@@ -131,7 +131,7 @@ option(VELOX_ENABLE_EXPRESSION "Build expression." ON)
 option(
   VELOX_ENABLE_EXAMPLES
   "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically." OFF)
-option(VELOX_ENABLE_SUBSTRAIT "Build Substrait-to-Velox converter." OFF)
+option(VELOX_ENABLE_SUBSTRAIT "Build Substrait-to-Velox converter." ON)
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
@@ -175,7 +175,7 @@ if(${VELOX_BUILD_MINIMAL} OR ${VELOX_BUILD_MINIMAL_WITH_DWIO})
   set(VELOX_ENABLE_S3 OFF)
   set(VELOX_ENABLE_GCS OFF)
   set(VELOX_ENABLE_ABFS OFF)
-  set(VELOX_ENABLE_SUBSTRAIT OFF)
+  # set(VELOX_ENABLE_SUBSTRAIT OFF)
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS})

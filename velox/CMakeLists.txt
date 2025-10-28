@@ -87,3 +87,5 @@ endif()
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tool)
 endif()
+
+add_subdirectory(myrunner)

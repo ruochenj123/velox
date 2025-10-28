@@ -18,6 +18,7 @@
 
 #include "velox/common/process/TraceContext.h"
 #include "velox/exec/Task.h"
+#include "velox/vector/VectorPrinter.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -771,7 +772,10 @@ void Driver::run(std::shared_ptr<Driver> self) {
   std::shared_ptr<BlockingState> blockingState;
   RowVectorPtr nullResult;
   auto reason = self->runInternal(self, blockingState, nullResult);
-
+  if (nullResult) {
+    std::string res = printVector(*nullResult.get());
+    LOG(INFO) << "nullResult: " << res << std::endl;
+  }
   // When Driver runs on an executor, the last operator (sink) must not produce
   // any results.
   VELOX_CHECK_NULL(

@@ -331,7 +331,8 @@ void LocalPlanner::plan(
   // Determine number of drivers for each pipeline.
   for (auto& factory : *driverFactories) {
     factory->maxDrivers = detail::maxDrivers(*factory, queryConfig);
-    factory->numDrivers = std::min(factory->maxDrivers, maxDrivers);
+    // factory->numDrivers = std::min(factory->maxDrivers, maxDrivers);
+    factory->numDrivers = 4;
 
     // Pipelines running grouped/bucketed execution would have separate groups
     // of drivers dealing with separate split groups (one driver can access
