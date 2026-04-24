@@ -1,0 +1,22 @@
+{
+  "queries": {
+    "23": {"name": "scan_1pct",  "type": "scan", "selectivity": "1%",  "date": "1992-02-01", "note": "actual ~0.16% due to shipdate distribution"},
+    "24": {"name": "scan_3pct",  "type": "scan", "selectivity": "3%",  "date": "1992-04-15"},
+    "25": {"name": "scan_10pct", "type": "scan", "selectivity": "10%", "date": "1992-10-01"},
+    "26": {"name": "scan_30pct", "type": "scan", "selectivity": "30%", "date": "1994-03-01"},
+    "27": {"name": "join_L_O",   "type": "join", "probe": "lineitem", "build": "orders",   "expected_count": 600037902},
+    "28": {"name": "join_L_P",   "type": "join", "probe": "lineitem", "build": "part",     "expected_count": 600037902},
+    "29": {"name": "join_L_S",   "type": "join", "probe": "lineitem", "build": "supplier", "expected_count": 600037902},
+    "30": {"name": "join_O_C",   "type": "join", "probe": "orders",   "build": "customer", "expected_count": 150000000}
+  },
+  "table_sizes_sf100": {
+    "lineitem": 600037902,
+    "orders":   150000000,
+    "customer":  15000000,
+    "part":      20000000,
+    "supplier":   1000000,
+    "partsupp":  80000000,
+    "nation":          25,
+    "region":           5
+  }
+}

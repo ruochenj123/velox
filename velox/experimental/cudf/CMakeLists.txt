@@ -17,7 +17,7 @@ add_subdirectory(connectors)
 add_subdirectory(vector)
 add_subdirectory(expression)
 
-if(VELOX_BUILD_TESTING)
+if(VELOX_BUILD_TESTING OR VELOX_ENABLE_BENCHMARKS)
   add_subdirectory(tests)
 endif()
 

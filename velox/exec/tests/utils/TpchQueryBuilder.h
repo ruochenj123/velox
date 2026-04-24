@@ -115,6 +115,16 @@ class TpchQueryBuilder {
   TpchPlan getQ21Plan() const;
   TpchPlan getQ22Plan() const;
 
+  // VLDB experiment queries (scan selectivity + equi-join microbenchmarks)
+  TpchPlan getScan1PctPlan() const;   // Q23
+  TpchPlan getScan3PctPlan() const;   // Q24
+  TpchPlan getScan10PctPlan() const;  // Q25
+  TpchPlan getScan30PctPlan() const;  // Q26
+  TpchPlan getJoinLOPlan() const;     // Q27: lineitem ⋈ orders
+  TpchPlan getJoinLPPlan() const;     // Q28: lineitem ⋈ part
+  TpchPlan getJoinLSPlan() const;     // Q29: lineitem ⋈ supplier
+  TpchPlan getJoinOCPlan() const;     // Q30: orders ⋈ customer
+
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
     return tableMetadata_.at(tableName).dataFiles;
