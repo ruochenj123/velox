@@ -29,8 +29,10 @@ add_library(
   CudfTopN.cpp
   DebugUtil.cpp
   GpuResources.cpp
+  GpuRowOps.cu
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
+  RowHashJoin.cpp
   SparkAggregateFunctions.cpp
   ToCudf.cpp
   Utilities.cpp
@@ -52,3 +54,5 @@ target_link_libraries(
 )
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
+
+set_target_properties(velox_cudf_exec PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

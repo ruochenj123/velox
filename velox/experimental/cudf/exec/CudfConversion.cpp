@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/RowStoreVector.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -29,6 +32,10 @@
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+
+#include <cuda_runtime.h>
+
+#include <chrono>
 
 namespace facebook::velox::cudf_velox {
 
@@ -142,12 +149,158 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
 
   // Get a stream from the global stream pool
   auto stream = cudfGlobalStreamPool().get_stream();
+  const bool logH2D = CudfConfig::getInstance().benchmarkLogGatherTime;
+  const bool rowWiseMode = CudfConfig::getInstance().benchmarkRowWiseGather;
+
+  // ===== Row-wise path: CPU col→row + cudaMemcpy =====
+  // CPU does col→row transpose, then cudaMemcpyAsync sends row buffer to GPU.
+  // Outputs RowStoreVector (flows directly to RowHashJoinProbe/Build).
+  // Only enabled when both rowWiseMode AND cpuColToRow are set.
+  const bool cpuColToRow = CudfConfig::getInstance().benchmarkCpuColToRow;
+  if (rowWiseMode && cpuColToRow) {
+    auto numRows = static_cast<int64_t>(input->size());
+    auto rowType = std::dynamic_pointer_cast<const RowType>(input->type());
+    VELOX_CHECK_NOT_NULL(rowType);
+
+    // Compute field layout from the RowType
+    std::vector<FieldDesc> fields;
+    int32_t offset = 0;
+    for (int i = 0; i < rowType->size(); i++) {
+      FieldDesc fd;
+      fd.offset = offset;
+      auto kind = rowType->childAt(i)->kind();
+      switch (kind) {
+        case TypeKind::BOOLEAN:
+        case TypeKind::TINYINT:
+          fd.byte_width = 1; break;
+        case TypeKind::SMALLINT:
+          fd.byte_width = 2; break;
+        case TypeKind::INTEGER:
+          fd.byte_width = 4; break;
+        case TypeKind::BIGINT:
+        case TypeKind::DOUBLE:
+          fd.byte_width = 8; break;
+        case TypeKind::REAL:
+          fd.byte_width = 4; break;
+        default:
+          VELOX_FAIL("RowCudfFromVelox: unsupported TypeKind {}", (int)kind);
+      }
+      fields.push_back(fd);
+      offset += fd.byte_width;
+    }
+    int32_t rowWidth = (offset + 7) & ~7; // 8-byte aligned
+
+    // CPU col→row conversion: pack columns into a contiguous row buffer
+    std::chrono::steady_clock::time_point cpuConvStart;
+    if (logH2D) {
+      cpuConvStart = std::chrono::steady_clock::now();
+    }
+
+    int64_t totalBytes = numRows * rowWidth;
+    // Use a host buffer (pinned or regular) for the row data
+    std::vector<uint8_t> hostRowBuf(totalBytes, 0);
+
+    // For each column, copy data row-by-row into the packed layout
+    for (int col = 0; col < rowType->size(); col++) {
+      auto child = input->childAt(col);
+      auto rawData = child->valuesAsVoid();
+      VELOX_CHECK_NOT_NULL(rawData, "RowCudfFromVelox: null raw data for col {}", col);
+      int32_t fieldOffset = fields[col].offset;
+      int32_t fieldWidth = fields[col].byte_width;
+      const uint8_t* src = static_cast<const uint8_t*>(rawData);
+
+      for (int64_t row = 0; row < numRows; row++) {
+        std::memcpy(
+            hostRowBuf.data() + row * rowWidth + fieldOffset,
+            src + row * fieldWidth,
+            fieldWidth);
+      }
+    }
+
+    if (logH2D) {
+      auto cpuConvEnd = std::chrono::steady_clock::now();
+      auto cpuConvNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          cpuConvEnd - cpuConvStart).count();
+      addRuntimeStat(
+          "cpuColToRowNanos",
+          RuntimeCounter(cpuConvNanos, RuntimeCounter::Unit::kNanos));
+    }
+
+    // H2D transfer
+    std::chrono::steady_clock::time_point h2dStart;
+    if (logH2D) {
+      h2dStart = std::chrono::steady_clock::now();
+    }
+
+    rmm::device_buffer gpuRowBuf(totalBytes, stream);
+    cudaMemcpyAsync(
+        gpuRowBuf.data(), hostRowBuf.data(), totalBytes,
+        cudaMemcpyHostToDevice, stream.value());
+
+    // Upload field descriptors
+    rmm::device_buffer gpuFieldsBuf(
+        fields.data(), fields.size() * sizeof(FieldDesc), stream);
+
+    // Sync to ensure transfer complete before returning
+    stream.synchronize();
+
+    if (logH2D) {
+      auto h2dEnd = std::chrono::steady_clock::now();
+      auto h2dNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          h2dEnd - h2dStart).count();
+      addRuntimeStat(
+          "h2dWallNanos",
+          RuntimeCounter(h2dNanos, RuntimeCounter::Unit::kNanos));
+      addRuntimeStat(
+          "h2dRows",
+          RuntimeCounter(static_cast<int64_t>(numRows)));
+      addRuntimeStat(
+          "h2dBytes",
+          RuntimeCounter(totalBytes, RuntimeCounter::Unit::kBytes));
+    }
+
+    return std::make_shared<RowStoreVector>(
+        input->pool(), outputType_, numRows,
+        std::move(gpuRowBuf), std::move(gpuFieldsBuf),
+        std::move(fields), rowWidth, stream);
+  }
+
+  // ===== Standard columnar path: Arrow → cudf =====
 
   // Convert RowVector to cudf table.  toCudfTable synchronizes the stream
   // internally before releasing Arrow host buffers, so no additional sync
   // is needed here.
+  std::chrono::steady_clock::time_point h2dStart;
+  if (logH2D) {
+    h2dStart = std::chrono::steady_clock::now();
+  }
+
   auto tbl = with_arrow::toCudfTable(
       input, input->pool(), stream, get_output_mr(), timestampTimeZone_);
+
+  if (logH2D) {
+    auto h2dEnd = std::chrono::steady_clock::now();
+    auto h2dNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        h2dEnd - h2dStart).count();
+    addRuntimeStat(
+        "h2dWallNanos",
+        RuntimeCounter(h2dNanos, RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "h2dRows",
+        RuntimeCounter(static_cast<int64_t>(input->size())));
+
+    // Compute actual bytes on GPU (sum of column data sizes)
+    int64_t h2dBytes = 0;
+    auto tblView = tbl->view();
+    for (int c = 0; c < tblView.num_columns(); c++) {
+      auto const& col = tblView.column(c);
+      h2dBytes += static_cast<int64_t>(col.size()) *
+                  cudf::size_of(col.type());
+    }
+    addRuntimeStat(
+        "h2dBytes",
+        RuntimeCounter(h2dBytes, RuntimeCounter::Unit::kBytes));
+  }
 
   VELOX_CHECK_NOT_NULL(tbl);
 

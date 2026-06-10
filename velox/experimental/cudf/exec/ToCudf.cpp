@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -325,8 +326,13 @@ void registerCudf() {
     output_mr_ = mr_;
   }
 
-  exec::Operator::registerOperator(
-      std::make_unique<CudfHashJoinBridgeTranslator>());
+  if (CudfConfig::getInstance().benchmarkRowWiseGather) {
+    exec::Operator::registerOperator(
+        std::make_unique<RowHashJoinBridgeTranslator>());
+  } else {
+    exec::Operator::registerOperator(
+        std::make_unique<CudfHashJoinBridgeTranslator>());
+  }
   CudfDriverAdapter cda{CudfConfig::getInstance().allowCpuFallback};
   exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
   exec::DriverFactory::registerAdapter(cudfAdapter);

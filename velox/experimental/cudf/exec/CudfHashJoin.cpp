@@ -47,6 +47,7 @@
 #include <cudf/unary.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <cuda_runtime.h>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
@@ -633,10 +634,24 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   std::vector<std::unique_ptr<cudf::column>> joinedCols;
   auto leftInput = leftTableView.select(leftColumnIndicesToGather_);
   auto rightInput = rightTableView.select(rightColumnIndicesToGather_);
+
+  // [Benchmark] Time the two gather calls if enabled
+  cudaEvent_t gatherStart, gatherEnd;
+  const bool timeGather = CudfConfig::getInstance().benchmarkLogGatherTime;
+  if (timeGather) {
+    cudaEventCreate(&gatherStart);
+    cudaEventCreate(&gatherEnd);
+    cudaEventRecord(gatherStart, stream.value());
+  }
+
   auto leftResult = cudf::gather(
       leftInput, leftIndicesCol, oobPolicy, stream, get_output_mr());
   auto rightResult = cudf::gather(
       rightInput, rightIndicesCol, oobPolicy, stream, get_output_mr());
+
+  if (timeGather) {
+    cudaEventRecord(gatherEnd, stream.value());
+  }
 
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Left result number of columns: " << leftResult->num_columns();
@@ -657,6 +672,20 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
+
+  // [Benchmark] Record gather time as an operator runtime stat
+  if (timeGather) {
+    float ms = 0;
+    cudaEventSynchronize(gatherEnd);
+    cudaEventElapsedTime(&ms, gatherStart, gatherEnd);
+    auto nanos = static_cast<int64_t>(ms * 1e6);
+    addRuntimeStat(
+        "cudfGatherWallNanos",
+        RuntimeCounter(nanos, RuntimeCounter::Unit::kNanos));
+    cudaEventDestroy(gatherStart);
+    cudaEventDestroy(gatherEnd);
+  }
+
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -1824,9 +1853,36 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   auto cudfOutput =
       concatenateTables(std::move(cudfOutputs), stream, get_output_mr());
   auto const size = cudfOutput->num_rows();
+
+  // [Benchmark] Track output rows as operator runtime stat
+  if (CudfConfig::getInstance().benchmarkLogGatherTime) {
+    addRuntimeStat(
+        "cudfGatherOutputRows",
+        RuntimeCounter(static_cast<int64_t>(size)));
+  }
+
   if (cudfOutput->num_columns() == 0 or size == 0) {
     return nullptr;
   }
+
+  // [Benchmark] Minimize D2H transfer — return only 1 row so CudfToVelox
+  // transfers negligible data. Gather timing is already captured above.
+  if (CudfConfig::getInstance().benchmarkSkipOutput) {
+    stream.synchronize();
+    // slice is zero-copy (returns table_view), no stream/mr needed
+    auto sliced = cudf::slice(*cudfOutput, {0, 1}, stream);
+    // Build a new table by copying each column individually with explicit stream/mr
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(sliced[0].num_columns());
+    for (cudf::size_type i = 0; i < sliced[0].num_columns(); ++i) {
+      cols.push_back(std::make_unique<cudf::column>(
+          sliced[0].column(i), stream, get_output_mr()));
+    }
+    auto singleRow = std::make_unique<cudf::table>(std::move(cols));
+    return std::make_shared<CudfVector>(
+        pool(), outputType_, 1, std::move(singleRow), stream);
+  }
+
   return std::make_shared<CudfVector>(
       pool(),
       outputType_,

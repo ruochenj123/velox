@@ -54,6 +54,7 @@ libdwarf-dev = ">=2.1.0,<3"
 libunwind = ">=1.8.3,<2"
 elfutils = ">=0.194,<0.195"
 libpsl = ">=0.21.5,<0.22"
+clang-tools = ">=22.1.4,<23"
 
 [feature.cuda12.system-requirements]
 cuda = "12"

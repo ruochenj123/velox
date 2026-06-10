@@ -131,6 +131,26 @@ struct CudfConfig {
   /// "s" (seconds), "ms" (milliseconds), "us" (microseconds), "ns"
   /// (nanoseconds).
   cudf::type_id timestampUnit = cudf::type_id::TIMESTAMP_NANOSECONDS;
+
+  /// [Benchmark] When true, CudfHashJoinProbe returns an empty CudfVector
+  /// instead of the actual join output, eliminating D2H transfer overhead.
+  bool benchmarkSkipOutput{false};
+
+  /// [Benchmark] When true, CudfHashJoinProbe logs accumulated gather time
+  /// (the two cudf::gather calls in unfilteredOutput) when finished.
+  bool benchmarkLogGatherTime{false};
+
+  /// [Benchmark] When true, CudfHashJoinProbe uses row-wise warp gather
+  /// instead of column-wise cudf::gather. Both sides (probe+build) are
+  /// transposed to fixed-stride rows, gathered via warp-collaborative copy,
+  /// then the result is discarded (skip_output semantics apply).
+  bool benchmarkRowWiseGather{false};
+
+  /// [Benchmark] When true AND benchmarkRowWiseGather is true, CudfFromVelox
+  /// does CPU col-to-row conversion and outputs RowStoreVector.
+  /// When false, CudfFromVelox uses the standard columnar Arrow->cudf path
+  /// and RowHashJoinProbe/Build do GPU-side transpose.
+  bool benchmarkCpuColToRow{false};
 };
 
 } // namespace facebook::velox::cudf_velox

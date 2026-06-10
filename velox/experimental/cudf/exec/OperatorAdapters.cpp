@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfLimit.h"
+#include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
@@ -414,6 +415,83 @@ class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
         std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+/// RowHashJoinBuildAdapter - Replaces with RowHashJoinBuild (row-wise gather)
+class RowHashJoinBuildAdapter : public OperatorAdapter {
+ public:
+  RowHashJoinBuildAdapter() : OperatorAdapter("RowHashJoinBuild") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::HashBuild*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) return false;
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+    if (!joinPlanNode) return false;
+    // Row-wise only supports inner join, no filter
+    return joinPlanNode->joinType() == core::JoinType::kInner &&
+           !joinPlanNode->filter();
+  }
+
+  bool acceptsGpuInput() const override { return true; }
+  bool producesGpuOutput() const override { return false; }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<RowHashJoinBuild>(operatorId, ctx, joinPlanNode));
+    return result;
+  }
+};
+
+/// RowHashJoinProbeAdapter - Replaces with RowHashJoinProbe (row-wise gather)
+class RowHashJoinProbeAdapter : public OperatorAdapter {
+ public:
+  RowHashJoinProbeAdapter() : OperatorAdapter("RowHashJoinProbe") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::HashProbe*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) return false;
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+    if (!joinPlanNode) return false;
+    return joinPlanNode->joinType() == core::JoinType::kInner &&
+           !joinPlanNode->filter();
+  }
+
+  bool acceptsGpuInput() const override { return true; }
+  bool producesGpuOutput() const override { return false; }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto joinPlanNode =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<RowHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
   }
 };
@@ -848,8 +926,13 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
-  registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
-  registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
+  if (CudfConfig::getInstance().benchmarkRowWiseGather) {
+    registry.registerAdapter(std::make_unique<RowHashJoinBuildAdapter>());
+    registry.registerAdapter(std::make_unique<RowHashJoinProbeAdapter>());
+  } else {
+    registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
+    registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
+  }
   registry.registerAdapter(std::make_unique<OrderByAdapter>());
   registry.registerAdapter(std::make_unique<TopNAdapter>());
   registry.registerAdapter(std::make_unique<LimitAdapter>());

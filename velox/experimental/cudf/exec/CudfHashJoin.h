@@ -257,6 +257,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
 
+  // [Benchmark] Gather time and output rows are tracked via
+  // addRuntimeStat("cudfGatherWallNanos") and
+  // addRuntimeStat("cudfGatherOutputRows") — automatically aggregated
+  // across all drivers in the operator stats output.
+
   /**
    * @brief Performs inner join between probe table and all build tables.
    * @param leftTable Probe-side table to join
