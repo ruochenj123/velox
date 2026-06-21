@@ -145,9 +145,13 @@ class RowHashJoinProbe : public CudfOperatorBase {
   // Pre-allocated device buffers (reused per batch)
   rmm::device_buffer probeRowBuffer_;      // probe rows on GPU
   rmm::device_buffer probeFieldsBuffer_;   // FieldDesc on GPU
-  rmm::device_buffer probeKeyBuffer_;      // extracted probe keys
+  rmm::device_buffer probeKeyBuffer_;      // extracted probe keys (RowStoreVector path)
   rmm::device_buffer probeGatherBuffer_;   // gathered probe rows
   rmm::device_buffer buildGatherBuffer_;   // gathered build rows
+
+  // Probe key column pointer (CudfVector path: points into input CudfVector)
+  const void* probeKeyData_ = nullptr;
+  int32_t probeKeyWidth_ = 0;
   int64_t probeRowCapacity_ = 0;
   int64_t gatherCapacity_ = 0;
   bool fieldsUploaded_ = false;

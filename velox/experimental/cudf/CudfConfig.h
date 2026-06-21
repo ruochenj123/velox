@@ -140,6 +140,11 @@ struct CudfConfig {
   /// (the two cudf::gather calls in unfilteredOutput) when finished.
   bool benchmarkLogGatherTime{false};
 
+  /// [Benchmark] When true, CudfHashJoinProbe skips cudf::gather entirely
+  /// and returns a dummy 1-row output. Use to measure gather's true e2e
+  /// impact by comparing e2e with vs without this flag.
+  bool benchmarkSkipGather{false};
+
   /// [Benchmark] When true, CudfHashJoinProbe uses row-wise warp gather
   /// instead of column-wise cudf::gather. Both sides (probe+build) are
   /// transposed to fixed-stride rows, gathered via warp-collaborative copy,
@@ -151,6 +156,12 @@ struct CudfConfig {
   /// When false, CudfFromVelox uses the standard columnar Arrow->cudf path
   /// and RowHashJoinProbe/Build do GPU-side transpose.
   bool benchmarkCpuColToRow{false};
+
+  /// [Benchmark] When true, operators emit per-batch trace lines to stdout:
+  ///   TRACE <timestamp_us> <driver_id> <op_name> <event> <rows> <bytes>
+  /// Use for Gantt-chart timeline reconstruction.
+  bool benchmarkLogTimeline{false};
+
 };
 
 } // namespace facebook::velox::cudf_velox

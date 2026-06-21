@@ -19,6 +19,7 @@
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/Task.h"
+#include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -128,6 +129,24 @@ bool TableScan::shouldStop(StopReason taskStopReason) const {
 RowVectorPtr TableScan::getOutput() {
   VELOX_CHECK(!blockingFuture_.valid());
   blockingReason_ = BlockingReason::kNotBlocked;
+
+  // Timeline: emit "Scan start" once per GPU-batch accumulation cycle.
+  // Uses driverId from the operator context directly (thread_local state
+  // may not be initialized yet on the first call).
+  if (cudf_velox::benchmarkTimelineEnabled().load(std::memory_order_relaxed) &&
+      driverCtx_->driverId == 0) {
+    auto& scanState = cudf_velox::threadScanTraceState();
+    // Always update from current operator context (thread may switch pipelines)
+    scanState.driverId = driverCtx_->driverId;
+    scanState.pipelineId = driverCtx_->pipelineId;
+    if (scanState.scanTraceNeeded) {
+      auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      printf("OPTRACE %lld d0 p%d Scan start 0\n",
+             (long long)ts, scanState.pipelineId);
+      scanState.scanTraceNeeded = false;
+    }
+  }
 
   if (noMoreSplits_) {
     return nullptr;

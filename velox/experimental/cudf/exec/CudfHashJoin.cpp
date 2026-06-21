@@ -53,6 +53,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <chrono>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -218,6 +220,22 @@ void CudfHashJoinBuild::doNoMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+
+  // Timeline: hash table build start
+  const bool logTimeline2 = CudfConfig::getInstance().benchmarkLogTimeline;
+  const auto buildDriverId = operatorCtx_->driverCtx()->driverId;
+  const auto buildPipelineId = operatorCtx_->driverCtx()->pipelineId;
+  auto buildTimeNow = []() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  int64_t totalBuildRows = 0;
+  for (auto& inp : inputs_) totalBuildRows += inp->size();
+  if (logTimeline2) {
+    printf("OPTRACE %lld d0 p%d HashBuild start %lld\n",
+           (long long)buildTimeNow(), buildPipelineId, (long long)totalBuildRows);
+  }
+
   // Using output_mr here to allow spilling queued up large tables
   auto tbls = getConcatenatedTableBatched(
       std::exchange(inputs_, {}),
@@ -289,6 +307,12 @@ void CudfHashJoinBuild::doNoMoreInput() {
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+
+  // Timeline: hash table build end
+  if (logTimeline2) {
+    printf("OPTRACE %lld d0 p%d HashBuild end %lld\n",
+           (long long)buildTimeNow(), buildPipelineId, (long long)totalBuildRows);
+  }
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -634,6 +658,31 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   std::vector<std::unique_ptr<cudf::column>> joinedCols;
   auto leftInput = leftTableView.select(leftColumnIndicesToGather_);
   auto rightInput = rightTableView.select(rightColumnIndicesToGather_);
+
+  // [Benchmark] Skip gather entirely — return a 1-row dummy table
+  // to measure gather's true impact on e2e.
+  if (CudfConfig::getInstance().benchmarkSkipGather) {
+    stream.synchronize();
+    auto numOutputRows = leftIndicesCol.size();
+    // Track how many rows WOULD have been gathered
+    if (CudfConfig::getInstance().benchmarkLogGatherTime) {
+      addRuntimeStat(
+          "cudfGatherOutputRows",
+          RuntimeCounter(static_cast<int64_t>(numOutputRows)));
+    }
+    // Build a zero-row table with the correct schema
+    std::vector<std::unique_ptr<cudf::column>> joinedCols;
+    joinedCols.resize(outputType_->names().size());
+    for (int i = 0; i < leftColumnOutputIndices_.size(); i++) {
+      joinedCols[leftColumnOutputIndices_[i]] =
+          cudf::make_empty_column(leftInput.column(i).type());
+    }
+    for (int i = 0; i < rightColumnOutputIndices_.size(); i++) {
+      joinedCols[rightColumnOutputIndices_[i]] =
+          cudf::make_empty_column(rightInput.column(i).type());
+    }
+    return std::make_unique<cudf::table>(std::move(joinedCols));
+  }
 
   // [Benchmark] Time the two gather calls if enabled
   cudaEvent_t gatherStart, gatherEnd;
@@ -1782,6 +1831,20 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+
+  // Timeline logging
+  const bool logTimeline = CudfConfig::getInstance().benchmarkLogTimeline;
+  const auto driverId = operatorCtx_->driverCtx()->driverId;
+  const auto pipelineId = operatorCtx_->driverCtx()->pipelineId;
+  auto timeNow = []() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  if (logTimeline && driverId == 0) {
+    printf("OPTRACE %lld d0 p%d JoinProbe start %lld\n",
+           (long long)timeNow(), pipelineId, (long long)cudfInput->size());
+  }
+
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();
@@ -1865,24 +1928,29 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
     return nullptr;
   }
 
-  // [Benchmark] Minimize D2H transfer — return only 1 row so CudfToVelox
-  // transfers negligible data. Gather timing is already captured above.
+
+  // [Benchmark] Skip output: sync GPU, then return a minimal CPU RowVector
+  // directly (same as RowHashJoinProbe) to avoid CudfToVelox D2H overhead.
   if (CudfConfig::getInstance().benchmarkSkipOutput) {
     stream.synchronize();
-    // slice is zero-copy (returns table_view), no stream/mr needed
-    auto sliced = cudf::slice(*cudfOutput, {0, 1}, stream);
-    // Build a new table by copying each column individually with explicit stream/mr
-    std::vector<std::unique_ptr<cudf::column>> cols;
-    cols.reserve(sliced[0].num_columns());
-    for (cudf::size_type i = 0; i < sliced[0].num_columns(); ++i) {
-      cols.push_back(std::make_unique<cudf::column>(
-          sliced[0].column(i), stream, get_output_mr()));
+    if (logTimeline && driverId == 0) {
+      printf("OPTRACE %lld d0 p%d JoinProbe end %lld\n",
+             (long long)timeNow(), pipelineId, (long long)1);
     }
-    auto singleRow = std::make_unique<cudf::table>(std::move(cols));
-    return std::make_shared<CudfVector>(
-        pool(), outputType_, 1, std::move(singleRow), stream);
+    // Return a 1-row null-constant RowVector (CPU-side, no GPU data)
+    std::vector<VectorPtr> children(outputType_->size());
+    for (int i = 0; i < outputType_->size(); i++) {
+      children[i] = BaseVector::createNullConstant(
+          outputType_->childAt(i), 1, pool());
+    }
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, 1, std::move(children));
   }
 
+  if (logTimeline && driverId == 0) {
+    printf("OPTRACE %lld d0 p%d JoinProbe end %lld\n",
+           (long long)timeNow(), pipelineId, (long long)cudfOutput->num_rows());
+  }
   return std::make_shared<CudfVector>(
       pool(),
       outputType_,

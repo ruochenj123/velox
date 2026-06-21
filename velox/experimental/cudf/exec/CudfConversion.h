@@ -99,6 +99,8 @@ class CudfToVelox : public CudfOperatorBase {
   RowVectorPtr convertFrontToVelox();
   std::optional<uint64_t> averageRowSize_;
   std::deque<CudfVectorPtr> inputs_;
+  // Non-CudfVector inputs that pass through without D2H conversion
+  std::deque<RowVectorPtr> passthroughInputs_;
   // Converted CPU-side buffer being drained by successive doGetOutput() calls.
   RowVectorPtr veloxBuffer_;
   // Current offset into veloxBuffer_ for the next slice.

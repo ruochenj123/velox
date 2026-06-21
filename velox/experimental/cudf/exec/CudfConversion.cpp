@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
@@ -103,6 +104,18 @@ void CudfFromVelox::doAddInput(RowVectorPtr input) {
     }
     input->loadedVector();
 
+    // Timeline: initialize thread_local scan state on first addInput call
+    // (this runs on the driver's actual thread, unlike the constructor).
+    if (inputs_.empty() && CudfConfig::getInstance().benchmarkLogTimeline &&
+        operatorCtx_->driverCtx()->driverId == 0) {
+      auto& scanState = threadScanTraceState();
+      if (scanState.driverId == -1) {
+        scanState.driverId = operatorCtx_->driverCtx()->driverId;
+        scanState.pipelineId = operatorCtx_->driverCtx()->pipelineId;
+        benchmarkTimelineEnabled().store(true, std::memory_order_relaxed);
+      }
+    }
+
     // Accumulate inputs
     inputs_.push_back(input);
     currentOutputSize_ += input->size();
@@ -119,6 +132,19 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
       (currentOutputSize_ < targetOutputSize and not noMoreInput_) or
       inputs_.empty()) {
     return nullptr;
+  }
+
+  // Timeline: initialize per-thread scan state and signal scan phase complete
+  const bool logTimeline = CudfConfig::getInstance().benchmarkLogTimeline;
+  const auto driverId = operatorCtx_->driverCtx()->driverId;
+  const auto pipelineId = operatorCtx_->driverCtx()->pipelineId;
+  auto timeNow = []() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  if (logTimeline && driverId == 0) {
+    printf("OPTRACE %lld d0 p%d FromVelox start %lld\n",
+           (long long)timeNow(), pipelineId, (long long)inputs_[0]->size());
   }
 
   // Select inputs that don't exceed the max vector size limit
@@ -151,6 +177,8 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   const bool logH2D = CudfConfig::getInstance().benchmarkLogGatherTime;
   const bool rowWiseMode = CudfConfig::getInstance().benchmarkRowWiseGather;
+
+
 
   // ===== Row-wise path: CPU col→row + cudaMemcpy =====
   // CPU does col→row transpose, then cudaMemcpyAsync sends row buffer to GPU.
@@ -259,10 +287,16 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
           RuntimeCounter(totalBytes, RuntimeCounter::Unit::kBytes));
     }
 
-    return std::make_shared<RowStoreVector>(
+    auto result = std::make_shared<RowStoreVector>(
         input->pool(), outputType_, numRows,
         std::move(gpuRowBuf), std::move(gpuFieldsBuf),
         std::move(fields), rowWidth, stream);
+    if (logTimeline && driverId == 0) {
+      printf("OPTRACE %lld d0 p%d FromVelox end %lld\n",
+             (long long)timeNow(), pipelineId, (long long)numRows);
+      threadScanTraceState().scanTraceNeeded = true;
+    }
+    return result;
   }
 
   // ===== Standard columnar path: Arrow → cudf =====
@@ -306,6 +340,11 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
 
   // Return a CudfVector that owns the cudf table
   const auto size = tbl->num_rows();
+  if (logTimeline && driverId == 0) {
+    printf("OPTRACE %lld d0 p%d FromVelox end %lld\n",
+           (long long)timeNow(), pipelineId, (long long)size);
+    threadScanTraceState().scanTraceNeeded = true;
+  }
   return std::make_shared<CudfVector>(
       input->pool(), outputType_, size, std::move(tbl), stream);
 }
@@ -342,8 +381,12 @@ void CudfToVelox::doAddInput(RowVectorPtr input) {
   // Accumulate inputs
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_CHECK_NOT_NULL(cudfInput);
-    inputs_.push_back(std::move(cudfInput));
+    if (cudfInput) {
+      inputs_.push_back(std::move(cudfInput));
+    } else {
+      // Non-CudfVector (e.g. skip_output dummy RowVector) — pass through
+      passthroughInputs_.push_back(std::move(input));
+    }
   }
 }
 
@@ -399,6 +442,14 @@ RowVectorPtr CudfToVelox::doGetOutput() {
     return nullptr;
   }
 
+  // Drain passthrough inputs first (e.g. skip_output CPU RowVectors)
+  if (!passthroughInputs_.empty()) {
+    auto result = std::move(passthroughInputs_.front());
+    passthroughInputs_.pop_front();
+    finished_ = noMoreInput_ && inputs_.empty() && passthroughInputs_.empty();
+    return result;
+  }
+
   if (outputType_->size() == 0) {
     // cuDF zero-column tables do not have a row count, so we sum the sizes
     // of all CudfVectors in the inputs_, to maintain the logical count.
@@ -419,7 +470,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
   // more GPU inputs.
   if (!veloxBuffer_) {
     if (inputs_.empty()) {
-      finished_ = noMoreInput_;
+      finished_ = noMoreInput_ && passthroughInputs_.empty();
       return nullptr;
     }
 

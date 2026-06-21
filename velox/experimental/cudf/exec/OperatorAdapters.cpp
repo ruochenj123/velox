@@ -480,7 +480,7 @@ class RowHashJoinProbeAdapter : public OperatorAdapter {
   }
 
   bool acceptsGpuInput() const override { return true; }
-  bool producesGpuOutput() const override { return false; }
+  bool producesGpuOutput() const override { return true; }
 
   std::vector<std::unique_ptr<exec::Operator>> createReplacements(
       const exec::Operator* /*op*/,
