@@ -19,6 +19,14 @@ struct FieldDesc {
   int32_t byte_width;  // >0 for fixed-width types only
 };
 
+/// Per-field mapping for selective gather: maps a field from a source row
+/// to a position in an output row.
+struct FieldMapping {
+  int32_t src_offset;  // byte offset within source row
+  int32_t dst_offset;  // byte offset within output row
+  int32_t byte_width;  // field width in bytes
+};
+
 // ============================================================================
 // GpuFixedRowStore — device-side handle (POD, memcpy-safe)
 // ============================================================================

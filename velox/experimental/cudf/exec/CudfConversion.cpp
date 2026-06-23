@@ -147,6 +147,8 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
            (long long)timeNow(), pipelineId, (long long)inputs_[0]->size());
   }
 
+  auto tpStart = std::chrono::steady_clock::now();
+
   // Select inputs that don't exceed the max vector size limit
   std::vector<RowVectorPtr> selectedInputs;
   vector_size_t totalSize = 0;
@@ -161,8 +163,12 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
     }
   }
 
+  auto tpBeforeMerge = std::chrono::steady_clock::now();
+
   // Combine selected RowVectors into a single RowVector
   auto input = mergeRowVectors(selectedInputs, inputs_[0]->pool());
+
+  auto tpAfterMerge = std::chrono::steady_clock::now();
 
   // Remove processed inputs
   inputs_.erase(inputs_.begin(), inputs_.begin() + selectedInputs.size());
@@ -304,21 +310,39 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // Convert RowVector to cudf table.  toCudfTable synchronizes the stream
   // internally before releasing Arrow host buffers, so no additional sync
   // is needed here.
-  std::chrono::steady_clock::time_point h2dStart;
-  if (logH2D) {
-    h2dStart = std::chrono::steady_clock::now();
-  }
+  auto tpBeforeToCudf = std::chrono::steady_clock::now();
 
   auto tbl = with_arrow::toCudfTable(
       input, input->pool(), stream, get_output_mr(), timestampTimeZone_);
 
-  if (logH2D) {
-    auto h2dEnd = std::chrono::steady_clock::now();
-    auto h2dNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        h2dEnd - h2dStart).count();
+  auto tpAfterToCudf = std::chrono::steady_clock::now();
+
+  // Always emit detailed breakdown stats
+  {
+    auto nanos = [](auto a, auto b) {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+    };
     addRuntimeStat(
-        "h2dWallNanos",
-        RuntimeCounter(h2dNanos, RuntimeCounter::Unit::kNanos));
+        "fromVeloxSelectNanos",
+        RuntimeCounter(nanos(tpStart, tpBeforeMerge), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "fromVeloxMergeNanos",
+        RuntimeCounter(nanos(tpBeforeMerge, tpAfterMerge), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "fromVeloxToCudfNanos",
+        RuntimeCounter(nanos(tpBeforeToCudf, tpAfterToCudf), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "fromVeloxTotalNanos",
+        RuntimeCounter(nanos(tpStart, tpAfterToCudf), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "fromVeloxBatchesMerged",
+        RuntimeCounter(static_cast<int64_t>(selectedInputs.size())));
+    addRuntimeStat(
+        "fromVeloxOutputRows",
+        RuntimeCounter(static_cast<int64_t>(input->size())));
+  }
+
+  if (logH2D) {
     addRuntimeStat(
         "h2dRows",
         RuntimeCounter(static_cast<int64_t>(input->size())));

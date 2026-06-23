@@ -59,6 +59,8 @@ class RowHashJoinBridge : public exec::JoinBridge {
     rmm::device_buffer keyBuffer;
     int64_t numRows;
     int32_t rowWidth;
+    // Host-side field descriptors (for probe to compute output layout)
+    std::vector<FieldDesc> hostFields;
   };
 
   void setBuildData(std::shared_ptr<BuildData> data);
@@ -142,16 +144,20 @@ class RowHashJoinProbe : public CudfOperatorBase {
   std::vector<cudf::size_type> rightColumnIndicesToGather_;
   std::vector<int> rightColumnOutputIndices_;
 
+  // Selective gather: field mappings (src_offset -> dst_offset) for output
+  std::vector<FieldMapping> probeGatherMappings_;
+  std::vector<FieldMapping> buildGatherMappings_;
+  rmm::device_buffer probeGatherMappingsBuffer_;  // FieldMapping[] on GPU
+  rmm::device_buffer buildGatherMappingsBuffer_;  // FieldMapping[] on GPU
+  rmm::device_buffer outputFieldsBuffer_;          // FieldDesc[] on GPU for output
+  bool outputLayoutComputed_ = false;
+
   // Pre-allocated device buffers (reused per batch)
   rmm::device_buffer probeRowBuffer_;      // probe rows on GPU
   rmm::device_buffer probeFieldsBuffer_;   // FieldDesc on GPU
-  rmm::device_buffer probeKeyBuffer_;      // extracted probe keys (RowStoreVector path)
-  rmm::device_buffer probeGatherBuffer_;   // gathered probe rows
-  rmm::device_buffer buildGatherBuffer_;   // gathered build rows
+  rmm::device_buffer probeKeyBuffer_;      // extracted probe keys
+  rmm::device_buffer probeGatherBuffer_;   // gathered output rows
 
-  // Probe key column pointer (CudfVector path: points into input CudfVector)
-  const void* probeKeyData_ = nullptr;
-  int32_t probeKeyWidth_ = 0;
   int64_t probeRowCapacity_ = 0;
   int64_t gatherCapacity_ = 0;
   bool fieldsUploaded_ = false;

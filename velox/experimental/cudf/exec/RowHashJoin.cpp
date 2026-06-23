@@ -341,7 +341,7 @@ void RowHashJoinBuild::doNoMoreInput() {
     hashJoin = std::make_shared<cudf::hash_join>(
         keyTable, cudf::null_equality::UNEQUAL, stream);
   } else {
-    // ---- CudfVector path: concatenate + transpose (excluding key) ----
+    // ---- CudfVector path: concatenate + transpose ----
     auto buildType = joinNode_->sources()[1]->outputType();
     std::vector<CudfVectorPtr> cudfInputs;
     for (auto& inp : inputs_) {
@@ -357,22 +357,17 @@ void RowHashJoinBuild::doNoMoreInput() {
     auto buildView = concatenated->view();
     numRows = buildView.num_rows();
 
-    // Identify key column — keep it columnar (avoid transpose + extract)
+    // Identify key column
     auto rightKeys = joinNode_->rightKeys();
     auto rightType = joinNode_->sources()[1]->outputType();
     int keyColIdx = rightType->getChildIdx(rightKeys[0]->name());
     auto keyColView = buildView.column(keyColIdx);
     int32_t keyWidth = cudfTypeWidth(keyColView.type().id());
 
-    // Save key column via direct D2D copy (columnar → columnar, no extract)
-    keyBuffer = rmm::device_buffer(numRows * keyWidth, stream);
-    cudaMemcpyAsync(
-        keyBuffer.data(), keyColView.head(),
-        static_cast<size_t>(numRows) * keyWidth,
-        cudaMemcpyDeviceToDevice, stream.value());
-
-    // Compute row layout EXCLUDING key column (narrower rows)
-    auto [f, rw] = computeRowLayoutFromTableExcluding(buildView, keyColIdx);
+    // Include ALL columns (including key) in row layout, then extract key.
+    // This is the general design: rows carry all columns, and each operator
+    // extracts what it needs. Cost of extract is negligible (<4%).
+    auto [f, rw] = computeRowLayoutFromTable(buildView);
     fields = std::move(f);
     rowWidth = rw;
 
@@ -387,9 +382,9 @@ void RowHashJoinBuild::doNoMoreInput() {
       cudaEventRecord(txStart, stream.value());
     }
 
-    // Transpose only non-key columns (key stays columnar)
-    transposeToRowsExcluding(
-        buildView, fields, rowWidth, keyColIdx,
+    // Transpose all columns to rows
+    transposeToRows(
+        buildView, fields, rowWidth,
         static_cast<uint8_t*>(rowBuffer.data()), stream.value());
 
     if (timeTx) {
@@ -411,7 +406,21 @@ void RowHashJoinBuild::doNoMoreInput() {
     fieldsBuffer = rmm::device_buffer(
         fields.data(), fields.size() * sizeof(FieldDesc), stream);
 
-    // Build hash table from columnar key (no extractKeysFromRows needed!)
+    // Extract key from rows for hash table construction
+    GpuFixedRowStore tmpStore;
+    tmpStore.row_buffer = static_cast<uint8_t*>(rowBuffer.data());
+    tmpStore.row_width = rowWidth;
+    tmpStore.num_rows = numRows;
+    tmpStore.num_fields = fields.size();
+    tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
+
+    int32_t keyOffset = fields[keyColIdx].offset;
+    keyBuffer = rmm::device_buffer(numRows * keyWidth, stream);
+    extractKeysFromRows(
+        tmpStore, keyOffset, keyWidth,
+        keyBuffer.data(), stream.value());
+
+    // Build hash table from extracted key
     auto keyCol = cudf::column_view(
         cudf::data_type{keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
         static_cast<cudf::size_type>(numRows),
@@ -440,6 +449,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.keyBuffer = std::move(keyBuffer);
   bd.numRows = numRows;
   bd.rowWidth = rowWidth;
+  bd.hostFields = std::move(fields);
 
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
@@ -600,22 +610,16 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         "probeTransposeSkipped",
         RuntimeCounter(static_cast<int64_t>(probeRows)));
   } else {
-    // ---- Path B: CudfVector (transpose non-key columns, keep key columnar) ----
+    // ---- Path B: CudfVector (transpose all columns to rows, extract key) ----
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
     VELOX_CHECK_NOT_NULL(cudfInput, "RowHashJoinProbe: input must be RowStoreVector or CudfVector");
     stream = cudfInput->stream();
     auto probeView = cudfInput->getTableView();
     probeRows = probeView.num_rows();
 
-    // Save probe key column reference (columnar, no copy needed — input_ stays alive)
-    auto probeKeyColView = probeView.column(leftKeyIndices_[0]);
-    int32_t keyWidth = cudfTypeWidth(probeKeyColView.type().id());
-    probeKeyData_ = probeKeyColView.head();
-    probeKeyWidth_ = keyWidth;
-
     if (!initialized_) {
-      // Compute row layout EXCLUDING key column (narrower rows)
-      auto [pf, prw] = computeRowLayoutFromTableExcluding(probeView, leftKeyIndices_[0]);
+      // Include ALL columns in row layout (key embedded)
+      auto [pf, prw] = computeRowLayoutFromTable(probeView);
       probeFields_ = std::move(pf);
       probeRowWidth_ = prw;
       initialized_ = true;
@@ -625,6 +629,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     if (probeRows > probeRowCapacity_) {
       probeRowCapacity_ = probeRows;
       probeRowBuffer_ = rmm::device_buffer(probeRowBytes, stream);
+      // Allocate key buffer for extraction
+      int32_t keyWidth = cudfTypeWidth(probeView.column(leftKeyIndices_[0]).type().id());
+      probeKeyBuffer_ = rmm::device_buffer(probeRows * keyWidth, stream);
       if (!fieldsUploaded_) {
         probeFieldsBuffer_ = rmm::device_buffer(
             probeFields_.data(), probeFields_.size() * sizeof(FieldDesc), stream);
@@ -639,9 +646,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       cudaEventRecord(txStart, stream.value());
     }
 
-    // Transpose only non-key columns (key stays columnar)
-    transposeToRowsExcluding(
-        probeView, probeFields_, probeRowWidth_, leftKeyIndices_[0],
+    // Transpose ALL columns (including key) to rows
+    transposeToRows(
+        probeView, probeFields_, probeRowWidth_,
         static_cast<uint8_t*>(probeRowBuffer_.data()), stream.value());
 
     if (timeTx) {
@@ -665,23 +672,70 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     probeGpuStore.fields = static_cast<const FieldDesc*>(probeFieldsBuffer_.data());
   }
 
-  // ---- 2. Prepare probe key for hash join ----
-  const void* keyData = nullptr;
-  int32_t keyWidth = 0;
-  if (probeKeyData_) {
-    // CudfVector path: key is already columnar, use directly
-    keyData = probeKeyData_;
-    keyWidth = probeKeyWidth_;
-    probeKeyData_ = nullptr;  // reset for next batch
-  } else {
-    // RowStoreVector path: extract key from row buffer
-    int32_t keyOffset = probeFields_[leftKeyIndices_[0]].offset;
-    keyWidth = probeFields_[leftKeyIndices_[0]].byte_width;
-    extractKeysFromRows(
-        probeGpuStore, keyOffset, keyWidth,
-        probeKeyBuffer_.data(), stream.value());
-    keyData = probeKeyBuffer_.data();
+  // ---- Compute output row layout (once) ----
+  // Determines which fields from probe/build appear in the query output,
+  // and their destination offsets. Column order matches outputType.
+  if (!outputLayoutComputed_) {
+    auto outType = joinNode_->outputType();
+    auto leftType = joinNode_->sources()[0]->outputType();
+    auto rightType = joinNode_->sources()[1]->outputType();
+    const auto& buildHostFields = buildData_->hostFields;
+
+    int32_t dstOffset = 0;
+    for (int i = 0; i < outType->size(); i++) {
+      auto name = outType->nameOf(i);
+      auto leftIdx = leftType->getChildIdxIfExists(name);
+      int32_t byteWidth;
+      if (leftIdx.has_value()) {
+        int srcCol = leftIdx.value();
+        byteWidth = probeFields_[srcCol].byte_width;
+        probeGatherMappings_.push_back(
+            {probeFields_[srcCol].offset, dstOffset, byteWidth});
+      } else {
+        int srcCol = rightType->getChildIdx(name);
+        byteWidth = buildHostFields[srcCol].byte_width;
+        buildGatherMappings_.push_back(
+            {buildHostFields[srcCol].offset, dstOffset, byteWidth});
+      }
+      outputFields_.push_back({dstOffset, byteWidth});
+      dstOffset += byteWidth;
+    }
+    outputRowWidth_ = (dstOffset + 7) & ~7;
+
+    // Upload field mappings to GPU (constant across all batches)
+    if (!probeGatherMappings_.empty()) {
+      probeGatherMappingsBuffer_ = rmm::device_buffer(
+          probeGatherMappings_.data(),
+          probeGatherMappings_.size() * sizeof(FieldMapping), stream);
+    }
+    if (!buildGatherMappings_.empty()) {
+      buildGatherMappingsBuffer_ = rmm::device_buffer(
+          buildGatherMappings_.data(),
+          buildGatherMappings_.size() * sizeof(FieldMapping), stream);
+    }
+
+    addRuntimeStat("outputGatherProbeFields",
+        RuntimeCounter(static_cast<int64_t>(probeGatherMappings_.size())));
+    addRuntimeStat("outputGatherBuildFields",
+        RuntimeCounter(static_cast<int64_t>(buildGatherMappings_.size())));
+    addRuntimeStat("outputRowWidthBytes",
+        RuntimeCounter(static_cast<int64_t>(outputRowWidth_)));
+
+    // Upload output field descriptors to GPU (for RowStoreVector output)
+    outputFieldsBuffer_ = rmm::device_buffer(
+        outputFields_.data(),
+        outputFields_.size() * sizeof(FieldDesc), stream);
+
+    outputLayoutComputed_ = true;
   }
+
+  // ---- 2. Extract probe key from row buffer ----
+  int32_t keyOffset = probeFields_[leftKeyIndices_[0]].offset;
+  int32_t keyWidth = probeFields_[leftKeyIndices_[0]].byte_width;
+  extractKeysFromRows(
+      probeGpuStore, keyOffset, keyWidth,
+      probeKeyBuffer_.data(), stream.value());
+  const void* keyData = probeKeyBuffer_.data();
 
   // ---- 3. Hash probe ----
   auto probeKeyCol = cudf::column_view(
@@ -707,29 +761,28 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   }
 
   if (numMatches > 0) {
-    // Ensure gather buffers are large enough
-    int64_t neededProbe = (int64_t)numMatches * probeRowWidth_;
-    int64_t neededBuild = (int64_t)numMatches * buildRowWidth;
+    // Selective gather + concatenate: only gather columns that appear in
+    // the output type, laid out in outputType column order.
+    int64_t neededOutput = (int64_t)numMatches * outputRowWidth_;
     if (numMatches > gatherCapacity_) {
       gatherCapacity_ = numMatches;
-      probeGatherBuffer_ = rmm::device_buffer(neededProbe, stream);
-      buildGatherBuffer_ = rmm::device_buffer(neededBuild, stream);
+      probeGatherBuffer_ = rmm::device_buffer(neededOutput, stream);
+    } else if (neededOutput > static_cast<int64_t>(probeGatherBuffer_.size())) {
+      probeGatherBuffer_ = rmm::device_buffer(neededOutput, stream);
     }
 
-    // Gather probe rows
-    gatherRowsWarp(
+    selectiveGatherAndConcat(
         probeGpuStore,
         reinterpret_cast<const int32_t*>(leftIndices->data()),
-        numMatches,
-        static_cast<uint8_t*>(probeGatherBuffer_.data()),
-        stream.value());
-
-    // Gather build rows
-    gatherRowsWarp(
+        static_cast<const FieldMapping*>(probeGatherMappingsBuffer_.data()),
+        static_cast<int32_t>(probeGatherMappings_.size()),
         bd.gpuRowStore,
         reinterpret_cast<const int32_t*>(rightIndices->data()),
+        static_cast<const FieldMapping*>(buildGatherMappingsBuffer_.data()),
+        static_cast<int32_t>(buildGatherMappings_.size()),
         numMatches,
-        static_cast<uint8_t*>(buildGatherBuffer_.data()),
+        outputRowWidth_,
+        static_cast<uint8_t*>(probeGatherBuffer_.data()),
         stream.value());
   }
 
@@ -765,30 +818,46 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
            (long long)timeNow(), pipelineId, (long long)numMatches);
   }
 
-  // Return dummy output (1 row) to indicate progress
-  // This matches the skip_output behavior of CudfHashJoinProbe.
-  auto outputType = outputType_;
-  if (CudfConfig::getInstance().benchmarkSkipOutput && numMatches > 0) {
-    // Create a minimal 1-row output
-    std::vector<VectorPtr> children(outputType->size());
-    for (int i = 0; i < outputType->size(); i++) {
-      children[i] = BaseVector::createNullConstant(
-          outputType->childAt(i), 1, pool());
-    }
-    return std::make_shared<RowVector>(
-        pool(), outputType, nullptr, 1, std::move(children));
-  } else if (numMatches == 0) {
+  if (numMatches == 0) {
     return nullptr;
   }
 
-  // Non-skip path: also return 1 row (we don't implement full D2H for rows)
-  std::vector<VectorPtr> children(outputType->size());
-  for (int i = 0; i < outputType->size(); i++) {
-    children[i] = BaseVector::createNullConstant(
-        outputType->childAt(i), 1, pool());
+  // skip_output path: return dummy 1-row to indicate progress
+  if (CudfConfig::getInstance().benchmarkSkipOutput) {
+    std::vector<VectorPtr> children(outputType_->size());
+    for (int i = 0; i < outputType_->size(); i++) {
+      children[i] = BaseVector::createNullConstant(
+          outputType_->childAt(i), 1, pool());
+    }
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, 1, std::move(children));
   }
-  return std::make_shared<RowVector>(
-      pool(), outputType, nullptr, 1, std::move(children));
+
+  // Normal path: return a RowStoreVector wrapping the gathered output buffer.
+  // The buffer layout matches outputType column order (described by outputFields_).
+  // This is structurally correct for chained joins — downstream operators
+  // can consume it as RowStoreVector and index fields by outputType column order.
+
+  // Clone the output fields buffer (each RowStoreVector needs its own copy
+  // since the probe operator reuses outputFieldsBuffer_ across batches)
+  rmm::device_buffer outFieldsBuf(
+      outputFieldsBuffer_.data(),
+      outputFieldsBuffer_.size(), stream);
+
+  // Transfer ownership of the gathered row data to the output vector.
+  // Allocate a fresh probeGatherBuffer_ for the next batch.
+  rmm::device_buffer outputRowData = std::move(probeGatherBuffer_);
+  gatherCapacity_ = 0;  // force realloc on next batch
+
+  return std::make_shared<RowStoreVector>(
+      pool(),
+      outputType_,
+      static_cast<int64_t>(numMatches),
+      std::move(outputRowData),
+      std::move(outFieldsBuf),
+      outputFields_,
+      outputRowWidth_,
+      stream);
 }
 
 void RowHashJoinProbe::doNoMoreInput() {
