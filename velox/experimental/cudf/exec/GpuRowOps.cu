@@ -425,3 +425,76 @@ void columnsToRows(
   cudaFreeAsync(d_cols, stream);
 }
 
+// ============================================================================
+// Kernel: transpose fixed-stride row buffer back into columnar layout on GPU
+// (reverse of columns_to_rows_kernel). Used at the last row-mode join to
+// produce cudf columns consumable by downstream columnar operators.
+// ============================================================================
+
+__global__ void rows_to_columns_kernel(
+    const uint8_t* __restrict__ row_buffer,
+    int32_t row_width,
+    const ColDesc* __restrict__ cols,
+    int32_t num_cols,
+    int32_t num_rows) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+
+  const uint8_t* src_row = row_buffer + (int64_t)row * row_width;
+  for (int c = 0; c < num_cols; c++) {
+    const uint8_t* src = src_row + cols[c].offset;
+    // cols[c].data is the destination column base (naturally aligned).
+    uint8_t* dst = const_cast<uint8_t*>(cols[c].data) +
+        (int64_t)row * cols[c].byte_width;
+    int w = cols[c].byte_width;
+    // Source alignment within the row is not guaranteed; destination is.
+    if (w == 8 && ((reinterpret_cast<uintptr_t>(src) & 7) == 0)) {
+      *reinterpret_cast<uint64_t*>(dst) =
+          *reinterpret_cast<const uint64_t*>(src);
+    } else if (w == 4 && ((reinterpret_cast<uintptr_t>(src) & 3) == 0)) {
+      *reinterpret_cast<uint32_t*>(dst) =
+          *reinterpret_cast<const uint32_t*>(src);
+    } else if (w == 2 && ((reinterpret_cast<uintptr_t>(src) & 1) == 0)) {
+      *reinterpret_cast<uint16_t*>(dst) =
+          *reinterpret_cast<const uint16_t*>(src);
+    } else {
+      for (int b = 0; b < w; b++) {
+        dst[b] = src[b];
+      }
+    }
+  }
+}
+
+/// Transpose a fixed-stride row buffer into columnar device buffers.
+/// d_col_ptrs[i] must point to a pre-allocated device buffer of at least
+/// num_rows * field_descs[i].byte_width bytes.
+void rowsToColumns(
+    const uint8_t* d_row_buffer,
+    const FieldDesc* field_descs,
+    uint8_t* const* d_col_ptrs,
+    int32_t num_cols,
+    int32_t num_rows,
+    int32_t row_width,
+    cudaStream_t stream) {
+  if (num_rows == 0 || num_cols == 0) return;
+
+  // Build ColDesc array on thread-local stack (no heap alloc, no race)
+  for (int i = 0; i < num_cols; i++) {
+    tl_host_col_desc[i].data = d_col_ptrs[i];
+    tl_host_col_desc[i].offset = field_descs[i].offset;
+    tl_host_col_desc[i].byte_width = field_descs[i].byte_width;
+  }
+
+  ColDesc* d_cols;
+  cudaMallocAsync(&d_cols, num_cols * sizeof(ColDesc), stream);
+  cudaMemcpyAsync(d_cols, tl_host_col_desc, num_cols * sizeof(ColDesc),
+      cudaMemcpyHostToDevice, stream);
+
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  rows_to_columns_kernel<<<grid, block, 0, stream>>>(
+      d_row_buffer, row_width, d_cols, num_cols, num_rows);
+
+  cudaFreeAsync(d_cols, stream);
+}
+

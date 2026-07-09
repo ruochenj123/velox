@@ -17,7 +17,7 @@
  *   - Inner join only
  *   - No filter expressions
  *   - Fixed-width types only (no VARCHAR)
- *   - Single join key (first column = join key)
+ *   - Composite (multi-column) join keys supported
  */
 
 #pragma once
@@ -53,10 +53,12 @@ class RowHashJoinBridge : public exec::JoinBridge {
     // Ownership of device memory
     rmm::device_buffer rowBuffer;
     rmm::device_buffer fieldsBuffer;
-    // Hash join object built from key column
+    // Hash join object built from key column(s)
     std::shared_ptr<cudf::hash_join> hashJoin;
-    // Key column on GPU (extracted from row store)
-    rmm::device_buffer keyBuffer;
+    // Key columns on GPU (one buffer per join key, extracted from row store).
+    // cudf::hash_join references the build key table for its lifetime, so these
+    // buffers must outlive `hashJoin`.
+    std::vector<rmm::device_buffer> keyBuffers;
     int64_t numRows;
     int32_t rowWidth;
     // Host-side field descriptors (for probe to compute output layout)
@@ -155,15 +157,29 @@ class RowHashJoinProbe : public CudfOperatorBase {
   // Pre-allocated device buffers (reused per batch)
   rmm::device_buffer probeRowBuffer_;      // probe rows on GPU
   rmm::device_buffer probeFieldsBuffer_;   // FieldDesc on GPU
-  rmm::device_buffer probeKeyBuffer_;      // extracted probe keys
+  std::vector<rmm::device_buffer> probeKeyBuffers_;  // extracted probe keys (one per join key)
   rmm::device_buffer probeGatherBuffer_;   // gathered output rows
 
   int64_t probeRowCapacity_ = 0;
+  int64_t probeKeyCapacity_ = 0;
   int64_t gatherCapacity_ = 0;
   bool fieldsUploaded_ = false;
 
   bool initialized_ = false;
   bool finished_ = false;
+
+  // Terminal detection: whether this probe is the LAST row-mode join in the
+  // chain (its downstream consumer is a columnar cudf operator, not another
+  // RowHashJoinProbe). When terminal, doGetOutput emits a column-major
+  // CudfVector (row->col transpose) instead of a row-major RowStoreVector.
+  // Tri-state: -1 = not yet determined, 0 = chained (emit RowStoreVector),
+  // 1 = terminal (emit CudfVector).
+  int emitColumnar_ = -1;
+
+  // Build a column-major CudfVector from the gathered row buffer.
+  RowVectorPtr makeColumnarOutput(
+      int32_t numMatches,
+      rmm::cuda_stream_view stream);
 };
 
 // ============================================================================

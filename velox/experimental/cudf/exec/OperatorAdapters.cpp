@@ -161,6 +161,16 @@ class FilterProjectAdapter : public OperatorAdapter {
       return false;
     }
 
+    // [Benchmark] Force FilterProject to stay on CPU. This moves the
+    // Velox->cuDF (H2D) boundary to *after* the projection, so the fused
+    // output column crosses PCIe instead of the raw inputs.
+    if (CudfConfig::getInstance().benchmarkKeepProjectOnCpu) {
+      LOG_FALLBACK(
+          "FilterProject kept on CPU (benchmarkKeepProjectOnCpu), PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
     auto projectPlanNode =
         std::dynamic_pointer_cast<const core::ProjectNode>(planNode);
     auto filterNode = filterProjectOp->filterNode();

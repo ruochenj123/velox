@@ -101,3 +101,17 @@ void columnsToRows(
     uint8_t* d_row_buffer,
     cudaStream_t stream);
 
+/// Transpose a fixed-stride row buffer back into columnar device buffers
+/// (reverse of columnsToRows). Each d_col_ptrs[i] must point to a
+/// pre-allocated device buffer of at least num_rows * field_descs[i].byte_width
+/// bytes. Used at the last row-mode join to hand columnar data to downstream
+/// cudf operators (aggregation, orderBy, ...).
+void rowsToColumns(
+    const uint8_t* d_row_buffer,
+    const FieldDesc* field_descs,
+    uint8_t* const* d_col_ptrs,
+    int32_t num_cols,
+    int32_t num_rows,
+    int32_t row_width,
+    cudaStream_t stream);
+

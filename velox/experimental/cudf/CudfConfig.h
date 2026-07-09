@@ -162,6 +162,13 @@ struct CudfConfig {
   /// Use for Gantt-chart timeline reconstruction.
   bool benchmarkLogTimeline{false};
 
+  /// [Benchmark] When true, FilterProject nodes are kept on the CPU instead
+  /// of being replaced by CudfFilterProject. This pushes elementwise
+  /// projections (e.g. TPC-H revenue = extendedprice*(1-discount)) to the CPU
+  /// so the fused output column crosses PCIe instead of the raw inputs,
+  /// reducing H2D transfer. Requires allowCpuFallback=true.
+  bool benchmarkKeepProjectOnCpu{false};
+
 };
 
 } // namespace facebook::velox::cudf_velox

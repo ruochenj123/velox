@@ -10,15 +10,21 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/RowStoreVector.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 
 #include "velox/exec/Task.h"
+#include "velox/exec/Driver.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime.h>
 
@@ -111,6 +117,38 @@ int32_t cudfTypeWidth(cudf::type_id id) {
       return 4;
     default:
       VELOX_FAIL("RowHashJoin: unsupported cudf type_id {}", (int)id);
+  }
+}
+
+/// Extract all join-key columns from a fixed-stride row store into separate
+/// device buffers and append a matching cudf::column_view for each. Supports
+/// composite (multi-column) keys: cudf::hash_join compares row-wise across all
+/// key columns. Buffers are appended to `outBuffers` (ownership) and views to
+/// `outViews`; the caller must keep `outBuffers` alive as long as the views /
+/// any hash_join built from them are used (the build key table is referenced
+/// by cudf::hash_join for its lifetime).
+void extractKeyColumns(
+    const GpuFixedRowStore& store,
+    const std::vector<FieldDesc>& fields,
+    const std::vector<cudf::size_type>& keyColIndices,
+    int64_t numRows,
+    rmm::cuda_stream_view stream,
+    std::vector<rmm::device_buffer>& outBuffers,
+    std::vector<cudf::column_view>& outViews) {
+  for (auto colIdx : keyColIndices) {
+    int32_t keyOffset = fields[colIdx].offset;
+    int32_t keyWidth = fields[colIdx].byte_width;
+    rmm::device_buffer buf(numRows * keyWidth, stream);
+    extractKeysFromRows(
+        store, keyOffset, keyWidth, buf.data(), stream.value());
+    // View captures buf.data() before the move; rmm move preserves the device
+    // pointer, so the view stays valid once buf is moved into outBuffers.
+    outViews.emplace_back(
+        cudf::data_type{
+            keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
+        static_cast<cudf::size_type>(numRows),
+        buf.data(), nullptr, 0);
+    outBuffers.push_back(std::move(buf));
   }
 }
 
@@ -279,7 +317,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   std::vector<FieldDesc> fields;
   rmm::device_buffer rowBuffer;
   rmm::device_buffer fieldsBuffer;
-  rmm::device_buffer keyBuffer;
+  std::vector<rmm::device_buffer> keyBuffers;
   std::shared_ptr<cudf::hash_join> hashJoin;
 
   if (firstRowStore) {
@@ -314,12 +352,14 @@ void RowHashJoinBuild::doNoMoreInput() {
     fieldsBuffer = rmm::device_buffer(
         fields.data(), fields.size() * sizeof(FieldDesc), stream);
 
-    // RowStoreVector path: key is embedded in rows, need to extract
+    // RowStoreVector path: keys are embedded in rows, need to extract.
     auto rightKeys = joinNode_->rightKeys();
     auto rightType = joinNode_->sources()[1]->outputType();
-    int keyColIdx = rightType->getChildIdx(rightKeys[0]->name());
-    int32_t keyOffset = fields[keyColIdx].offset;
-    int32_t keyWidth = fields[keyColIdx].byte_width;
+    std::vector<cudf::size_type> keyColIndices;
+    for (auto& k : rightKeys) {
+      keyColIndices.push_back(
+          static_cast<cudf::size_type>(rightType->getChildIdx(k->name())));
+    }
 
     GpuFixedRowStore tmpStore;
     tmpStore.row_buffer = static_cast<uint8_t*>(rowBuffer.data());
@@ -328,16 +368,12 @@ void RowHashJoinBuild::doNoMoreInput() {
     tmpStore.num_fields = fields.size();
     tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
 
-    keyBuffer = rmm::device_buffer(numRows * keyWidth, stream);
-    extractKeysFromRows(
-        tmpStore, keyOffset, keyWidth,
-        keyBuffer.data(), stream.value());
+    std::vector<cudf::column_view> keyViews;
+    extractKeyColumns(
+        tmpStore, fields, keyColIndices, numRows, stream,
+        keyBuffers, keyViews);
 
-    auto keyCol = cudf::column_view(
-        cudf::data_type{keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
-        static_cast<cudf::size_type>(numRows),
-        keyBuffer.data(), nullptr, 0);
-    auto keyTable = cudf::table_view({keyCol});
+    auto keyTable = cudf::table_view(keyViews);
     hashJoin = std::make_shared<cudf::hash_join>(
         keyTable, cudf::null_equality::UNEQUAL, stream);
   } else {
@@ -357,14 +393,16 @@ void RowHashJoinBuild::doNoMoreInput() {
     auto buildView = concatenated->view();
     numRows = buildView.num_rows();
 
-    // Identify key column
+    // Identify key columns (composite keys supported)
     auto rightKeys = joinNode_->rightKeys();
     auto rightType = joinNode_->sources()[1]->outputType();
-    int keyColIdx = rightType->getChildIdx(rightKeys[0]->name());
-    auto keyColView = buildView.column(keyColIdx);
-    int32_t keyWidth = cudfTypeWidth(keyColView.type().id());
+    std::vector<cudf::size_type> keyColIndices;
+    for (auto& k : rightKeys) {
+      keyColIndices.push_back(
+          static_cast<cudf::size_type>(rightType->getChildIdx(k->name())));
+    }
 
-    // Include ALL columns (including key) in row layout, then extract key.
+    // Include ALL columns (including keys) in row layout, then extract keys.
     // This is the general design: rows carry all columns, and each operator
     // extracts what it needs. Cost of extract is negligible (<4%).
     auto [f, rw] = computeRowLayoutFromTable(buildView);
@@ -406,7 +444,7 @@ void RowHashJoinBuild::doNoMoreInput() {
     fieldsBuffer = rmm::device_buffer(
         fields.data(), fields.size() * sizeof(FieldDesc), stream);
 
-    // Extract key from rows for hash table construction
+    // Extract keys from rows for hash table construction
     GpuFixedRowStore tmpStore;
     tmpStore.row_buffer = static_cast<uint8_t*>(rowBuffer.data());
     tmpStore.row_width = rowWidth;
@@ -414,18 +452,13 @@ void RowHashJoinBuild::doNoMoreInput() {
     tmpStore.num_fields = fields.size();
     tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
 
-    int32_t keyOffset = fields[keyColIdx].offset;
-    keyBuffer = rmm::device_buffer(numRows * keyWidth, stream);
-    extractKeysFromRows(
-        tmpStore, keyOffset, keyWidth,
-        keyBuffer.data(), stream.value());
+    std::vector<cudf::column_view> keyViews;
+    extractKeyColumns(
+        tmpStore, fields, keyColIndices, numRows, stream,
+        keyBuffers, keyViews);
 
-    // Build hash table from extracted key
-    auto keyCol = cudf::column_view(
-        cudf::data_type{keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
-        static_cast<cudf::size_type>(numRows),
-        keyBuffer.data(), nullptr, 0);
-    auto keyTable = cudf::table_view({keyCol});
+    // Build hash table from extracted key(s)
+    auto keyTable = cudf::table_view(keyViews);
     hashJoin = std::make_shared<cudf::hash_join>(
         keyTable, cudf::null_equality::UNEQUAL, stream);
   }
@@ -446,7 +479,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.rowBuffer = std::move(rowBuffer);
   bd.fieldsBuffer = std::move(fieldsBuffer);
   bd.hashJoin = std::move(hashJoin);
-  bd.keyBuffer = std::move(keyBuffer);
+  bd.keyBuffers = std::move(keyBuffers);
   bd.numRows = numRows;
   bd.rowWidth = rowWidth;
   bd.hostFields = std::move(fields);
@@ -594,12 +627,6 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       fieldsUploaded_ = true;
     }
 
-    // Ensure key buffer is large enough
-    if (probeRows > probeRowCapacity_) {
-      probeRowCapacity_ = probeRows;
-      probeKeyBuffer_ = rmm::device_buffer(probeRows * 8, stream);
-    }
-
     probeGpuStore.row_buffer = static_cast<uint8_t*>(rowStoreInput->gpuRowData());
     probeGpuStore.row_width = probeRowWidth_;
     probeGpuStore.num_rows = probeRows;
@@ -629,9 +656,6 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     if (probeRows > probeRowCapacity_) {
       probeRowCapacity_ = probeRows;
       probeRowBuffer_ = rmm::device_buffer(probeRowBytes, stream);
-      // Allocate key buffer for extraction
-      int32_t keyWidth = cudfTypeWidth(probeView.column(leftKeyIndices_[0]).type().id());
-      probeKeyBuffer_ = rmm::device_buffer(probeRows * keyWidth, stream);
       if (!fieldsUploaded_) {
         probeFieldsBuffer_ = rmm::device_buffer(
             probeFields_.data(), probeFields_.size() * sizeof(FieldDesc), stream);
@@ -729,20 +753,38 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     outputLayoutComputed_ = true;
   }
 
-  // ---- 2. Extract probe key from row buffer ----
-  int32_t keyOffset = probeFields_[leftKeyIndices_[0]].offset;
-  int32_t keyWidth = probeFields_[leftKeyIndices_[0]].byte_width;
-  extractKeysFromRows(
-      probeGpuStore, keyOffset, keyWidth,
-      probeKeyBuffer_.data(), stream.value());
-  const void* keyData = probeKeyBuffer_.data();
+  // ---- 2. Extract probe keys from row buffer (one buffer per join key) ----
+  const int numKeys = static_cast<int>(leftKeyIndices_.size());
+  if (static_cast<int>(probeKeyBuffers_.size()) != numKeys) {
+    probeKeyBuffers_.clear();
+    probeKeyBuffers_.resize(numKeys);
+    probeKeyCapacity_ = 0;
+  }
+  if (probeRows > probeKeyCapacity_) {
+    probeKeyCapacity_ = probeRows;
+    for (int k = 0; k < numKeys; k++) {
+      int32_t kw = probeFields_[leftKeyIndices_[k]].byte_width;
+      probeKeyBuffers_[k] = rmm::device_buffer((int64_t)probeRows * kw, stream);
+    }
+  }
+
+  std::vector<cudf::column_view> probeKeyViews;
+  probeKeyViews.reserve(numKeys);
+  for (int k = 0; k < numKeys; k++) {
+    int32_t keyOffset = probeFields_[leftKeyIndices_[k]].offset;
+    int32_t keyWidth = probeFields_[leftKeyIndices_[k]].byte_width;
+    extractKeysFromRows(
+        probeGpuStore, keyOffset, keyWidth,
+        probeKeyBuffers_[k].data(), stream.value());
+    probeKeyViews.emplace_back(
+        cudf::data_type{
+            keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
+        static_cast<cudf::size_type>(probeRows),
+        probeKeyBuffers_[k].data(), nullptr, 0);
+  }
 
   // ---- 3. Hash probe ----
-  auto probeKeyCol = cudf::column_view(
-      cudf::data_type{keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
-      static_cast<cudf::size_type>(probeRows),
-      keyData, nullptr, 0);
-  auto probeKeyTable = cudf::table_view({probeKeyCol});
+  auto probeKeyTable = cudf::table_view(probeKeyViews);
 
   auto [leftIndices, rightIndices] = bd.hashJoin->inner_join(
       probeKeyTable, std::nullopt, stream, get_temp_mr());
@@ -790,7 +832,18 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     cudaEventRecord(gatherEnd, stream.value());
   }
 
-  stream.synchronize();
+  // NOTE: No stream.synchronize() here. The gather kernel above and the
+  // input-buffer free below (rowStoreInput.reset()/input_.reset()) are ordered
+  // on the same `stream`. The RMM memory resource in use (pool/async/arena/
+  // managed_* — see createMemoryResource in GpuResources.cpp) is
+  // stream-ordered: deallocate() returns the block to the freeing stream's
+  // free list and any cross-stream reuse waits on a recorded event, so the
+  // input buffer cannot be handed out until this stream's gather completes.
+  // The sync is therefore redundant for correctness. We keep it only when
+  // measuring gather time in isolation.
+  if (timeGather) {
+    stream.synchronize();
+  }
 
   // Record gather time as operator stat
   if (timeGather) {
@@ -833,6 +886,37 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         pool(), outputType_, nullptr, 1, std::move(children));
   }
 
+  // ---- Determine (once) whether this is the terminal row-mode join ----
+  // A probe is terminal if the operator immediately downstream in the driver
+  // pipeline is NOT another RowHashJoinProbe (i.e. it's a columnar cudf op
+  // such as aggregation/orderBy). Terminal probes must emit CudfVector so the
+  // downstream columnar operator can consume it; chained probes emit
+  // RowStoreVector so the next row-join skips the col->row transpose.
+  if (emitColumnar_ < 0) {
+    emitColumnar_ = 1; // default: assume terminal (safe: always consumable)
+    auto* driver = operatorCtx_->driver();
+    if (driver != nullptr) {
+      const auto ops = driver->operators();
+      // Find self, then inspect the next operator in the pipeline.
+      for (size_t i = 0; i + 1 < ops.size(); i++) {
+        if (ops[i] == this) {
+          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
+            emitColumnar_ = 0; // next op is a row-join -> keep row layout
+          }
+          break;
+        }
+      }
+    }
+    addRuntimeStat(
+        "rowJoinEmitColumnar",
+        RuntimeCounter(static_cast<int64_t>(emitColumnar_)));
+  }
+
+  // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
+  if (emitColumnar_ == 1) {
+    return makeColumnarOutput(numMatches, stream);
+  }
+
   // Normal path: return a RowStoreVector wrapping the gathered output buffer.
   // The buffer layout matches outputType column order (described by outputFields_).
   // This is structurally correct for chained joins — downstream operators
@@ -857,6 +941,79 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       std::move(outFieldsBuf),
       outputFields_,
       outputRowWidth_,
+      stream);
+}
+
+// ============================================================================
+// makeColumnarOutput — row->col transpose at the terminal join
+// ============================================================================
+// Converts the gathered fixed-stride row buffer (probeGatherBuffer_, layout
+// described by outputFields_ / outputRowWidth_) into a column-major cudf::table
+// wrapped in a CudfVector, so that downstream columnar cudf operators
+// (aggregation, orderBy, ...) can consume it.
+RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  const int32_t numCols = outputType_->size();
+  VELOX_CHECK_EQ(static_cast<size_t>(numCols), outputFields_.size());
+
+  // Allocate one device buffer per output column and remember its base ptr.
+  std::vector<std::unique_ptr<rmm::device_buffer>> colBuffers;
+  colBuffers.reserve(numCols);
+  std::vector<uint8_t*> colPtrs(numCols);
+  for (int i = 0; i < numCols; i++) {
+    int64_t bytes = static_cast<int64_t>(numMatches) *
+        outputFields_[i].byte_width;
+    auto buf = std::make_unique<rmm::device_buffer>(bytes, stream);
+    colPtrs[i] = static_cast<uint8_t*>(buf->data());
+    colBuffers.push_back(std::move(buf));
+  }
+
+  // Scatter row buffer -> columns.
+  rowsToColumns(
+      static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+      outputFields_.data(),
+      colPtrs.data(),
+      numCols,
+      numMatches,
+      outputRowWidth_,
+      stream.value());
+
+  // Wrap each device buffer as a cudf::column with the right type.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(numCols);
+  for (int i = 0; i < numCols; i++) {
+    auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
+    columns.push_back(std::make_unique<cudf::column>(
+        cudfType,
+        static_cast<cudf::size_type>(numMatches),
+        std::move(*colBuffers[i]),      // data buffer (ownership moved)
+        rmm::device_buffer{},           // no null mask
+        0));                            // null count
+  }
+
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  // Gather buffer is consumed by the per-column copies above; force realloc.
+  gatherCapacity_ = 0;
+  probeGatherBuffer_ = rmm::device_buffer{};
+
+  // NOTE: No stream.synchronize() here. rowsToColumns above and the
+  // probeGatherBuffer_ free are ordered on the same `stream`, and the RMM
+  // resource is stream-ordered (see createMemoryResource in GpuResources.cpp),
+  // so the gather buffer cannot be reused until the transpose completes. The
+  // returned CudfVector carries `stream`, so downstream operators observe the
+  // scattered columns via the standard stream-ordered consumption contract.
+
+  addRuntimeStat(
+      "rowToColOutputRows",
+      RuntimeCounter(static_cast<int64_t>(numMatches)));
+
+  return std::make_shared<CudfVector>(
+      pool(),
+      outputType_,
+      static_cast<vector_size_t>(numMatches),
+      std::move(table),
       stream);
 }
 
