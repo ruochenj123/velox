@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
@@ -31,6 +32,7 @@
 
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/HashProbe.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/Values.h"
 
@@ -67,6 +69,91 @@ core::PlanNodePtr CompileState::getPlanNode(const core::PlanNodeId& id) const {
 
 bool CompileState::compile(bool allowCpuFallback) {
   auto operators = driver_.operators();
+
+  // ---- Fused multi-way probe pre-pass ----
+  // When enabled, replace a maximal run of >=2 consecutive inner-join
+  // HashProbe operators on this pipeline with a single FusedRowHashJoinProbe
+  // that walks each probe tuple through all N build hash tables in one kernel.
+  // Runs before the per-operator adaptation loop so those HashProbe operators
+  // are consumed here (the normal RowHashJoinProbeAdapter never sees them).
+  if (CudfConfig::getInstance().benchmarkFusedProbe &&
+      CudfConfig::getInstance().benchmarkRowWiseGather) {
+    auto* preCtx = driver_.driverCtx();
+    auto isValidId = [](const core::PlanNodeId& id) {
+      return !id.empty() && id != "N/A";
+    };
+    auto isFusibleProbe = [&](exec::Operator* op)
+        -> std::shared_ptr<const core::HashJoinNode> {
+      if (dynamic_cast<const exec::HashProbe*>(op) == nullptr) {
+        return nullptr;
+      }
+      if (!isValidId(op->planNodeId())) {
+        return nullptr;
+      }
+      auto node = std::dynamic_pointer_cast<const core::HashJoinNode>(
+          getPlanNode(op->planNodeId()));
+      if (!node || node->joinType() != core::JoinType::kInner ||
+          node->filter()) {
+        return nullptr;
+      }
+      return node;
+    };
+
+    for (int32_t i = 0; i < static_cast<int32_t>(operators.size());) {
+      std::vector<std::shared_ptr<const core::HashJoinNode>> runNodes;
+      int32_t j = i;
+      while (j < static_cast<int32_t>(operators.size())) {
+        auto node = isFusibleProbe(operators[j]);
+        if (!node) {
+          break;
+        }
+        runNodes.push_back(node);
+        ++j;
+      }
+      // Normally the fused probe only replaces a RUN of >=2 joins (a single
+      // join has nothing to fuse). benchmarkFuseSingleJoin lets it fire on a
+      // single join too: that yields a FusedRowHashJoinProbe with numSteps=1,
+      // i.e. our ROW-NATIVE join primitive (row build store + device-probeable
+      // GpuHashTable + probe-and-materialize in one kernel) standing in for
+      // cudf::inner_join. It isolates the row-layout join from fusion, so we can
+      // ask whether the primitive is good BEFORE asking whether chaining it wins.
+      const size_t minRun =
+          CudfConfig::getInstance().benchmarkFuseSingleJoin ? 1 : 2;
+      if (runNodes.size() >= minRun) {
+        std::vector<std::unique_ptr<exec::Operator>> fused;
+
+        // GPU re-batching is orthogonal to the layout: give the fused probe the
+        // same large batches CudfBatchConcat gives the columnar probe, so the
+        // comparison isolates the layout rather than the batch size. The fused
+        // probe replaced the WHOLE chain, so a single concat in front of it is
+        // all there is -- unlike column mode, which needs one before every
+        // probe because each join re-materialises a (shrinking) intermediate.
+        if (CudfConfig::getInstance().benchmarkConcatBeforeJoin) {
+          fused.push_back(
+              std::make_unique<CudfBatchConcat>(
+                  operators[i]->operatorId(),
+                  preCtx,
+                  runNodes.front(),
+                  runNodes.front()->sources()[0]->outputType()));
+        }
+
+        // Record which joins are fused so RowHashJoinBuild builds only the
+        // device map for them (and skips the dead cudf::hash_join). Done before
+        // the move below consumes runNodes.
+        for (const auto& rn : runNodes) {
+          CudfConfig::getInstance().markProbeFused(rn->id());
+        }
+        fused.push_back(std::make_unique<FusedRowHashJoinProbe>(
+            operators[i]->operatorId(), preCtx, std::move(runNodes)));
+        // Replace the half-open range [i, j) with the single fused operator.
+        driverFactory_.replaceOperators(driver_, i, j, std::move(fused));
+        operators = driver_.operators();
+        ++i; // step past the fused operator
+      } else {
+        i = (j > i) ? j : i + 1;
+      }
+    }
+  }
 
   // Cache debug flag to avoid repeated getInstance() calls
   const bool debugEnabled = CudfConfig::getInstance().debugEnabled;
@@ -108,6 +195,23 @@ bool CompileState::compile(bool allowCpuFallback) {
         if (isAnyOf<CudfOperator>(op)) {
           // CudfOperator is always fully GPU compatible
           // (runs on GPU, accepts GPU input, produces GPU output).
+          props.canRunOnGPU = true;
+          props.acceptsGpuInput = true;
+          props.producesGpuOutput = true;
+        }
+        if (isAnyOf<FusedRowHashJoinProbe, CudfBatchConcat>(op)) {
+          // Both are inserted by the fused PRE-PASS, before this loop runs, so
+          // unlike operators created inside an adapter's createReplacements they
+          // ARE re-examined here -- and no adapter matches either of them.
+          //
+          // Note CudfOperatorBase does NOT inherit CudfOperator (they are
+          // unrelated classes), so the isAnyOf<CudfOperator> test above does not
+          // catch them. Without this, they are judged CPU operators and a
+          // CudfToVelox is inserted in front, handing CudfBatchConcat a Velox
+          // RowVector -- which trips its "expects CudfVector input" check.
+          //
+          // Both consume GPU input (CudfVector / RowStoreVector) and produce GPU
+          // output, so mark them fully GPU compatible.
           props.canRunOnGPU = true;
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
@@ -194,7 +298,16 @@ bool CompileState::compile(bool allowCpuFallback) {
       }
     } else {
       // special case for CudfOperator
-      if (isAnyOf<CudfOperator>(oper)) {
+      //
+      // CudfBatchConcat must be listed for the same reason FusedRowHashJoinProbe
+      // is: the fused pre-pass inserts BOTH into the operator list before this
+      // loop, so both are re-examined here, and neither has an adapter nor
+      // inherits CudfOperator. Omitting it makes the concat a "pure CPU"
+      // operator, which aborts the task outright when allowCpuFallback=false.
+      // See the matching isAnyOf<> in the properties lambda above -- these two
+      // lists have to agree.
+      if (isAnyOf<CudfOperator>(oper) ||
+          isAnyOf<FusedRowHashJoinProbe, CudfBatchConcat>(oper)) {
         isPureCpuOperator = false;
       } else {
         // CPU operator without adapter
@@ -366,6 +479,16 @@ void unregisterCudf() {
 CudfConfig& CudfConfig::getInstance() {
   static CudfConfig instance;
   return instance;
+}
+
+void CudfConfig::markProbeFused(const std::string& joinNodeId) {
+  std::lock_guard<std::mutex> l(fusedProbeMutex_);
+  fusedProbeJoinIds_.insert(joinNodeId);
+}
+
+bool CudfConfig::isProbeFused(const std::string& joinNodeId) const {
+  std::lock_guard<std::mutex> l(fusedProbeMutex_);
+  return fusedProbeJoinIds_.count(joinNodeId) > 0;
 }
 
 void CudfConfig::initialize(

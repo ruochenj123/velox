@@ -18,6 +18,8 @@
 #include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/RowHashJoin.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
@@ -37,6 +39,17 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+
+// Local CUDA error check for the row-ingest path (cudf's CUDF_CUDA_TRY is not
+// pulled in here, and a silent cudaHostAlloc failure would corrupt results).
+#define VELOX_CUDA_CHECK(expr)                          \
+  do {                                                  \
+    cudaError_t _err = (expr);                          \
+    VELOX_CHECK(                                        \
+        _err == cudaSuccess,                            \
+        "CUDA error in row ingest: {}",                 \
+        cudaGetErrorString(_err));                      \
+  } while (0)
 
 namespace facebook::velox::cudf_velox {
 
@@ -191,112 +204,204 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // Outputs RowStoreVector (flows directly to RowHashJoinProbe/Build).
   // Only enabled when both rowWiseMode AND cpuColToRow are set.
   const bool cpuColToRow = CudfConfig::getInstance().benchmarkCpuColToRow;
-  if (rowWiseMode && cpuColToRow) {
+
+  // Decide ONCE whether the downstream consumer can take rows. Emitting a
+  // RowStoreVector into an operator that only understands CudfVector is a hard
+  // crash, so default to columnar and opt in only for known row consumers.
+  if (emitRowStore_ < 0) {
+    emitRowStore_ = 0;
+    if (rowWiseMode && cpuColToRow) {
+      auto* driver = operatorCtx_->driver();
+      if (driver != nullptr) {
+        const auto ops = driver->operators();
+        for (size_t i = 0; i + 1 < ops.size(); i++) {
+          if (ops[i] == this) {
+            auto* next = ops[i + 1];
+            // CudfBatchConcat handles RowStoreVector too (see concatRowStore).
+            if (dynamic_cast<RowHashJoinProbe*>(next) != nullptr ||
+                dynamic_cast<RowHashJoinBuild*>(next) != nullptr ||
+                dynamic_cast<FusedRowHashJoinProbe*>(next) != nullptr ||
+                dynamic_cast<CudfBatchConcat*>(next) != nullptr) {
+              emitRowStore_ = 1;
+            }
+            break;
+          }
+        }
+      }
+    }
+    addRuntimeStat(
+        "fromVeloxEmitRowStore",
+        RuntimeCounter(static_cast<int64_t>(emitRowStore_)));
+  }
+
+  if (emitRowStore_ == 1) {
+    // All RowStoreVectors from this operator MUST share one stream -- see
+    // rowStream_ in the header. Acquire it once.
+    if (!rowStream_.has_value()) {
+      rowStream_ = stream;
+    }
+    stream = rowStream_.value();
+
     auto numRows = static_cast<int64_t>(input->size());
     auto rowType = std::dynamic_pointer_cast<const RowType>(input->type());
     VELOX_CHECK_NOT_NULL(rowType);
 
-    // Compute field layout from the RowType
-    std::vector<FieldDesc> fields;
-    int32_t offset = 0;
-    for (int i = 0; i < rowType->size(); i++) {
-      FieldDesc fd;
-      fd.offset = offset;
-      auto kind = rowType->childAt(i)->kind();
-      switch (kind) {
-        case TypeKind::BOOLEAN:
-        case TypeKind::TINYINT:
-          fd.byte_width = 1; break;
-        case TypeKind::SMALLINT:
-          fd.byte_width = 2; break;
-        case TypeKind::INTEGER:
-          fd.byte_width = 4; break;
-        case TypeKind::BIGINT:
-        case TypeKind::DOUBLE:
-          fd.byte_width = 8; break;
-        case TypeKind::REAL:
-          fd.byte_width = 4; break;
-        default:
-          VELOX_FAIL("RowCudfFromVelox: unsupported TypeKind {}", (int)kind);
+    // ---- Row layout: a property of the SCHEMA, so compute it exactly once ----
+    if (!rowLayoutReady_) {
+      int32_t offset = 0;
+      for (int i = 0; i < rowType->size(); i++) {
+        FieldDesc fd;
+        fd.offset = offset;
+        switch (rowType->childAt(i)->kind()) {
+          case TypeKind::BOOLEAN:
+          case TypeKind::TINYINT:
+            fd.byte_width = 1;
+            break;
+          case TypeKind::SMALLINT:
+            fd.byte_width = 2;
+            break;
+          case TypeKind::INTEGER: // includes DATE
+          case TypeKind::REAL:
+            fd.byte_width = 4;
+            break;
+          case TypeKind::BIGINT:
+          case TypeKind::DOUBLE:
+            fd.byte_width = 8;
+            break;
+          default:
+            VELOX_FAIL(
+                "Row ingest: unsupported TypeKind {}",
+                static_cast<int>(rowType->childAt(i)->kind()));
+        }
+        rowFields_.push_back(fd);
+        offset += fd.byte_width;
       }
-      fields.push_back(fd);
-      offset += fd.byte_width;
+      rowWidth_ = (offset + 7) & ~7; // 8-byte aligned stride
+      // Field descriptors are constant -- upload once, not once per batch.
+      rowFieldsDevice_ = rmm::device_buffer(
+          rowFields_.data(), rowFields_.size() * sizeof(FieldDesc), stream);
+      stream.synchronize(); // one-time, on the first batch only
+      rowLayoutReady_ = true;
     }
-    int32_t rowWidth = (offset + 7) & ~7; // 8-byte aligned
 
-    // CPU col→row conversion: pack columns into a contiguous row buffer
+    const int32_t rowWidth = rowWidth_;
+    const int64_t totalBytes = numRows * rowWidth;
+    const int numCols = rowType->size();
+
+    // ---- Acquire a PINNED host slot ----
+    //
+    // Pinned matters twice over: cudaMemcpyAsync from PAGEABLE memory is
+    // synchronous (it stages through a driver bounce buffer), so the old code
+    // was both ~2-3x slower on the wire AND blocking. Ping-ponging two slots
+    // means we never wait: by the time we come back to a slot, its copy
+    // completed a whole batch ago.
+    auto& slot = pinned_[pinnedSlot_];
+    pinnedSlot_ ^= 1;
+    if (slot.done == nullptr) {
+      VELOX_CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+    } else if (slot.inUse) {
+      VELOX_CUDA_CHECK(cudaEventSynchronize(slot.done)); // ~free: a batch has elapsed
+    }
+    if (slot.capacity < totalBytes) {
+      if (slot.host != nullptr) {
+        VELOX_CUDA_CHECK(cudaFreeHost(slot.host));
+      }
+      // Grow generously so this reallocation is rare rather than per-batch.
+      slot.capacity = std::max<int64_t>(totalBytes, slot.capacity * 2);
+      VELOX_CUDA_CHECK(cudaHostAlloc(
+          reinterpret_cast<void**>(&slot.host),
+          slot.capacity,
+          cudaHostAllocDefault));
+      // Zero ONCE, not per batch. Only the inter-field padding is never written
+      // by the packing loop below, and zeroing it once keeps it deterministic.
+      std::memset(slot.host, 0, slot.capacity);
+    }
+    slot.inUse = true;
+
+    // ---- Pack columns -> rows ----
+    //
+    // ROW-MAJOR outer loop: each iteration writes one row's fields to
+    // CONSECUTIVE bytes, so the store stream is sequential (which is what pinned
+    // / write-combining host memory wants). Reads are N sequential streams, one
+    // per column, which the hardware prefetcher handles.
+    //
+    // Typed stores for the common 8- and 4-byte widths, instead of the old
+    // scalar std::memcpy per field per row (numRows * numCols tiny memcpy calls).
     std::chrono::steady_clock::time_point cpuConvStart;
     if (logH2D) {
       cpuConvStart = std::chrono::steady_clock::now();
     }
 
-    int64_t totalBytes = numRows * rowWidth;
-    // Use a host buffer (pinned or regular) for the row data
-    std::vector<uint8_t> hostRowBuf(totalBytes, 0);
+    std::vector<const uint8_t*> srcs(numCols);
+    for (int c = 0; c < numCols; c++) {
+      auto raw = input->childAt(c)->valuesAsVoid();
+      VELOX_CHECK_NOT_NULL(raw, "Row ingest: null raw data for column {}", c);
+      srcs[c] = static_cast<const uint8_t*>(raw);
+    }
 
-    // For each column, copy data row-by-row into the packed layout
-    for (int col = 0; col < rowType->size(); col++) {
-      auto child = input->childAt(col);
-      auto rawData = child->valuesAsVoid();
-      VELOX_CHECK_NOT_NULL(rawData, "RowCudfFromVelox: null raw data for col {}", col);
-      int32_t fieldOffset = fields[col].offset;
-      int32_t fieldWidth = fields[col].byte_width;
-      const uint8_t* src = static_cast<const uint8_t*>(rawData);
-
-      for (int64_t row = 0; row < numRows; row++) {
-        std::memcpy(
-            hostRowBuf.data() + row * rowWidth + fieldOffset,
-            src + row * fieldWidth,
-            fieldWidth);
+    uint8_t* const base = slot.host;
+    for (int c = 0; c < numCols; c++) {
+      const int32_t off = rowFields_[c].offset;
+      const int32_t w = rowFields_[c].byte_width;
+      const uint8_t* src = srcs[c];
+      if (w == 8) {
+        const uint64_t* s = reinterpret_cast<const uint64_t*>(src);
+        uint8_t* d = base + off;
+        for (int64_t r = 0; r < numRows; r++, d += rowWidth) {
+          *reinterpret_cast<uint64_t*>(d) = s[r];
+        }
+      } else if (w == 4) {
+        const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+        uint8_t* d = base + off;
+        for (int64_t r = 0; r < numRows; r++, d += rowWidth) {
+          *reinterpret_cast<uint32_t*>(d) = s[r];
+        }
+      } else {
+        uint8_t* d = base + off;
+        for (int64_t r = 0; r < numRows; r++, d += rowWidth) {
+          std::memcpy(d, src + r * w, w);
+        }
       }
     }
 
     if (logH2D) {
-      auto cpuConvEnd = std::chrono::steady_clock::now();
-      auto cpuConvNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-          cpuConvEnd - cpuConvStart).count();
       addRuntimeStat(
           "cpuColToRowNanos",
-          RuntimeCounter(cpuConvNanos, RuntimeCounter::Unit::kNanos));
+          RuntimeCounter(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - cpuConvStart)
+                  .count(),
+              RuntimeCounter::Unit::kNanos));
     }
 
-    // H2D transfer
-    std::chrono::steady_clock::time_point h2dStart;
-    if (logH2D) {
-      h2dStart = std::chrono::steady_clock::now();
-    }
-
+    // ---- ONE contiguous H2D. No null masks, no per-column anything. ----
     rmm::device_buffer gpuRowBuf(totalBytes, stream);
-    cudaMemcpyAsync(
-        gpuRowBuf.data(), hostRowBuf.data(), totalBytes,
-        cudaMemcpyHostToDevice, stream.value());
-
-    // Upload field descriptors
-    rmm::device_buffer gpuFieldsBuf(
-        fields.data(), fields.size() * sizeof(FieldDesc), stream);
-
-    // Sync to ensure transfer complete before returning
-    stream.synchronize();
+    VELOX_CUDA_CHECK(cudaMemcpyAsync(
+        gpuRowBuf.data(),
+        slot.host,
+        totalBytes,
+        cudaMemcpyHostToDevice,
+        stream.value()));
+    // Record completion so this slot can be safely refilled two batches from
+    // now. NOTE: no stream.synchronize() -- that is the whole point.
+    VELOX_CUDA_CHECK(cudaEventRecord(slot.done, stream.value()));
 
     if (logH2D) {
-      auto h2dEnd = std::chrono::steady_clock::now();
-      auto h2dNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-          h2dEnd - h2dStart).count();
+      addRuntimeStat("h2dRows", RuntimeCounter(numRows));
       addRuntimeStat(
-          "h2dWallNanos",
-          RuntimeCounter(h2dNanos, RuntimeCounter::Unit::kNanos));
-      addRuntimeStat(
-          "h2dRows",
-          RuntimeCounter(static_cast<int64_t>(numRows)));
-      addRuntimeStat(
-          "h2dBytes",
-          RuntimeCounter(totalBytes, RuntimeCounter::Unit::kBytes));
+          "h2dBytes", RuntimeCounter(totalBytes, RuntimeCounter::Unit::kBytes));
     }
 
+    // The field descriptors live in rowFieldsDevice_ (uploaded once). Hand the
+    // RowStoreVector its own copy, since it takes ownership.
+    rmm::device_buffer fieldsCopy(
+        rowFieldsDevice_.data(), rowFieldsDevice_.size(), stream);
+
+    auto fieldsHostCopy = rowFields_;
     auto result = std::make_shared<RowStoreVector>(
         input->pool(), outputType_, numRows,
-        std::move(gpuRowBuf), std::move(gpuFieldsBuf),
-        std::move(fields), rowWidth, stream);
+        std::move(gpuRowBuf), std::move(fieldsCopy),
+        std::move(fieldsHostCopy), rowWidth, stream);
     if (logTimeline && driverId == 0) {
       printf("OPTRACE %lld d0 p%d FromVelox end %lld\n",
              (long long)timeNow(), pipelineId, (long long)numRows);
@@ -376,6 +481,23 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
 void CudfFromVelox::doClose() {
   // TODO(kn): Remove default stream after redesign of CudfFromVelox
   cudf::get_default_stream(cudf::allow_default_stream).synchronize();
+
+  // Release the pinned host slots used by the row-ingest path. Pinned memory is
+  // a scarce, process-wide resource -- leaking it across a 16-driver pipeline
+  // would starve every other H2D in the process.
+  for (auto& slot : pinned_) {
+    if (slot.done != nullptr) {
+      cudaEventSynchronize(slot.done);
+      cudaEventDestroy(slot.done);
+      slot.done = nullptr;
+    }
+    if (slot.host != nullptr) {
+      cudaFreeHost(slot.host);
+      slot.host = nullptr;
+      slot.capacity = 0;
+    }
+  }
+
   Operator::close();
   inputs_.clear();
 }

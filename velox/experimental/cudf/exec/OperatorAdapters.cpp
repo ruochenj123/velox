@@ -140,6 +140,40 @@ class TableScanAdapter : public OperatorAdapter {
   }
 };
 
+/// Approximate width of one row of `type`, in bytes.
+///
+/// Used to decide whether a scan-adjacent projection actually REDUCES what has
+/// to cross PCIe (see FilterProjectAdapter::canRunOnGPU). Only the comparison
+/// matters, not the absolute value, so fixed-width types use their real widths
+/// and VARCHAR gets a nominal charge -- enough for "did this projection drop a
+/// string column?" to come out the right way.
+static int64_t estimateRowBytes(const RowTypePtr& type) {
+  int64_t bytes = 0;
+  for (auto i = 0; i < type->size(); i++) {
+    switch (type->childAt(i)->kind()) {
+      case TypeKind::BOOLEAN:
+      case TypeKind::TINYINT:
+        bytes += 1;
+        break;
+      case TypeKind::SMALLINT:
+        bytes += 2;
+        break;
+      case TypeKind::INTEGER: // includes DATE (logical type over INTEGER)
+      case TypeKind::REAL:
+        bytes += 4;
+        break;
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+        bytes += 16; // nominal: strings are the thing we most want to drop
+        break;
+      default: // BIGINT, DOUBLE, TIMESTAMP, ...
+        bytes += 8;
+        break;
+    }
+  }
+  return bytes;
+}
+
 /// FilterProjectAdapter - Replaces with CudfFilterProject
 class FilterProjectAdapter : public OperatorAdapter {
  public:
@@ -161,19 +195,65 @@ class FilterProjectAdapter : public OperatorAdapter {
       return false;
     }
 
-    // [Benchmark] Force FilterProject to stay on CPU. This moves the
-    // Velox->cuDF (H2D) boundary to *after* the projection, so the fused
-    // output column crosses PCIe instead of the raw inputs.
-    if (CudfConfig::getInstance().benchmarkKeepProjectOnCpu) {
-      LOG_FALLBACK(
-          "FilterProject kept on CPU (benchmarkKeepProjectOnCpu), PlanNode id: {}",
-          planNode->id());
-      return false;
-    }
-
     auto projectPlanNode =
         std::dynamic_pointer_cast<const core::ProjectNode>(planNode);
     auto filterNode = filterProjectOp->filterNode();
+
+    // [Benchmark] Keep this FilterProject on the CPU, moving the Velox->cuDF
+    // (H2D) boundary to *after* it, so that fewer bytes cross PCIe.
+    //
+    // This is a PER-NODE decision, not a global switch. canRunOnGPU is called
+    // once per FilterProject operator with that operator's own plan node, so we
+    // answer differently for each. Two conditions must BOTH hold:
+    //
+    //   (1) SCAN-ADJACENT. The operator's input must come straight from a
+    //       TableScan, i.e. it sits BEFORE the H2D boundary already. A
+    //       mid-pipeline FilterProject is on the GPU; forcing it to the CPU
+    //       would insert a D2H/H2D round trip (e.g. TPC-H Q7's post-join
+    //       filter, Q8's post-aggregation division).
+    //
+    //   (2) IT MUST ACTUALLY REDUCE TRANSFERRED DATA. Either it filters (fewer
+    //       ROWS cross PCIe) or its output row is narrower than its input row
+    //       (fewer BYTES per row). A widening projection on the CPU sends MORE
+    //       data, defeating the purpose -- e.g. year(o_orderdate) turns a
+    //       4-byte DATE into an 8-byte BIGINT, so it belongs on the GPU, while
+    //       l_extendedprice*(1-l_discount) folds two 8-byte doubles into one
+    //       and belongs on the CPU.
+    //
+    // Together this is a cost-based placement of the H2D boundary rather than a
+    // benchmark flag: put the boundary after any scan-adjacent projection that
+    // shrinks what has to be transferred.
+    if (CudfConfig::getInstance().benchmarkKeepProjectOnCpu) {
+      // The operator's true upstream: when a Filter and a Project are fused
+      // into one FilterProject, planNode is the ProjectNode and its source is
+      // the FilterNode, so step through the filter to find the real source.
+      core::PlanNodePtr srcNode;
+      if (filterNode) {
+        srcNode = filterNode->sources()[0];
+      } else if (projectPlanNode) {
+        srcNode = projectPlanNode->sources()[0];
+      }
+
+      const bool scanAdjacent =
+          srcNode != nullptr &&
+          std::dynamic_pointer_cast<const core::TableScanNode>(srcNode) !=
+              nullptr;
+
+      bool reducesTransfer = (filterNode != nullptr); // drops rows
+      if (!reducesTransfer && srcNode != nullptr) {
+        reducesTransfer = estimateRowBytes(planNode->outputType()) <
+            estimateRowBytes(srcNode->outputType());
+      }
+
+      if (scanAdjacent && reducesTransfer) {
+        LOG_FALLBACK(
+            "FilterProject kept on CPU (scan-adjacent and reduces H2D), "
+            "PlanNode id: {}",
+            planNode->id());
+        return false;
+      }
+      // Otherwise fall through: run it on the GPU like any other operator.
+    }
 
     if (projectPlanNode) {
       if (projectPlanNode->sources()[0]->outputType()->size() == 0) {
@@ -423,6 +503,17 @@ class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().benchmarkConcatBeforeJoin) {
+      // Accumulate probe batches to batchSizeMinThreshold rows before probing.
+      // The concat's schema is the probe's *input* type -- sources()[0] is the
+      // probe side of a HashJoinNode -- not the join's output type.
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              joinPlanNode,
+              joinPlanNode->sources()[0]->outputType()));
+    }
     result.push_back(
         std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
@@ -500,6 +591,30 @@ class RowHashJoinProbeAdapter : public OperatorAdapter {
     auto joinPlanNode =
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
+
+    // GPU re-batching is ORTHOGONAL to the row/column layout choice -- it is a
+    // knob, not a rival design (exactly like concatOptimizationEnabled before
+    // the aggregation). Applying it to the row path too lets us ask the fair
+    // question: with BOTH given large probe batches, does the layout still win?
+    //
+    // HEAD OF THE CHAIN ONLY. CudfBatchConcat requires CudfVector input
+    // (VELOX_CHECK_NOT_NULL in doAddInput). Consecutive RowHashJoinProbes pass
+    // RowStoreVector to each other -- that format stickiness is the whole point
+    // of the row path -- so a concat in front of a downstream row probe would
+    // crash. One concat at the head is also sufficient: the batch size it
+    // establishes propagates down the chain.
+    const bool isChainHead =
+        std::dynamic_pointer_cast<const core::HashJoinNode>(
+            joinPlanNode->sources()[0]) == nullptr;
+    if (CudfConfig::getInstance().benchmarkConcatBeforeJoin && isChainHead) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              joinPlanNode,
+              joinPlanNode->sources()[0]->outputType()));
+    }
+
     result.push_back(
         std::make_unique<RowHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
@@ -763,7 +878,23 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
   }
 };
 
-/// ValuesAdapter - Keeps original operator
+/// ValuesAdapter - Keeps the original operator, but recognises GPU-RESIDENT input.
+///
+/// A ValuesNode holds RowVectorPtrs -- and CudfVector IS a RowVector. So a plan
+/// can be given vectors whose data already lives in GPU memory, and exec::Values
+/// will hand them straight to the next operator. That is how you benchmark the
+/// "data hot in GPU" regime that GPU-database papers actually measure: no I/O,
+/// no parquet decode, no H2D. The query is nothing but the query.
+///
+/// Without the check below this does not work. properties() AND-gates
+/// producesGpuOutput with canRunOnGPU, so returning canRunOnGPU=false (as this
+/// adapter used to, unconditionally) forces producesGpuOutput=false. ToCudf then
+/// inserts a CudfFromVelox after Values -- which would try to Arrow-convert data
+/// that is ALREADY on the device, i.e. a pointless D2H followed by an H2D.
+///
+/// We still keep the original exec::Values operator (keepOperator + empty
+/// createReplacements); all that changes is that we tell ToCudf its output is
+/// already on the GPU, so no conversion boundary is inserted.
 class ValuesAdapter : public OperatorAdapter {
  public:
   ValuesAdapter() : OperatorAdapter("Values") {}
@@ -776,18 +907,35 @@ class ValuesAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
+    // GPU-resident iff every value the node holds is a CudfVector.
+    auto valuesNode =
+        std::dynamic_pointer_cast<const core::ValuesNode>(planNode);
+    if (valuesNode != nullptr && !valuesNode->values().empty()) {
+      bool allGpu = true;
+      for (const auto& v : valuesNode->values()) {
+        if (std::dynamic_pointer_cast<CudfVector>(v) == nullptr) {
+          allGpu = false;
+          break;
+        }
+      }
+      if (allGpu) {
+        return true;
+      }
+    }
     LOG_FALLBACK(
-        "Values operator not supported on cuDF, PlanNode id: {}",
+        "Values operator not supported on cuDF (values are not CudfVectors), "
+        "PlanNode id: {}",
         planNode->id());
     return false;
   }
 
   bool acceptsGpuInput() const override {
-    return false;
+    return false; // it is a source; it has no input
   }
 
   bool producesGpuOutput() const override {
-    return false;
+    // Only consulted when canRunOnGPU is true, i.e. the values ARE CudfVectors.
+    return true;
   }
 
   std::vector<std::unique_ptr<exec::Operator>> createReplacements(

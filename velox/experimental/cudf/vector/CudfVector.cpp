@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -102,9 +103,32 @@ void logDefaultStreamIfNeeded(
   if (stream.value() != rmm::cuda_stream_default.value()) {
     return;
   }
-  LOG(WARNING) << constructorName
-               << " constructed with default CUDA stream. Backtrace:\n"
-               << process::StackTrace().toString();
+  // THIS RUNS ON THE HOT PATH -- once per CudfVector, i.e. once per operator
+  // output batch -- so it must stay cheap when it fires.
+  //
+  // It did not. `process::StackTrace().toString()` walks the stack and SYMBOLIZES
+  // every frame through folly's ELF symbolizer, which costs milliseconds. And
+  // glog evaluates the streamed arguments EAGERLY: LOG(WARNING) builds its
+  // message regardless of whether the severity is enabled, so --minloglevel
+  // does not suppress the cost, only the output.
+  //
+  // Measured (nsys CPU sampling, single-join GPU-resident bench, SF10): this one
+  // line was 56% of all CPU samples and ~30ms per iteration -- against ~10ms of
+  // actual GPU work. It also silently favoured whichever plan built FEWER
+  // CudfVectors, which made a row-vs-columnar comparison come out backwards.
+  //
+  // Keep the warning (default-stream use is worth knowing about) but make it
+  // once-only, and build the backtrace only when debug output is asked for.
+  if (CudfConfig::getInstance().debugEnabled) {
+    LOG(WARNING) << constructorName
+                 << " constructed with default CUDA stream. Backtrace:\n"
+                 << process::StackTrace().toString();
+    return;
+  }
+  LOG_FIRST_N(WARNING, 1)
+      << constructorName
+      << " constructed with default CUDA stream. Further warnings suppressed; "
+         "enable CudfConfig::debugEnabled for a backtrace.";
 }
 
 } // namespace

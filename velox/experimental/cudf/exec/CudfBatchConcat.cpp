@@ -25,11 +25,12 @@ namespace facebook::velox::cudf_velox {
 CudfBatchConcat::CudfBatchConcat(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    std::shared_ptr<const core::PlanNode> planNode)
+    std::shared_ptr<const core::PlanNode> planNode,
+    RowTypePtr outputType)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
-          planNode->outputType(),
+          outputType ? outputType : planNode->outputType(),
           planNode->id(),
           "CudfBatchConcat",
           nvtx3::rgb{211, 211, 211}, /* LightGrey */
@@ -40,15 +41,98 @@ CudfBatchConcat::CudfBatchConcat(
       targetRows_(CudfConfig::getInstance().batchSizeMinThreshold) {}
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
+  // Row-wise input (the row-ingest path produces RowStoreVector). Concatenating
+  // these is trivially cheap -- see concatRowStore().
+  if (auto rowVec = std::dynamic_pointer_cast<RowStoreVector>(input)) {
+    currentNumRows_ += rowVec->size();
+    rowBuffer_.push_back(std::move(rowVec));
+    return;
+  }
+
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
-  VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
+  VELOX_CHECK_NOT_NULL(
+      cudfVector,
+      "CudfBatchConcat expects CudfVector or RowStoreVector input");
 
   // Push input cudf table to buffer
   currentNumRows_ += cudfVector->getTableView().num_rows();
   buffer_.push_back(std::move(cudfVector));
 }
 
+// ============================================================================
+// Row-wise concatenation.
+//
+// A RowStoreVector is ONE contiguous, fixed-stride row buffer. So merging N of
+// them is N device-to-device memcpys, end to end, into a single allocation:
+// no per-column tables, no null masks, no cudf::concatenate. The columnar path
+// has to allocate and zero a null mask PER COLUMN per batch, and in every nsys
+// profile of this system cudaMemsetAsync (which is exactly those null masks) is
+// 54-79% of all CPU-side CUDA time. Here it is zero.
+// ============================================================================
+RowVectorPtr CudfBatchConcat::concatRowStore() {
+  VELOX_CHECK(!rowBuffer_.empty());
+
+  const auto& first = rowBuffer_.front();
+  const int32_t rowWidth = first->rowWidth();
+  auto stream = first->stream();
+  const auto& fields = first->hostFields();
+
+  int64_t totalRows = 0;
+  for (const auto& v : rowBuffer_) {
+    VELOX_CHECK_EQ(
+        v->rowWidth(), rowWidth, "CudfBatchConcat: row width mismatch");
+    // The device-to-device copies below are issued on ONE stream and the sources
+    // are released immediately afterwards. That is only safe if every source was
+    // produced on that same stream (CudfFromVelox pins its row path to a single
+    // per-operator stream for exactly this reason). If it ever is not, the copies
+    // would read unordered buffers and the sources would be freed underneath
+    // them -- a race that surfaces as nondeterministically wrong results, so fail
+    // loudly instead.
+    VELOX_CHECK(
+        v->stream().value() == stream.value(),
+        "CudfBatchConcat: RowStoreVector inputs must share one stream");
+    totalRows += v->size();
+  }
+
+  rmm::device_buffer merged(
+      static_cast<int64_t>(totalRows) * rowWidth, stream);
+  auto* dst = static_cast<uint8_t*>(merged.data());
+  for (const auto& v : rowBuffer_) {
+    const int64_t bytes = v->gpuRowBytes();
+    if (bytes > 0) {
+      cudaMemcpyAsync(
+          dst, v->gpuRowData(), bytes, cudaMemcpyDeviceToDevice, stream.value());
+      dst += bytes;
+    }
+  }
+
+  rmm::device_buffer fieldsBuf(
+      fields.data(), fields.size() * sizeof(FieldDesc), stream);
+  auto fieldsHost = fields;
+
+  rowBuffer_.clear();
+  currentNumRows_ = 0;
+
+  // Stream-ordered: the sources stay alive until their copies complete because
+  // rmm frees on the same stream, so no synchronize is needed here.
+  return std::make_shared<RowStoreVector>(
+      pool(),
+      outputType_,
+      totalRows,
+      std::move(merged),
+      std::move(fieldsBuf),
+      std::move(fieldsHost),
+      rowWidth,
+      stream);
+}
+
 RowVectorPtr CudfBatchConcat::doGetOutput() {
+  // ---- Row-wise path ----
+  if (!rowBuffer_.empty() &&
+      (currentNumRows_ >= targetRows_ || noMoreInput_)) {
+    return concatRowStore();
+  }
+
   // Drain the queue if there is any output to be flushed
   if (!outputQueue_.empty()) {
     auto table = std::move(outputQueue_.front());
@@ -106,7 +190,8 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
 }
 
 bool CudfBatchConcat::isFinished() {
-  return noMoreInput_ && buffer_.empty() && outputQueue_.empty();
+  return noMoreInput_ && buffer_.empty() && rowBuffer_.empty() &&
+      outputQueue_.empty();
 }
 
 } // namespace facebook::velox::cudf_velox

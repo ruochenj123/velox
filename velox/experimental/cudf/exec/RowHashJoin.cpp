@@ -17,13 +17,18 @@
 #include "velox/exec/Driver.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cstdlib>
 #include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime.h>
@@ -31,6 +36,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox {
 
@@ -40,6 +48,18 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
+// Align `off` up to `w` (a power of two: 1/2/4/8). EVERY row/accumulator layout
+// here must natural-align its fields: the fused kernel copies them with
+// `*reinterpret_cast<uint64_t*>` / `<uint32_t*>`, which faults
+// (cudaErrorMisalignedAddress) on an unaligned address. Packing tightly is only
+// safe when every field is 8 bytes (Q5/Q8) -- the moment a 4-byte column
+// precedes an 8-byte one (any mixed-width schema), the 8-byte field lands on a
+// 4-byte boundary and the kernel crashes. Natural alignment costs a few padding
+// bytes and fixes it.
+static inline int32_t alignUp(int32_t off, int32_t w) {
+  return (off + w - 1) & ~(w - 1);
+}
+
 /// Compute FieldDesc array and row width from a Velox RowType (fixed-width only).
 std::pair<std::vector<FieldDesc>, int32_t> computeRowLayout(
     const RowTypePtr& type) {
@@ -47,7 +67,6 @@ std::pair<std::vector<FieldDesc>, int32_t> computeRowLayout(
   int32_t offset = 0;
   for (int i = 0; i < type->size(); i++) {
     FieldDesc fd;
-    fd.offset = offset;
     auto kind = type->childAt(i)->kind();
     switch (kind) {
       case TypeKind::BOOLEAN:
@@ -65,6 +84,8 @@ std::pair<std::vector<FieldDesc>, int32_t> computeRowLayout(
       default:
         VELOX_FAIL("RowHashJoin: unsupported TypeKind {}", (int)kind);
     }
+    offset = alignUp(offset, fd.byte_width);
+    fd.offset = offset;
     fields.push_back(fd);
     offset += fd.byte_width;
   }
@@ -159,8 +180,9 @@ std::pair<std::vector<FieldDesc>, int32_t> computeRowLayoutFromTable(
   int32_t offset = 0;
   for (int i = 0; i < table.num_columns(); i++) {
     FieldDesc fd;
-    fd.offset = offset;
     fd.byte_width = cudfTypeWidth(table.column(i).type().id());
+    offset = alignUp(offset, fd.byte_width);
+    fd.offset = offset;
     fields.push_back(fd);
     offset += fd.byte_width;
   }
@@ -178,8 +200,9 @@ std::pair<std::vector<FieldDesc>, int32_t> computeRowLayoutFromTableExcluding(
   for (int i = 0; i < table.num_columns(); i++) {
     if (i == skipColIdx) continue;
     FieldDesc fd;
-    fd.offset = offset;
     fd.byte_width = cudfTypeWidth(table.column(i).type().id());
+    offset = alignUp(offset, fd.byte_width);
+    fd.offset = offset;
     fields.push_back(fd);
     offset += fd.byte_width;
   }
@@ -209,6 +232,48 @@ void transposeToRowsExcluding(
   columnsToRows(
       colPtrs.data(), fields.data(), numCols, numRows, rowWidth,
       d_row_buffer, stream);
+}
+
+/// Compute a KEY-ONLY row layout: FieldDesc for just the key columns (in
+/// keyColIndices order), packed contiguously. Gives the fingerprint verify a
+/// row-native build key while the payload is fetched columnar.
+std::pair<std::vector<FieldDesc>, int32_t> computeKeyRowLayout(
+    const cudf::table_view& table,
+    const std::vector<cudf::size_type>& keyColIndices) {
+  std::vector<FieldDesc> fields;
+  int32_t offset = 0;
+  for (auto idx : keyColIndices) {
+    FieldDesc fd;
+    fd.byte_width = cudfTypeWidth(table.column(idx).type().id());
+    offset = alignUp(offset, fd.byte_width);
+    fd.offset = offset;
+    fields.push_back(fd);
+    offset += fd.byte_width;
+  }
+  int32_t rowWidth = (offset + 7) & ~7;
+  return {fields, rowWidth};
+}
+
+/// Transpose ONLY the key columns (keyColIndices order) into a contiguous
+/// key-row buffer laid out per `fields`.
+void transposeKeyColumnsToRows(
+    const cudf::table_view& table,
+    const std::vector<cudf::size_type>& keyColIndices,
+    const std::vector<FieldDesc>& fields,
+    int32_t rowWidth,
+    uint8_t* d_row_buffer,
+    cudaStream_t stream) {
+  int32_t numRows = table.num_rows();
+  int32_t numCols = static_cast<int32_t>(keyColIndices.size());
+  if (numRows == 0 || numCols == 0) return;
+  std::vector<const uint8_t*> colPtrs;
+  colPtrs.reserve(numCols);
+  for (auto idx : keyColIndices) {
+    colPtrs.push_back(static_cast<const uint8_t*>(table.column(idx).head()));
+  }
+  columnsToRows(
+      colPtrs.data(), fields.data(), numCols, numRows, rowWidth, d_row_buffer,
+      stream);
 }
 
 } // namespace
@@ -320,6 +385,167 @@ void RowHashJoinBuild::doNoMoreInput() {
   std::vector<rmm::device_buffer> keyBuffers;
   std::shared_ptr<cudf::hash_join> hashJoin;
 
+  // Fused-probe device hash table (key -> build row index). Built from the
+  // already-extracted COLUMNAR key columns (coalesced key load), and only when
+  // fused -- in which case the cudf::hash_join below is dead work and skipped.
+  GpuHashTable deviceMap{};
+  rmm::device_buffer mapSlots;
+  bool hasDeviceMap = false;
+  // COLUMNAR build fetch (VELOX_CUDF_COL_BUILD): skip the row-store transpose for
+  // combined (non-fingerprint) fused builds; the probe fetches build payload
+  // straight from these columns. Worth it when each build row is fetched < ~1x.
+  bool columnarBuild = false;
+  std::shared_ptr<cudf::table> columnarBuildTablePtr;
+  // Fingerprint slots hold only a hash, not the key, so the probe re-packs the
+  // build key from a row to verify. When payload is fetched columnar, transpose
+  // ONLY the key columns into this dedicated key-row store -- decoupling key
+  // layout (always row-native) from payload layout (columnar vs full row store).
+  rmm::device_buffer keyRowBuffer;
+  rmm::device_buffer keyFieldsBuffer;
+  std::vector<FieldDesc> keyRowFields;
+  int32_t keyRowWidth = 0;
+  bool hasKeyRowStore = false;
+  // Build EXACTLY ONE hash table, decided per join by whether THIS join's probe
+  // was fused. The fused pre-pass recorded that during driver adaptation (before
+  // any build runs), so there is no hedging and no dead work:
+  //   probe fused     -> FusedRowHashJoinProbe reads deviceMap; build only it.
+  //   probe not fused -> RowHashJoinProbe reads cudf::hash_join; build only it.
+  // (In a bushy plan like Q8, main-chain joins are fused -> deviceMap; build-side
+  // sub-joins are not -> cudf::hash_join.)
+  const bool wantFusedMap =
+      CudfConfig::getInstance().isProbeFused(joinNode_->id());
+  const bool skipHashJoin = wantFusedMap;
+  bool packEnabled = false;
+  std::vector<int64_t> packMin, packMax;
+  std::vector<int32_t> packShift;
+  uint64_t packSentinel = 0;
+  auto buildFusedMap = [&](const std::vector<cudf::column_view>& keyViews,
+                           int64_t nRows) {
+    const int32_t numKeyWords = static_cast<int32_t>(keyViews.size());
+    const int32_t cap = fusedTableCapacity(static_cast<int32_t>(nRows));
+
+    std::vector<ColSeedField> keyCols(numKeyWords);
+    for (int32_t k = 0; k < numKeyWords; k++) {
+      const auto& kv = keyViews[k];
+      const int32_t w = cudfTypeWidth(kv.type().id());
+      keyCols[k].data = static_cast<const uint8_t*>(kv.head<uint8_t>()) +
+          (int64_t)kv.offset() * w;
+      keyCols[k].byte_width = w;
+      keyCols[k].acc_offset = 0; // unused for keys
+    }
+    rmm::device_buffer dKeyCols(
+        keyCols.data(), keyCols.size() * sizeof(ColSeedField), stream);
+
+    // ---- Decide composite-key PACKING (single-word fast path) ----
+    // Pack the K key columns into one uint64 when their combined bit-width fits
+    // in <=63 bits. Requires per-column min/max (two reductions each). Only for
+    // fixed-width integer keys (width 4/8, assumed non-negative).
+    auto scalarI64 = [&](const std::unique_ptr<cudf::scalar>& s) -> int64_t {
+      if (s->type().id() == cudf::type_id::INT64) {
+        return static_cast<cudf::numeric_scalar<int64_t>*>(s.get())->value(
+            stream);
+      }
+      return static_cast<int64_t>(
+          static_cast<cudf::numeric_scalar<int32_t>*>(s.get())->value(stream));
+    };
+    packEnabled = (numKeyWords >= 1 && numKeyWords <= kMaxKeyCols);
+    packMin.assign(numKeyWords, 0);
+    packMax.assign(numKeyWords, 0);
+    packShift.assign(numKeyWords, 0);
+    int32_t totalBits = 0;
+    for (int32_t k = 0; k < numKeyWords && packEnabled; k++) {
+      const auto id = keyViews[k].type().id();
+      if (id != cudf::type_id::INT32 && id != cudf::type_id::INT64) {
+        packEnabled = false;
+        break;
+      }
+      auto mn = cudf::reduce(
+          keyViews[k], *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+          keyViews[k].type(), stream, get_output_mr());
+      auto mx = cudf::reduce(
+          keyViews[k], *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
+          keyViews[k].type(), stream, get_output_mr());
+      const int64_t lo = scalarI64(mn), hi = scalarI64(mx);
+      const uint64_t range = static_cast<uint64_t>(hi - lo);
+      const int32_t bits = (range == 0) ? 1 : (64 - __builtin_clzll(range));
+      packMin[k] = lo;
+      packMax[k] = hi;
+      packShift[k] = totalBits;
+      totalBits += bits;
+    }
+    if (totalBits > 63) {
+      packEnabled = false;
+    }
+
+    if (packEnabled) {
+      packSentinel = (totalBits >= 64) ? 0ULL : (1ULL << totalBits);
+      rmm::device_buffer dMins(
+          packMin.data(), packMin.size() * sizeof(int64_t), stream);
+      rmm::device_buffer dShifts(
+          packShift.data(), packShift.size() * sizeof(int32_t), stream);
+      // COMBINED slots (cuco-style 8-byte (key,index) slot): if the packed key
+      // plus the row index fit in <=63 bits, store [key | index<<keyBits] in ONE
+      // word -- one atomicCAS per insert, half the scattered writes. This is the
+      // build's dominant cost (latency-bound random atomics); the packed 2-word
+      // path is the fallback when they don't fit.
+      const int32_t indexBits = (nRows <= 1)
+          ? 1
+          : (64 - __builtin_clzll(static_cast<uint64_t>(nRows - 1)));
+      const bool combined = (totalBits + indexBits <= 63);
+      if (combined) {
+        mapSlots = rmm::device_buffer((int64_t)cap * sizeof(uint64_t), stream);
+        buildHashTableFromColumnsCombined(
+            static_cast<const ColSeedField*>(dKeyCols.data()),
+            numKeyWords,
+            static_cast<const int64_t*>(dMins.data()),
+            static_cast<const int32_t*>(dShifts.data()),
+            totalBits,
+            static_cast<int32_t>(nRows),
+            static_cast<uint64_t*>(mapSlots.data()),
+            cap,
+            stream.value());
+        deviceMap =
+            GpuHashTable{static_cast<uint64_t*>(mapSlots.data()), cap, 1};
+        deviceMap.combinedKeyBits = totalBits;
+      } else {
+        // Exact key + index don't fit in one 63-bit word. Rather than a 16-byte
+        // 2-word slot (cuco's slow cas_dependent_write path), store cuco's
+        // 8-byte fingerprint slot [fp32 | index<<32] -- one atomicCAS. The probe
+        // verifies the real key on a fingerprint hit (build row is cache-hot).
+        const int32_t fpBits = 32;
+        mapSlots = rmm::device_buffer((int64_t)cap * sizeof(uint64_t), stream);
+        buildHashTableFromColumnsHashed(
+            static_cast<const ColSeedField*>(dKeyCols.data()),
+            numKeyWords,
+            static_cast<const int64_t*>(dMins.data()),
+            static_cast<const int32_t*>(dShifts.data()),
+            fpBits,
+            static_cast<int32_t>(nRows),
+            static_cast<uint64_t*>(mapSlots.data()),
+            cap,
+            stream.value());
+        deviceMap =
+            GpuHashTable{static_cast<uint64_t*>(mapSlots.data()), cap, 1};
+        deviceMap.combinedKeyBits = fpBits;
+        deviceMap.fingerprintSlot = 1;
+      }
+      stream.synchronize(); // dMins/dShifts must outlive the launch
+    } else {
+      mapSlots = rmm::device_buffer(
+          (int64_t)cap * (numKeyWords + 1) * sizeof(uint64_t), stream);
+      buildHashTableFromColumns(
+          static_cast<const ColSeedField*>(dKeyCols.data()),
+          numKeyWords,
+          static_cast<int32_t>(nRows),
+          static_cast<uint64_t*>(mapSlots.data()),
+          cap,
+          stream.value());
+      deviceMap = GpuHashTable{
+          static_cast<uint64_t*>(mapSlots.data()), cap, numKeyWords};
+    }
+    hasDeviceMap = true;
+  };
+
   if (firstRowStore) {
     // ---- RowStoreVector path: concatenate GPU row buffers ----
     rowWidth = firstRowStore->rowWidth();
@@ -373,11 +599,33 @@ void RowHashJoinBuild::doNoMoreInput() {
         tmpStore, fields, keyColIndices, numRows, stream,
         keyBuffers, keyViews);
 
-    auto keyTable = cudf::table_view(keyViews);
-    hashJoin = std::make_shared<cudf::hash_join>(
-        keyTable, cudf::null_equality::UNEQUAL, stream);
+    if (!skipHashJoin) {
+      auto keyTable = cudf::table_view(keyViews);
+      hashJoin = std::make_shared<cudf::hash_join>(
+          keyTable, cudf::null_equality::UNEQUAL, stream);
+    }
+    if (wantFusedMap) {
+      buildFusedMap(keyViews, numRows);
+    }
   } else {
     // ---- CudfVector path: concatenate + transpose ----
+    // Per-phase GPU timing (VELOX_CUDF_BUILD_PROFILE): stamp the stream at each phase
+    // boundary; one sync at the end reads all deltas. Answers "where does the
+    // build wall go" -- concat vs transpose(all cols) vs key-extract vs map-build.
+    const bool profBuild = (std::getenv("VELOX_CUDF_BUILD_PROFILE") != nullptr);
+    cudaEvent_t pe[6];
+    if (profBuild) {
+      for (auto& e : pe) {
+        cudaEventCreate(&e);
+      }
+    }
+    auto stamp = [&](int i) {
+      if (profBuild) {
+        cudaEventRecord(pe[i], stream.value());
+      }
+    };
+    stamp(0);
+
     auto buildType = joinNode_->sources()[1]->outputType();
     std::vector<CudfVectorPtr> cudfInputs;
     for (auto& inp : inputs_) {
@@ -392,6 +640,7 @@ void RowHashJoinBuild::doNoMoreInput() {
     VELOX_CHECK_NOT_NULL(concatenated);
     auto buildView = concatenated->view();
     numRows = buildView.num_rows();
+    stamp(1);
 
     // Identify key columns (composite keys supported)
     auto rightKeys = joinNode_->rightKeys();
@@ -402,65 +651,132 @@ void RowHashJoinBuild::doNoMoreInput() {
           static_cast<cudf::size_type>(rightType->getChildIdx(k->name())));
     }
 
-    // Include ALL columns (including keys) in row layout, then extract keys.
-    // This is the general design: rows carry all columns, and each operator
-    // extracts what it needs. Cost of extract is negligible (<4%).
-    auto [f, rw] = computeRowLayoutFromTable(buildView);
-    fields = std::move(f);
-    rowWidth = rw;
-
-    int64_t rowBytes = numRows * rowWidth;
-    rowBuffer = rmm::device_buffer(rowBytes, stream);
-
-    cudaEvent_t txStart, txEnd;
-    const bool timeTx = CudfConfig::getInstance().benchmarkLogGatherTime;
-    if (timeTx) {
-      cudaEventCreate(&txStart);
-      cudaEventCreate(&txEnd);
-      cudaEventRecord(txStart, stream.value());
+    // COLUMNAR-BUILD path: for a fused build (no sub-join hashJoin), build the
+    // hash table straight from the ORIGINAL columns -- no transpose, no key
+    // re-extract. If the slot is a plain combined slot (no fingerprint verify),
+    // skip the row-store transpose entirely and let the probe fetch build payload
+    // columnar. Fingerprint builds fall back to the row store (verify needs it).
+    const bool colBuildFlag =
+        (std::getenv("VELOX_CUDF_COL_BUILD") != nullptr) && wantFusedMap &&
+        skipHashJoin;
+    bool fusedMapBuilt = false;
+    if (colBuildFlag) {
+      std::vector<cudf::column_view> directKeys;
+      for (auto idx : keyColIndices) {
+        directKeys.push_back(buildView.column(idx));
+      }
+      buildFusedMap(directKeys, numRows);
+      fusedMapBuilt = true;
+      // Columnar payload for EVERY key regime. Combined/multi-word keep the key
+      // in the slot; fingerprint keeps it in a dedicated key-row store (below).
+      columnarBuild = true;
     }
 
-    // Transpose all columns to rows
-    transposeToRows(
-        buildView, fields, rowWidth,
-        static_cast<uint8_t*>(rowBuffer.data()), stream.value());
+    if (columnarBuild) {
+      // Compute the row LAYOUT (host-side: field offsets/widths, needed by the
+      // probe's acc-layout width lookups) but SKIP the payload transpose and row
+      // buffer. The probe fetches build payload straight from the columns; keep
+      // the concatenated table alive for it.
+      auto [f, rw] = computeRowLayoutFromTable(buildView);
+      fields = std::move(f);
+      rowWidth = rw;
+      columnarBuildTablePtr =
+          std::shared_ptr<cudf::table>(std::move(concatenated));
+      // Fingerprint verify re-packs the build key from a row: build a KEY-ONLY
+      // row store so the key stays row-native even though the payload is
+      // columnar. (Combined/multi-word carry the key in the slot -- no store.)
+      if (deviceMap.fingerprintSlot) {
+        auto [kf, krw] = computeKeyRowLayout(buildView, keyColIndices);
+        keyRowFields = std::move(kf);
+        keyRowWidth = krw;
+        keyRowBuffer =
+            rmm::device_buffer((int64_t)numRows * keyRowWidth, stream);
+        transposeKeyColumnsToRows(
+            buildView, keyColIndices, keyRowFields, keyRowWidth,
+            static_cast<uint8_t*>(keyRowBuffer.data()), stream.value());
+        keyFieldsBuffer = rmm::device_buffer(
+            keyRowFields.data(), keyRowFields.size() * sizeof(FieldDesc),
+            stream);
+        hasKeyRowStore = true;
+      }
+      stamp(2);
+      stamp(3);
+      stamp(4);
+      stamp(5);
+    } else {
+      // Row-store path: transpose ALL columns to rows, extract keys, build.
+      auto [f, rw] = computeRowLayoutFromTable(buildView);
+      fields = std::move(f);
+      rowWidth = rw;
 
-    if (timeTx) {
-      cudaEventRecord(txEnd, stream.value());
-      cudaEventSynchronize(txEnd);
-      float ms = 0;
-      cudaEventElapsedTime(&ms, txStart, txEnd);
-      auto nanos = static_cast<int64_t>(ms * 1e6);
-      addRuntimeStat(
-          "gpuTransposeWallNanos",
-          RuntimeCounter(nanos, RuntimeCounter::Unit::kNanos));
-      addRuntimeStat(
-          "gpuTransposeRows",
-          RuntimeCounter(static_cast<int64_t>(numRows)));
-      cudaEventDestroy(txStart);
-      cudaEventDestroy(txEnd);
+      int64_t rowBytes = numRows * rowWidth;
+      rowBuffer = rmm::device_buffer(rowBytes, stream);
+
+      transposeToRows(
+          buildView, fields, rowWidth,
+          static_cast<uint8_t*>(rowBuffer.data()), stream.value());
+      stamp(2);
+
+      fieldsBuffer = rmm::device_buffer(
+          fields.data(), fields.size() * sizeof(FieldDesc), stream);
+
+      // Extract keys from rows for hash table construction
+      GpuFixedRowStore tmpStore;
+      tmpStore.row_buffer = static_cast<uint8_t*>(rowBuffer.data());
+      tmpStore.row_width = rowWidth;
+      tmpStore.num_rows = numRows;
+      tmpStore.num_fields = fields.size();
+      tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
+
+      std::vector<cudf::column_view> keyViews;
+      extractKeyColumns(
+          tmpStore, fields, keyColIndices, numRows, stream,
+          keyBuffers, keyViews);
+      stamp(3);
+
+      // hashJoin feeds non-fused RowHashJoinProbe (sub-joins); skipHashJoin is set
+      // only when EVERY join is fused, so it is then dead work. deviceMap is built
+      // from the columnar key columns (coalesced key load).
+      if (!skipHashJoin) {
+        auto keyTable = cudf::table_view(keyViews);
+        hashJoin = std::make_shared<cudf::hash_join>(
+            keyTable, cudf::null_equality::UNEQUAL, stream);
+      }
+      stamp(4);
+      if (wantFusedMap && !fusedMapBuilt) {
+        buildFusedMap(keyViews, numRows);
+      }
+      stamp(5);
     }
 
-    fieldsBuffer = rmm::device_buffer(
-        fields.data(), fields.size() * sizeof(FieldDesc), stream);
-
-    // Extract keys from rows for hash table construction
-    GpuFixedRowStore tmpStore;
-    tmpStore.row_buffer = static_cast<uint8_t*>(rowBuffer.data());
-    tmpStore.row_width = rowWidth;
-    tmpStore.num_rows = numRows;
-    tmpStore.num_fields = fields.size();
-    tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
-
-    std::vector<cudf::column_view> keyViews;
-    extractKeyColumns(
-        tmpStore, fields, keyColIndices, numRows, stream,
-        keyBuffers, keyViews);
-
-    // Build hash table from extracted key(s)
-    auto keyTable = cudf::table_view(keyViews);
-    hashJoin = std::make_shared<cudf::hash_join>(
-        keyTable, cudf::null_equality::UNEQUAL, stream);
+    if (profBuild) {
+      cudaEventSynchronize(pe[5]);
+      float tConcat = 0, tTranspose = 0, tExtract = 0, tHashJoin = 0, tFused = 0;
+      cudaEventElapsedTime(&tConcat, pe[0], pe[1]);
+      cudaEventElapsedTime(&tTranspose, pe[1], pe[2]);
+      cudaEventElapsedTime(&tExtract, pe[2], pe[3]);
+      cudaEventElapsedTime(&tHashJoin, pe[3], pe[4]);
+      cudaEventElapsedTime(&tFused, pe[4], pe[5]);
+      fprintf(
+          stderr,
+          "[BUILD_PROFILE] nRows=%ld cols=%d rowWidth=%d skipHashJoin=%d "
+          "wantFusedMap=%d | concat=%.2f transpose=%.2f extractKeys=%.2f "
+          "hashJoin=%.2f fusedMap=%.2f | GPUtotal=%.2f ms\n",
+          (long)numRows,
+          (int)fields.size(),
+          (int)rowWidth,
+          (int)skipHashJoin,
+          (int)wantFusedMap,
+          tConcat,
+          tTranspose,
+          tExtract,
+          tHashJoin,
+          tFused,
+          tConcat + tTranspose + tExtract + tHashJoin + tFused);
+      for (auto& e : pe) {
+        cudaEventDestroy(e);
+      }
+    }
   }
 
   // Build GpuFixedRowStore handle
@@ -470,6 +786,10 @@ void RowHashJoinBuild::doNoMoreInput() {
   gpuStore.num_rows = numRows;
   gpuStore.num_fields = fields.size();
   gpuStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
+
+  // (The fused-probe device hash table `deviceMap` was built above, inside the
+  // input-specific branch, from the columnar key columns -- coalesced key load,
+  // and no dead cudf::hash_join.)
 
   stream.synchronize();
 
@@ -483,6 +803,32 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.numRows = numRows;
   bd.rowWidth = rowWidth;
   bd.hostFields = std::move(fields);
+  bd.deviceMap = deviceMap;
+  bd.mapSlots = std::move(mapSlots);
+  bd.hasDeviceMap = hasDeviceMap;
+  bd.packEnabled = packEnabled;
+  bd.packMin = std::move(packMin);
+  bd.packMax = std::move(packMax);
+  bd.packShift = std::move(packShift);
+  bd.packSentinel = packSentinel;
+  bd.columnarBuild = columnarBuild;
+  bd.buildTable = std::move(columnarBuildTablePtr);
+
+  // Key-only row store (fingerprint verify under columnar payload).
+  if (hasKeyRowStore) {
+    GpuFixedRowStore keyStore;
+    keyStore.row_buffer = static_cast<uint8_t*>(keyRowBuffer.data());
+    keyStore.row_width = keyRowWidth;
+    keyStore.num_rows = numRows;
+    keyStore.num_fields = static_cast<int32_t>(keyRowFields.size());
+    keyStore.fields = static_cast<const FieldDesc*>(keyFieldsBuffer.data());
+    bd.keyRowStore = keyStore;
+    bd.keyRowBuffer = std::move(keyRowBuffer);
+    bd.keyFieldsBuffer = std::move(keyFieldsBuffer);
+    bd.keyRowFields = std::move(keyRowFields);
+    bd.keyRowWidth = keyRowWidth;
+    bd.hasKeyRowStore = true;
+  }
 
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
@@ -1023,6 +1369,688 @@ void RowHashJoinProbe::doNoMoreInput() {
 
 bool RowHashJoinProbe::isFinished() {
   return finished_;
+}
+
+// ============================================================================
+// FusedRowHashJoinProbe
+// ============================================================================
+
+namespace {
+/// Byte width of a fixed-width Velox scalar type (fused acc / output layout).
+int32_t fusedTypeWidth(const TypePtr& t) {
+  switch (t->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+      return 1;
+    case TypeKind::SMALLINT:
+      return 2;
+    case TypeKind::INTEGER:
+    case TypeKind::REAL:
+      return 4;
+    case TypeKind::BIGINT:
+    case TypeKind::DOUBLE:
+      return 8;
+    default:
+      VELOX_FAIL(
+          "FusedRowHashJoinProbe: unsupported TypeKind {}", (int)t->kind());
+  }
+}
+} // namespace
+
+FusedRowHashJoinProbe::FusedRowHashJoinProbe(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::vector<std::shared_ptr<const core::HashJoinNode>> joinNodes)
+    : CudfOperatorBase(
+          operatorId,
+          driverCtx,
+          joinNodes.back()->outputType(),
+          joinNodes.back()->id(),
+          "FusedRowHashJoinProbe",
+          nvtx3::rgb{178, 34, 34}, // Firebrick
+          NvtxMethodFlag::kAll,
+          std::nullopt,
+          joinNodes.back()),
+      joinNodes_(std::move(joinNodes)),
+      numSteps_(static_cast<int32_t>(joinNodes_.size())) {
+  builds_.resize(numSteps_);
+  buildFutures_.resize(numSteps_);
+}
+
+bool FusedRowHashJoinProbe::needsInput() const {
+  return !noMoreInput_ && !finished_ && input_ == nullptr;
+}
+
+exec::BlockingReason FusedRowHashJoinProbe::isBlocked(ContinueFuture* future) {
+  // Fetch build data from all N bridges; block on the first that isn't ready.
+  for (int32_t s = 0; s < numSteps_; s++) {
+    if (builds_[s]) {
+      continue;
+    }
+    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+        operatorCtx_->driverCtx()->splitGroupId, joinNodes_[s]->id());
+    auto rowBridge = std::dynamic_pointer_cast<RowHashJoinBridge>(joinBridge);
+    VELOX_CHECK_NOT_NULL(rowBridge);
+    auto data = rowBridge->dataOrFuture(future);
+    if (!data) {
+      return exec::BlockingReason::kWaitForJoinBuild;
+    }
+    VELOX_CHECK(
+        data->hasDeviceMap,
+        "FusedRowHashJoinProbe requires device hash tables; "
+        "set benchmarkFusedProbe before build");
+    builds_[s] = std::move(data);
+  }
+  return exec::BlockingReason::kNotBlocked;
+}
+
+void FusedRowHashJoinProbe::doAddInput(RowVectorPtr input) {
+  input_ = std::move(input);
+}
+
+void FusedRowHashJoinProbe::setupLayout(
+    const std::vector<FieldDesc>& probeFields,
+    rmm::cuda_stream_view stream) {
+  // ---- Accumulator layout: union of all columns across C_0..C_N ----
+  std::unordered_map<std::string, int32_t> accOffset;
+  std::unordered_map<std::string, int32_t> accWidthByName;
+  int32_t off = 0;
+  auto addCol = [&](const std::string& n, int32_t w) {
+    if (accOffset.count(n)) {
+      return;
+    }
+    off = alignUp(off, w); // natural-align: the kernel reads acc with reinterpret_cast
+    accOffset[n] = off;
+    accWidthByName[n] = w;
+    off += w;
+  };
+
+  // Lazy payload: only KEY probe columns enter the accumulator; pure-payload
+  // probe columns are read from the probe at output time (survivors only).
+  // Requires columnar seed (need the probe columns) and columnar output.
+  {
+    const auto& cfg = CudfConfig::getInstance();
+    lazyPayload_ = cfg.benchmarkFusedLazyPayload && cfg.fusedColumnarSeed &&
+        cfg.fusedColumnarOutput;
+  }
+  std::unordered_set<std::string> probeKeyNames;
+  for (int32_t s = 0; s < numSteps_; s++) {
+    for (auto& key : joinNodes_[s]->leftKeys()) {
+      probeKeyNames.insert(key->name());
+    }
+  }
+  auto c0 = joinNodes_[0]->sources()[0]->outputType();
+  std::unordered_map<std::string, int32_t> c0Idx;
+  for (int i = 0; i < c0->size(); i++) {
+    c0Idx[c0->nameOf(i)] = i;
+  }
+  auto probeDeferred = [&](const std::string& n) {
+    // A probe column that is never a join key -> not seeded, read lazily.
+    return lazyPayload_ && c0Idx.count(n) && !probeKeyNames.count(n);
+  };
+
+  for (int i = 0; i < c0->size(); i++) {
+    if (probeDeferred(c0->nameOf(i))) {
+      continue; // deferred (or dead): stays out of the accumulator
+    }
+    addCol(c0->nameOf(i), fusedTypeWidth(c0->childAt(i)));
+  }
+  for (int32_t s = 0; s < numSteps_; s++) {
+    auto out = joinNodes_[s]->outputType();
+    for (int j = 0; j < out->size(); j++) {
+      addCol(out->nameOf(j), fusedTypeWidth(out->childAt(j)));
+    }
+  }
+  accWidth_ = (off + 7) & ~7;
+  VELOX_CHECK_LE(
+      accWidth_, kFusedAccMaxBytes,
+      "Fused accumulator exceeds kFusedAccMaxBytes; increase the bound");
+
+  // ---- probeToAcc: seed acc from the fact input row ----
+  std::vector<FieldMapping> pmap;
+  seedAccOffsets_.clear();
+  seedAccWidths_.clear();
+  seedProbeCol_.clear();
+  for (int i = 0; i < c0->size(); i++) {
+    auto name = c0->nameOf(i);
+    if (probeDeferred(name)) {
+      continue; // not seeded -- read lazily at output
+    }
+    pmap.push_back(
+        {probeFields[i].offset, accOffset[name], probeFields[i].byte_width});
+    // OPT 1 needs the same destination, but keyed off the input COLUMN rather
+    // than a byte offset within a row. The device array itself is rebuilt each
+    // batch (it holds column pointers), so only the offsets are cached here.
+    seedAccOffsets_.push_back(accOffset[name]);
+    seedAccWidths_.push_back(probeFields[i].byte_width);
+    seedProbeCol_.push_back(i);
+  }
+  numProbeFields_ = static_cast<int32_t>(seedProbeCol_.size());
+  probeToAccBuf_ =
+      rmm::device_buffer(pmap.data(), pmap.size() * sizeof(FieldMapping), stream);
+
+  // ---- Per-step key fields + build appends ----
+  stepKeyFieldBufs_.resize(numSteps_);
+  stepBuildToAccBufs_.resize(numSteps_);
+  stepBuildColsBufs_.resize(numSteps_);
+  std::vector<FusedJoinStep> hostSteps(numSteps_);
+  for (int32_t s = 0; s < numSteps_; s++) {
+    auto node = joinNodes_[s];
+    auto leftType = node->sources()[0]->outputType();
+    auto rightType = node->sources()[1]->outputType();
+    auto out = node->outputType();
+
+    // Key fields (read from acc). leftKeys[k] joins rightKeys[k], matching the
+    // order the build table's key words were packed in.
+    std::vector<FusedKeyField> kf;
+    for (auto& key : node->leftKeys()) {
+      auto name = key->name();
+      kf.push_back({accOffset[name], accWidthByName[name]});
+    }
+    // fusedProbeKernel builds the lookup key in `uint64_t key[kMaxKeyCols]`, a
+    // per-thread stack array. More keys than that is an out-of-bounds write, not
+    // a graceful failure -- so check here rather than corrupt the stack.
+    VELOX_CHECK_LE(
+        kf.size(),
+        static_cast<size_t>(kMaxKeyCols),
+        "Fused join step {} has {} key columns; kMaxKeyCols is {}. "
+        "Raise the bound (it is nearly free -- see GpuFusedProbe.cuh).",
+        s,
+        kf.size(),
+        kMaxKeyCols);
+
+    // Build appends: right-source output columns of this join. For a COLUMNAR
+    // build (no row store), also record each field's cuDF column base pointer so
+    // the probe can fetch it at `data + br*width`.
+    const bool colBuild = builds_[s]->columnarBuild;
+    std::vector<FieldMapping> bmap;
+    std::vector<ColBuildField> colFields;
+    cudf::table_view buildTv;
+    if (colBuild) {
+      VELOX_CHECK_NOT_NULL(builds_[s]->buildTable);
+      buildTv = builds_[s]->buildTable->view();
+    }
+    for (int j = 0; j < out->size(); j++) {
+      auto name = out->nameOf(j);
+      if (leftType->getChildIdxIfExists(name).has_value()) {
+        continue; // left-source column already lives in acc
+      }
+      int srcCol = rightType->getChildIdx(name);
+      if (colBuild) {
+        // No row store: width from the column, row-store offset unused.
+        auto col = buildTv.column(srcCol);
+        int32_t w = static_cast<int32_t>(cudfTypeWidth(col.type().id()));
+        const uint8_t* base = static_cast<const uint8_t*>(col.head<uint8_t>()) +
+            (int64_t)col.offset() * w;
+        bmap.push_back({0, accOffset[name], w});
+        colFields.push_back({base, accOffset[name], w});
+      } else {
+        bmap.push_back(
+            {builds_[s]->hostFields[srcCol].offset,
+             accOffset[name],
+             builds_[s]->hostFields[srcCol].byte_width});
+      }
+    }
+
+    stepKeyFieldBufs_[s] = rmm::device_buffer(
+        kf.data(), kf.size() * sizeof(FusedKeyField), stream);
+    stepBuildToAccBufs_[s] = rmm::device_buffer(
+        bmap.data(), bmap.size() * sizeof(FieldMapping), stream);
+
+    hostSteps[s].table = builds_[s]->deviceMap;
+    hostSteps[s].keyFields =
+        static_cast<const FusedKeyField*>(stepKeyFieldBufs_[s].data());
+    hostSteps[s].numKeys = static_cast<int32_t>(kf.size());
+    // Fingerprint verify reads the build key from the KEY-ONLY store when payload
+    // is columnar; otherwise from the full row store.
+    hostSteps[s].buildStore = builds_[s]->hasKeyRowStore
+        ? builds_[s]->keyRowStore
+        : builds_[s]->gpuRowStore;
+    hostSteps[s].buildToAcc =
+        static_cast<const FieldMapping*>(stepBuildToAccBufs_[s].data());
+    hostSteps[s].numBuildFields = static_cast<int32_t>(bmap.size());
+    hostSteps[s].columnarBuild = colBuild ? 1 : 0;
+    if (colBuild) {
+      stepBuildColsBufs_[s] = rmm::device_buffer(
+          colFields.data(), colFields.size() * sizeof(ColBuildField), stream);
+      hostSteps[s].buildCols =
+          static_cast<const ColBuildField*>(stepBuildColsBufs_[s].data());
+    }
+
+    // Composite-key packing params, mirrored from the build (the build packed
+    // its keys; the probe must pack the same way). keyFields[k] must be in the
+    // SAME order the build packed -- both follow rightKeys()/leftKeys() order.
+    hostSteps[s].packEnabled = builds_[s]->packEnabled ? 1 : 0;
+    if (builds_[s]->packEnabled) {
+      VELOX_CHECK_EQ(
+          builds_[s]->packMin.size(), kf.size(),
+          "packing key-column count mismatch at fused step {}", s);
+      // Build key column offsets in the build row store, in the SAME order as
+      // keyFields (leftKeys[k] <-> rightKeys[k]). Used by fingerprint-slot
+      // verification to re-pack the build key from its row.
+      auto rightKeys = node->rightKeys();
+      for (size_t k = 0; k < kf.size(); k++) {
+        hostSteps[s].packMin[k] = builds_[s]->packMin[k];
+        hostSteps[s].packMax[k] = builds_[s]->packMax[k];
+        hostSteps[s].packShift[k] = builds_[s]->packShift[k];
+        // buildKeyOffset[k] locates key k in whatever store the verify reads:
+        // the key-only store (columnar payload) or the full row store. Both list
+        // keys in rightKeys()/keyColIndices order, matching packShift[k].
+        if (builds_[s]->hasKeyRowStore) {
+          hostSteps[s].buildKeyOffset[k] = builds_[s]->keyRowFields[k].offset;
+        } else {
+          int32_t bcol = static_cast<int32_t>(
+              rightType->getChildIdx(rightKeys[k]->name()));
+          hostSteps[s].buildKeyOffset[k] = builds_[s]->hostFields[bcol].offset;
+        }
+      }
+      hostSteps[s].packSentinel = builds_[s]->packSentinel;
+    }
+  }
+  // Whether ANY step uses a composite fingerprint slot. Lets the probe launch
+  // the fingerprint-free kernel specialization when no step needs it (the common
+  // case), so the verify path costs zero registers there.
+  hasFingerprint_ = false;
+  for (auto& hs : hostSteps) {
+    if (hs.table.fingerprintSlot) {
+      hasFingerprint_ = true;
+      break;
+    }
+  }
+  stepsBuf_ = rmm::device_buffer(
+      hostSteps.data(), hostSteps.size() * sizeof(FusedJoinStep), stream);
+
+  // ---- accToOut: acc -> final chain output (outputType column order) ----
+  // Split output columns into ACC-sourced (produced by the chain / seeded keys)
+  // and DEFERRED (pure probe payload read from the probe at output). outputFields_
+  // still covers ALL columns (it sizes the output buffers); colOut/accToOut only
+  // the acc-sourced ones; deferred lists the rest.
+  std::vector<FieldMapping> omap;
+  int32_t doff = 0;
+  outputFields_.clear();
+  outAccOffsets_.clear();
+  accOutIdx_.clear();
+  deferredProbeCol_.clear();
+  deferredOutIdx_.clear();
+  deferredWidth_.clear();
+  for (int j = 0; j < outputType_->size(); j++) {
+    auto name = outputType_->nameOf(j);
+    int32_t w = fusedTypeWidth(outputType_->childAt(j));
+    doff = alignUp(doff, w); // fused row-output path writes with reinterpret_cast
+    outputFields_.push_back({doff, w});
+    if (probeDeferred(name)) {
+      deferredProbeCol_.push_back(c0Idx[name]);
+      deferredOutIdx_.push_back(j);
+      deferredWidth_.push_back(w);
+    } else {
+      omap.push_back({accOffset[name], doff, w});
+      outAccOffsets_.push_back(accOffset[name]); // OPT 2
+      accOutIdx_.push_back(j);
+    }
+    doff += w;
+  }
+  outputRowWidth_ = (doff + 7) & ~7;
+  numOutFields_ = static_cast<int32_t>(accOutIdx_.size());
+  numDeferred_ = static_cast<int32_t>(deferredProbeCol_.size());
+  accToOutBuf_ =
+      rmm::device_buffer(omap.data(), omap.size() * sizeof(FieldMapping), stream);
+  outputFieldsBuffer_ = rmm::device_buffer(
+      outputFields_.data(), outputFields_.size() * sizeof(FieldDesc), stream);
+
+  outCountBuf_ = rmm::device_buffer(sizeof(int32_t), stream);
+  layoutComputed_ = true;
+}
+
+RowVectorPtr FusedRowHashJoinProbe::doGetOutput() {
+  // ---- Phase 1: harvest the batch launched on the PREVIOUS call ----
+  //
+  // Its kernel has been running on the GPU while the driver went upstream for
+  // the next batch (scan + H2D), so this synchronize should find it already
+  // complete. That is the entire point of deferring: see InFlight in the header.
+  //
+  // Reusing probeRowBuffer_/probeGatherBuffer_/outCountBuf_ for the batch we are
+  // about to launch is safe precisely BECAUSE we synchronize here first -- the
+  // previous kernel is done with them.
+  RowVectorPtr harvested = nullptr;
+  if (inflight_.valid) {
+    int32_t numMatches = 0;
+    cudaMemcpyAsync(
+        &numMatches,
+        outCountBuf_.data(),
+        sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        inflight_.stream.value());
+    inflight_.stream.synchronize();
+
+    addRuntimeStat(
+        "fusedProbeOutputRows",
+        RuntimeCounter(static_cast<int64_t>(numMatches)));
+
+    if (CudfConfig::getInstance().benchmarkSkipOutput) {
+      std::vector<VectorPtr> children(outputType_->size());
+      for (int i = 0; i < outputType_->size(); i++) {
+        children[i] =
+            BaseVector::createNullConstant(outputType_->childAt(i), 1, pool());
+      }
+      harvested = std::make_shared<RowVector>(
+          pool(), outputType_, nullptr, 1, std::move(children));
+    } else if (numMatches > 0) {
+      // Fused probe replaced the whole chain, so its consumer is always a
+      // columnar operator.
+      harvested = CudfConfig::getInstance().fusedColumnarOutput
+          ? makeColumnarOutputDirect(numMatches, inflight_.stream)
+          : makeColumnarOutput(numMatches, inflight_.stream);
+    }
+    inflight_.valid = false;
+  }
+
+  // ---- Phase 2: launch the current input, WITHOUT waiting for it ----
+  if (!input_) {
+    finished_ = noMoreInput_ && !inflight_.valid;
+    return harvested;
+  }
+
+  // ---- Determine probe input (RowStoreVector Path A or CudfVector Path B) ----
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  int32_t probeRows = 0;
+  GpuFixedRowStore probeGpuStore;
+
+  auto rowStoreInput = std::dynamic_pointer_cast<RowStoreVector>(input_);
+  // OPT 1 needs cuDF columns to read from, so it only applies to a CudfVector
+  // input. In practice the fused probe replaces the WHOLE chain, so its input is
+  // the columnar source -- but an upstream row-mode operator could hand us a
+  // RowStoreVector, and then the row seed is already the right thing.
+  const auto& cfg = CudfConfig::getInstance();
+  const bool columnarSeed = cfg.fusedColumnarSeed && (rowStoreInput == nullptr);
+  const bool columnarOut = cfg.fusedColumnarOutput;
+  if (rowStoreInput) {
+    stream = rowStoreInput->stream();
+    probeRows = rowStoreInput->size();
+    if (!initialized_) {
+      probeFields_ = rowStoreInput->hostFields();
+      probeRowWidth_ = rowStoreInput->rowWidth();
+      initialized_ = true;
+    }
+    if (!fieldsUploaded_) {
+      probeFieldsBuffer_ = rmm::device_buffer(
+          probeFields_.data(), probeFields_.size() * sizeof(FieldDesc), stream);
+      fieldsUploaded_ = true;
+    }
+    probeGpuStore.row_buffer =
+        static_cast<uint8_t*>(rowStoreInput->gpuRowData());
+    probeGpuStore.row_width = probeRowWidth_;
+    probeGpuStore.num_rows = probeRows;
+    probeGpuStore.num_fields = probeFields_.size();
+    probeGpuStore.fields =
+        static_cast<const FieldDesc*>(probeFieldsBuffer_.data());
+  } else {
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+    VELOX_CHECK_NOT_NULL(
+        cudfInput, "FusedRowHashJoinProbe: input must be RowStoreVector or CudfVector");
+    stream = cudfInput->stream();
+    auto probeView = cudfInput->getTableView();
+    probeRows = probeView.num_rows();
+    if (!initialized_) {
+      auto [pf, prw] = computeRowLayoutFromTable(probeView);
+      probeFields_ = std::move(pf);
+      probeRowWidth_ = prw;
+      initialized_ = true;
+    }
+    if (!layoutComputed_) {
+      setupLayout(probeFields_, stream);
+    }
+
+    if (columnarSeed) {
+      // OPT 1: no transpose. Hand the kernel the column base pointers and let
+      // each thread read its own tuple's fields directly -- lane i reads col[i],
+      // which is coalesced, whereas the row store made lane i read at
+      // i*row_width, which is not.
+      //
+      // Rebuilt every batch: these are raw column POINTERS into the input
+      // table, and the input table is a different one each batch.
+      // Base pointer of every probe column this batch -- used by the seed here
+      // and by the lazy-payload deferred reads at output.
+      probeColBase_.assign(probeView.num_columns(), nullptr);
+      for (int c = 0; c < probeView.num_columns(); c++) {
+        auto col = probeView.column(c);
+        VELOX_CHECK(
+            col.null_count() == 0,
+            "FusedRowHashJoinProbe columnar seed: null probe column not supported");
+        probeColBase_[c] = static_cast<const uint8_t*>(col.head<uint8_t>()) +
+            (int64_t)col.offset() * probeFields_[c].byte_width;
+      }
+      std::vector<ColSeedField> seeds(numProbeFields_);
+      for (int i = 0; i < numProbeFields_; i++) {
+        seeds[i].data = probeColBase_[seedProbeCol_[i]];
+        seeds[i].byte_width = seedAccWidths_[i];
+        seeds[i].acc_offset = seedAccOffsets_[i];
+      }
+      colSeedBuf_ = rmm::device_buffer(
+          seeds.data(), seeds.size() * sizeof(ColSeedField), stream);
+    } else {
+      int64_t probeRowBytes = (int64_t)probeRows * probeRowWidth_;
+      if (probeRows > probeRowCapacity_) {
+        probeRowCapacity_ = probeRows;
+        probeRowBuffer_ = rmm::device_buffer(probeRowBytes, stream);
+      }
+      if (!fieldsUploaded_) {
+        probeFieldsBuffer_ = rmm::device_buffer(
+            probeFields_.data(), probeFields_.size() * sizeof(FieldDesc), stream);
+        fieldsUploaded_ = true;
+      }
+      transposeToRows(
+          probeView, probeFields_, probeRowWidth_,
+          static_cast<uint8_t*>(probeRowBuffer_.data()), stream.value());
+      probeGpuStore.row_buffer = static_cast<uint8_t*>(probeRowBuffer_.data());
+      probeGpuStore.row_width = probeRowWidth_;
+      probeGpuStore.num_rows = probeRows;
+      probeGpuStore.num_fields = probeFields_.size();
+      probeGpuStore.fields =
+          static_cast<const FieldDesc*>(probeFieldsBuffer_.data());
+    }
+  }
+
+  if (!layoutComputed_) {
+    setupLayout(probeFields_, stream);
+  }
+
+  // ---- Allocate the output, upper-bounded at probeRows ----
+  // An inner-join probe tuple survives at most once, so probeRows bounds the
+  // output. Both layouts allocate the same TOTAL bytes; they differ only in
+  // whether those bytes are one row buffer or N column buffers.
+  if (columnarOut) {
+    // OPT 2: one column buffer per OUTPUT column (all of them -- acc-sourced and
+    // deferred alike write here), reused across batches. Sized at the upper
+    // bound and handed to cudf::column at the true (smaller) size later.
+    const int nOut = outputType_->size();
+    if (probeRows > outColCapacity_ || outColBuffers_.empty()) {
+      outColCapacity_ = probeRows;
+      outColBuffers_.clear();
+      outColBuffers_.reserve(nOut);
+      for (int j = 0; j < nOut; j++) {
+        outColBuffers_.emplace_back(
+            (int64_t)probeRows * outputFields_[j].byte_width, stream);
+      }
+    }
+    // Acc-sourced output columns (read from the accumulator in the kernel).
+    std::vector<ColOutField> outs(numOutFields_);
+    for (int k = 0; k < numOutFields_; k++) {
+      const int j = accOutIdx_[k];
+      outs[k].data = static_cast<uint8_t*>(outColBuffers_[j].data());
+      outs[k].byte_width = outputFields_[j].byte_width;
+      outs[k].acc_offset = outAccOffsets_[k];
+    }
+    colOutBuf_ = rmm::device_buffer(
+        outs.data(), outs.size() * sizeof(ColOutField), stream);
+    // OPT 3: deferred (pure probe-payload) output columns, read from the probe
+    // column at the survivor's own row index.
+    if (numDeferred_ > 0) {
+      std::vector<DeferredField> defs(numDeferred_);
+      for (int k = 0; k < numDeferred_; k++) {
+        defs[k].probeData = probeColBase_[deferredProbeCol_[k]];
+        defs[k].outData =
+            static_cast<uint8_t*>(outColBuffers_[deferredOutIdx_[k]].data());
+        defs[k].byte_width = deferredWidth_[k];
+      }
+      deferredBuf_ = rmm::device_buffer(
+          defs.data(), defs.size() * sizeof(DeferredField), stream);
+    }
+  } else {
+    int64_t neededOutput = (int64_t)probeRows * outputRowWidth_;
+    if (probeRows > gatherCapacity_) {
+      gatherCapacity_ = probeRows;
+      probeGatherBuffer_ = rmm::device_buffer(neededOutput, stream);
+    } else if (neededOutput > static_cast<int64_t>(probeGatherBuffer_.size())) {
+      probeGatherBuffer_ = rmm::device_buffer(neededOutput, stream);
+    }
+  }
+  cudaMemsetAsync(outCountBuf_.data(), 0, sizeof(int32_t), stream.value());
+
+  // ---- Fused N-way probe: one kernel walks each tuple through all joins ----
+  fusedProbe(
+      probeGpuStore,
+      probeRows,
+      static_cast<const FieldMapping*>(probeToAccBuf_.data()),
+      numProbeFields_,
+      columnarSeed ? static_cast<const ColSeedField*>(colSeedBuf_.data())
+                   : nullptr,
+      static_cast<const FusedJoinStep*>(stepsBuf_.data()),
+      numSteps_,
+      accWidth_,
+      static_cast<const FieldMapping*>(accToOutBuf_.data()),
+      columnarOut ? static_cast<const ColOutField*>(colOutBuf_.data()) : nullptr,
+      numOutFields_,
+      (columnarOut && numDeferred_ > 0)
+          ? static_cast<const DeferredField*>(deferredBuf_.data())
+          : nullptr,
+      numDeferred_,
+      outputRowWidth_,
+      columnarOut ? nullptr
+                  : static_cast<uint8_t*>(probeGatherBuffer_.data()),
+      static_cast<int32_t*>(outCountBuf_.data()),
+      hasFingerprint_,
+      stream.value());
+
+  // DO NOT synchronize here. Record the batch as in-flight and return the one we
+  // harvested at the top of this call. The driver will now go upstream for the
+  // next batch (scan + Velox->cuDF + H2D) while this kernel runs, and we collect
+  // its outCount on the next doGetOutput() -- by which point it is long done.
+  inflight_.valid = true;
+  inflight_.probeRows = probeRows;
+  inflight_.stream = stream;
+
+  rowStoreInput.reset();
+  input_.reset();
+  finished_ = false; // a batch is in flight; we are not done until it is drained
+
+  return harvested;
+}
+
+RowVectorPtr FusedRowHashJoinProbe::makeColumnarOutput(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  const int32_t numCols = outputType_->size();
+  VELOX_CHECK_EQ(static_cast<size_t>(numCols), outputFields_.size());
+
+  std::vector<std::unique_ptr<rmm::device_buffer>> colBuffers;
+  colBuffers.reserve(numCols);
+  std::vector<uint8_t*> colPtrs(numCols);
+  for (int i = 0; i < numCols; i++) {
+    int64_t bytes =
+        static_cast<int64_t>(numMatches) * outputFields_[i].byte_width;
+    auto buf = std::make_unique<rmm::device_buffer>(bytes, stream);
+    colPtrs[i] = static_cast<uint8_t*>(buf->data());
+    colBuffers.push_back(std::move(buf));
+  }
+
+  rowsToColumns(
+      static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+      outputFields_.data(),
+      colPtrs.data(),
+      numCols,
+      numMatches,
+      outputRowWidth_,
+      stream.value());
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(numCols);
+  for (int i = 0; i < numCols; i++) {
+    auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
+    columns.push_back(std::make_unique<cudf::column>(
+        cudfType,
+        static_cast<cudf::size_type>(numMatches),
+        std::move(*colBuffers[i]),
+        rmm::device_buffer{},
+        0));
+  }
+
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  // KEEP the gather buffer. rowsToColumns SCATTERS out of it into fresh column
+  // buffers -- unlike RowHashJoinProbe, which hands its buffer to the output
+  // RowStoreVector and so must relinquish it. Freeing it here forced a fresh
+  // rmm allocation on every single batch, and allocation is the dominant
+  // CPU-side cost in this system (see the cudaMemsetAsync/cudaMallocAsync
+  // totals in any nsys profile). Reusing it is safe: the next batch's kernel is
+  // queued on the SAME stream behind this scatter, so CUDA stream ordering
+  // guarantees the read completes before the write begins.
+
+  return std::make_shared<CudfVector>(
+      pool(),
+      outputType_,
+      static_cast<vector_size_t>(numMatches),
+      std::move(table),
+      stream);
+}
+
+RowVectorPtr FusedRowHashJoinProbe::makeColumnarOutputDirect(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  // OPT 2: the kernel already wrote cuDF-layout columns. There is no
+  // rows_to_columns pass here -- that whole kernel is gone.
+  //
+  // The staging buffers are sized at the upper bound (probeRows), so we copy the
+  // live prefix into exactly-sized column buffers rather than handing the
+  // oversized ones to cudf::column. That costs one CONTIGUOUS D2D copy of just
+  // the surviving rows (a few thousand rows for an aggregation-terminated TPC-H
+  // chain) and, crucially, keeps the staging buffers reusable across batches --
+  // giving them away would force a fresh rmm allocation every batch, and
+  // allocation is the dominant CPU-side cost in this system.
+  const int32_t numCols = outputType_->size();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(numCols);
+  for (int i = 0; i < numCols; i++) {
+    const int64_t bytes =
+        static_cast<int64_t>(numMatches) * outputFields_[i].byte_width;
+    rmm::device_buffer colData(bytes, stream);
+    cudaMemcpyAsync(
+        colData.data(),
+        outColBuffers_[i].data(),
+        bytes,
+        cudaMemcpyDeviceToDevice,
+        stream.value());
+    columns.push_back(std::make_unique<cudf::column>(
+        veloxToCudfDataType(outputType_->childAt(i)),
+        static_cast<cudf::size_type>(numMatches),
+        std::move(colData),
+        rmm::device_buffer{},
+        0));
+  }
+  return std::make_shared<CudfVector>(
+      pool(),
+      outputType_,
+      static_cast<vector_size_t>(numMatches),
+      std::make_unique<cudf::table>(std::move(columns)),
+      stream);
+}
+
+void FusedRowHashJoinProbe::doNoMoreInput() {
+  Operator::noMoreInput();
+}
+
+bool FusedRowHashJoinProbe::isFinished() {
+  // Not finished while a batch is still in flight -- it has yet to be harvested.
+  return noMoreInput_ && input_ == nullptr && !inflight_.valid;
 }
 
 // ============================================================================

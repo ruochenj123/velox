@@ -36,6 +36,7 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/filtered_join.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
@@ -104,6 +105,18 @@ void CudfHashJoinBridge::setHashTable(
     promises = std::move(promises_);
   }
   notify(std::move(promises));
+}
+
+void CudfHashJoinBridge::setDistinctObjects(
+    std::vector<std::shared_ptr<cudf::distinct_hash_join>> objs) {
+  std::lock_guard<std::mutex> l(mutex_);
+  bridgeDistinctObjects_ = std::move(objs);
+}
+
+std::vector<std::shared_ptr<cudf::distinct_hash_join>>
+CudfHashJoinBridge::getDistinctObjects() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return bridgeDistinctObjects_;
 }
 
 std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
@@ -272,7 +285,22 @@ void CudfHashJoinBuild::doNoMoreInput() {
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
 
+  // [Benchmark] When the distinct-join baseline is on, inner+no-filter joins use
+  // cudf::distinct_hash_join built in the PROBE. Skip the general hash_join build
+  // here -- building it too would charge the distinct baseline for a table it
+  // never probes, unfairly inflating it (and flattering the fused comparison).
+  const bool useDistinct = CudfConfig::getInstance().benchmarkDistinctHashJoin &&
+      joinNode_->isInnerJoin() && !joinNode_->filter();
+  if (useDistinct) {
+    buildHashJoin = false;
+  }
+
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  // [Benchmark] When the distinct baseline is on, build the distinct_hash_join
+  // objects HERE (in the build operator) so their construction cost is charged
+  // to CudfHashJoinBuild, symmetric with the fused RowHashJoinBuild -- rather
+  // than lazily on first probe. The probe then only find_matches + gathers.
+  std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctObjects;
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
@@ -280,6 +308,13 @@ void CudfHashJoinBuild::doNoMoreInput() {
                               cudf::null_equality::UNEQUAL,
                               stream)
                         : nullptr);
+    if (useDistinct) {
+      distinctObjects.push_back(std::make_shared<cudf::distinct_hash_join>(
+          tbls[i]->view().select(buildKeyIndices),
+          cudf::null_equality::UNEQUAL,
+          0.5,
+          stream));
+    }
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
@@ -293,6 +328,15 @@ void CudfHashJoinBuild::doNoMoreInput() {
     }
   }
 
+  // distinct_hash_join's constructor inserts ASYNC on `stream`. Without this
+  // sync the actual build kernel would complete later and be charged to the
+  // probe (which syncs), understating the build. Sync here so the build cost is
+  // attributed to CudfHashJoinBuild, symmetric with the fused RowHashJoinBuild
+  // (whose buildFusedMap already synchronizes).
+  if (useDistinct && !distinctObjects.empty()) {
+    stream.synchronize();
+  }
+
   std::vector<std::shared_ptr<cudf::table>> shared_tbls;
   for (auto& tbl : tbls) {
     shared_tbls.push_back(std::move(tbl));
@@ -304,6 +348,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
   cudfHashJoinBridge->setBuildStream(stream);
+  cudfHashJoinBridge->setDistinctObjects(std::move(distinctObjects));
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
@@ -868,16 +913,36 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
         : rightTableView;
 
     // left = probe, right = build
-    VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
       // Make build stream wait for probe tables to become valid
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream,
-        get_temp_mr());
+    const auto joinStream =
+        buildStream_.has_value() ? buildStream_.value() : stream;
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices,
+        rightJoinIndices;
+    // [Benchmark] FAIR N:1 baseline: use cudf::distinct_hash_join for FK->PK
+    // joins (unique build keys, no join filter). Single-pass, skips the general
+    // join's count phase. The object was BUILT in CudfHashJoinBuild (so its
+    // construction cost is not charged to the probe); here we only probe.
+    if (CudfConfig::getInstance().benchmarkDistinctHashJoin &&
+        !joinNode_->filter()) {
+      VELOX_CHECK_LT(
+          i, distinctObjects_.size(),
+          "distinct baseline on but distinct_hash_join not built in the "
+          "build operator");
+      VELOX_CHECK_NOT_NULL(distinctObjects_[i]);
+      std::tie(leftJoinIndices, rightJoinIndices) =
+          distinctObjects_[i]->inner_join(
+              leftTableView.select(leftKeyIndices_), joinStream, get_temp_mr());
+    } else {
+      VELOX_CHECK_NOT_NULL(hb);
+      std::tie(leftJoinIndices, rightJoinIndices) = hb->inner_join(
+          leftTableView.select(leftKeyIndices_),
+          std::nullopt,
+          joinStream,
+          get_temp_mr());
+    }
     if (buildStream_.has_value()) {
       // Make probe stream wait for join completion before using indices
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
@@ -1997,6 +2062,9 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
+  // [Benchmark] distinct objects were built in CudfHashJoinBuild; take them here
+  // (empty unless the distinct baseline is active).
+  distinctObjects_ = cudfJoinBridge->getDistinctObjects();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {

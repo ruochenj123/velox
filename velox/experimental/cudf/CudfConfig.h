@@ -18,9 +18,11 @@
 
 #include <cudf/types.hpp>
 
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox {
 
@@ -56,6 +58,19 @@ struct CudfConfig {
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
   static CudfConfig& getInstance();
+
+  /// [Benchmark] Registry of HashJoin plan-node ids whose PROBE the fused
+  /// pre-pass folded into a FusedRowHashJoinProbe. RowHashJoinBuild reads this to
+  /// build EXACTLY ONE hash table -- our device map when the probe is fused, or
+  /// cudf::hash_join when it is not -- instead of hedging and building both.
+  ///
+  /// Written by the fused pre-pass during driver ADAPTATION (single-threaded,
+  /// under the task lock, before any driver runs), read by the build during
+  /// EXECUTION -- so it is race-free without further ordering. The mutex guards
+  /// against overlapping tasks. Keyed by node id alone: each process runs one
+  /// query plan, whose ids are stable across iterations.
+  void markProbeFused(const std::string& joinNodeId);
+  bool isProbeFused(const std::string& joinNodeId) const;
 
   /// Initialize from a map with the above keys.
   void initialize(std::unordered_map<std::string, std::string>&&);
@@ -169,6 +184,79 @@ struct CudfConfig {
   /// reducing H2D transfer. Requires allowCpuFallback=true.
   bool benchmarkKeepProjectOnCpu{false};
 
+  /// [Benchmark] When true (and benchmarkRowWiseGather is true), a maximal run
+  /// of consecutive row-wise inner-join probes on one pipeline is replaced by a
+  /// single FusedRowHashJoinProbe that walks each probe tuple through all N
+  /// build hash tables in one kernel (one thread per tuple, tuple resident in a
+  /// local accumulator). Requires every fused build side to have unique keys
+  /// (N:1). RowHashJoinBuild additionally builds a device-probeable hash table.
+  bool benchmarkFusedProbe{false};
+
+  /// [Benchmark] Make the COLUMNAR probe use cudf::distinct_hash_join instead of
+  /// the general cudf::hash_join. distinct_hash_join is the N:1-aware primitive
+  /// (undefined if the build has duplicate keys) -- single-pass, no count phase.
+  /// This is the FAIR columnar baseline for FK->PK workloads: the general join
+  /// pays a two-pass count+retrieve tax (measured ~8ms fixed) that distinct
+  /// avoids for free. Only applied to inner joins with no join filter (the build
+  /// keys must be unique). Set it only when the workload is genuinely FK->PK.
+  bool benchmarkDistinctHashJoin{false};
+
+  /// [Benchmark] Let the fused pre-pass fire on a SINGLE join (numSteps=1),
+  /// standing our row-native join primitive up against cudf::inner_join with no
+  /// fusion in play. Requires benchmarkFusedProbe. Isolates the row-layout join
+  /// from the chain-fusion effect.
+  bool benchmarkFuseSingleJoin{false};
+
+  /// [Benchmark] OPT 1. Seed the fused probe's accumulator DIRECTLY from cuDF
+  /// columns instead of transposing the probe input into a row store first.
+  /// The probe tuple is read exactly once, in thread-id order, so a columnar
+  /// read is fully coalesced (lane i reads col[i]) while the row read is
+  /// strided (lane i reads base + i*row_width). Eliminates the columns_to_rows
+  /// pass entirely -- which nsys measured as the LARGEST single GPU cost in the
+  /// fused operator (3.09ms of 6.53ms on TPC-H Q8 SF10).
+  /// Requires benchmarkFusedProbe. Does not affect the BUILD-side row store.
+  bool fusedColumnarSeed{false};
+
+  /// [Benchmark] OPT 2. Scatter fused-probe survivors DIRECTLY into cuDF output
+  /// columns instead of writing a row buffer and then transposing it. Coalesced
+  /// for free: the warp-aggregated atomic gives surviving lanes CONSECUTIVE
+  /// output slots, so a column-major write is adjacent across the warp while the
+  /// row-major write is strided by the output row width.
+  /// Only matters when the chain OUTPUT is large -- TPC-H chains end in an
+  /// aggregation and emit a few thousand rows, so expect ~0 there.
+  /// Requires benchmarkFusedProbe.
+  bool fusedColumnarOutput{false};
+
+  /// [Benchmark] OPT 3. LAZY PAYLOAD. The fused probe normally seeds EVERY probe
+  /// column into the accumulator for every probe row, then carries them through
+  /// the chain -- but only survivors reach the output, so payload columns that
+  /// are never a join key are seeded 1/selectivity times more than needed. With
+  /// lazy payload, only KEY columns are seeded; a pure-payload probe column is
+  /// read straight from its cuDF column at the surviving thread's own probe row
+  /// index, at output time, for survivors only. This matches what
+  /// cudf::distinct_hash_join does (gather survivors) while keeping the fused
+  /// kernel's inline compaction and contiguous build fetch. Requires
+  /// fusedColumnarSeed + fusedColumnarOutput (needs the probe columns and a
+  /// columnar output).
+  bool benchmarkFusedLazyPayload{false};
+
+  /// [Benchmark] When true, a CudfBatchConcat is inserted before
+  /// CudfHashJoinProbe, accumulating probe batches to batchSizeMinThreshold
+  /// rows before probing. This is the "just re-batch on the GPU" alternative to
+  /// row-wise gather: it decouples the join's batch size from the pipeline's,
+  /// so scan/H2D can stream CPU-friendly small batches while the join still
+  /// sees a GPU-friendly large one.
+  ///
+  /// Only the probe side is wrapped. CudfHashJoinBuild already accumulates all
+  /// of its input and concatenates once in noMoreInput(), so it is effectively
+  /// at unbounded batch size already and concat there would be pure copy cost.
+  ///
+  /// Independent of concatOptimizationEnabled, which covers aggregation only.
+  bool benchmarkConcatBeforeJoin{false};
+
+ private:
+  std::unordered_set<std::string> fusedProbeJoinIds_;
+  mutable std::mutex fusedProbeMutex_;
 };
 
 } // namespace facebook::velox::cudf_velox

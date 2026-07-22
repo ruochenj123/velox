@@ -28,6 +28,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -72,10 +73,19 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  // [Benchmark] Per-build-table distinct_hash_join objects, constructed in the
+  // BUILD operator (so their build cost is charged to CudfHashJoinBuild, not the
+  // probe). Empty unless the distinct-join baseline is active. One per build
+  // sub-table, parallel to the hash_type's tables/hash_join vectors.
+  void setDistinctObjects(
+      std::vector<std::shared_ptr<cudf::distinct_hash_join>> objs);
+  std::vector<std::shared_ptr<cudf::distinct_hash_join>> getDistinctObjects();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
+  std::vector<std::shared_ptr<cudf::distinct_hash_join>> bridgeDistinctObjects_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
 };
@@ -200,6 +210,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<cudf::size_type> leftKeyIndices_;
   /** @brief Column indices for join keys in right (build) table */
   std::vector<cudf::size_type> rightKeyIndices_;
+  /** @brief [Benchmark] Per-build-table distinct_hash_join objects, constructed
+   * in CudfHashJoinBuild and fetched from the bridge in isBlocked() when
+   * CudfConfig::benchmarkDistinctHashJoin is set. */
+  std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctObjects_;
   /** @brief Column indices to gather from left table for output */
   std::vector<cudf::size_type> leftColumnIndicesToGather_;
   /** @brief Column indices to gather from right table for output */
