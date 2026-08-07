@@ -35,6 +35,7 @@
 #include <arrow/io/interfaces.h>
 #include <arrow/table.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -126,6 +127,17 @@ std::unique_ptr<cudf::table> toCudfTable(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     std::optional<std::string> timestampTimeZone) {
+  return toCudfTable(
+      veloxTable, pool, stream, mr, std::move(timestampTimeZone), nullptr);
+}
+
+std::unique_ptr<cudf::table> toCudfTable(
+    const facebook::velox::RowVectorPtr& veloxTable,
+    facebook::velox::memory::MemoryPool* pool,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    std::optional<std::string> timestampTimeZone,
+    ToCudfTiming* timing) {
   TimestampUnit unit;
   switch (CudfConfig::getInstance().timestampUnit) {
     case cudf::type_id::TIMESTAMP_NANOSECONDS:
@@ -153,6 +165,12 @@ std::unique_ptr<cudf::table> toCudfTable(
       .timestampTimeZone = timestampTimeZone,
       .exportVarbinaryAsString = true,
       .useDecimalTypeWidth = true};
+  auto tick = []() { return std::chrono::steady_clock::now(); };
+  auto elapsedNs = [](auto a, auto b) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+  };
+
+  auto tpStart = tick();
   ArrowArray arrowArray;
   exportToArrow(
       std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
@@ -164,7 +182,9 @@ std::unique_ptr<cudf::table> toCudfTable(
       std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
       arrowSchema,
       arrowOptions);
+  auto tpExported = tick();
   auto tbl = cudf::from_arrow(&arrowSchema, &arrowArray, stream, mr);
+  auto tpFromArrow = tick();
 
   // Synchronize before releasing Arrow resources.  cudf::from_arrow uses
   // cudaMemcpyBatchAsync (CUDA 13.0+) with cudaMemcpySrcAccessOrderStream,
@@ -172,6 +192,12 @@ std::unique_ptr<cudf::table> toCudfTable(
   // each copy.  The Arrow arrays must therefore stay alive until the stream
   // has executed those copies.
   stream.synchronize();
+
+  if (timing) {
+    timing->exportNanos = elapsedNs(tpStart, tpExported);
+    timing->fromArrowNanos = elapsedNs(tpExported, tpFromArrow);
+    timing->syncNanos = elapsedNs(tpFromArrow, tick());
+  }
 
   // Release Arrow resources
   if (arrowArray.release) {

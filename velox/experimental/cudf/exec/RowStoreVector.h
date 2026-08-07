@@ -35,6 +35,27 @@ class RowStoreVector : public RowVector {
       std::vector<FieldDesc> hostFields,
       int32_t rowWidth,
       rmm::cuda_stream_view stream)
+      : RowStoreVector(
+            pool,
+            std::move(type),
+            numRows,
+            std::move(rowBuffer),
+            std::make_shared<rmm::device_buffer>(std::move(fieldsBuffer)),
+            std::move(hostFields),
+            rowWidth,
+            stream) {}
+
+  /// Shared-fields variant: batches from one producer share the single
+  /// uploaded FieldDesc buffer instead of each carrying a device copy.
+  RowStoreVector(
+      velox::memory::MemoryPool* pool,
+      RowTypePtr type,
+      int64_t numRows,
+      rmm::device_buffer rowBuffer,
+      std::shared_ptr<rmm::device_buffer> fieldsBuffer,
+      std::vector<FieldDesc> hostFields,
+      int32_t rowWidth,
+      rmm::cuda_stream_view stream)
       : RowVector(
             pool,
             type,
@@ -54,7 +75,7 @@ class RowStoreVector : public RowVector {
     store.row_width = rowWidth_;
     store.num_rows = size();
     store.num_fields = hostFields_.size();
-    store.fields = static_cast<const FieldDesc*>(fieldsBuffer_.data());
+    store.fields = static_cast<const FieldDesc*>(fieldsBuffer_->data());
     return store;
   }
 
@@ -84,8 +105,11 @@ class RowStoreVector : public RowVector {
     return children;
   }
 
-  rmm::device_buffer rowBuffer_;    // GPU row data
-  rmm::device_buffer fieldsBuffer_; // GPU FieldDesc array
+  rmm::device_buffer rowBuffer_; // GPU row data
+  // GPU FieldDesc array. Shared: all batches from one producer point at the
+  // single uploaded buffer (kept alive by this shared_ptr); the legacy ctor
+  // wraps a per-batch buffer, which is equivalent but not deduplicated.
+  std::shared_ptr<rmm::device_buffer> fieldsBuffer_;
   std::vector<FieldDesc> hostFields_; // CPU copy of field layout
   int32_t rowWidth_;
   rmm::cuda_stream_view stream_;

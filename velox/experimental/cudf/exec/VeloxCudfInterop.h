@@ -32,12 +32,33 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type);
 
 namespace with_arrow {
 
+// Optional per-call phase timing for toCudfTable, filled when a non-null
+// pointer is passed. Phases: exportToArrow (array + schema, pure CPU),
+// the cudf::from_arrow call (device alloc + copy enqueue), and the stream
+// synchronize (waits for the H2D copies to complete).
+struct ToCudfTiming {
+  int64_t exportNanos{0};
+  int64_t fromArrowNanos{0};
+  int64_t syncNanos{0};
+};
+
+// Two overloads rather than one defaulted `timing` parameter: the 5-arg
+// symbol is kept intact so previously compiled objects (EnforceSingleRow,
+// Hive connector, ...) keep linking without a full rebuild.
 std::unique_ptr<cudf::table> toCudfTable(
     const facebook::velox::RowVectorPtr& veloxTable,
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     std::optional<std::string> timestampTimeZone = std::nullopt);
+
+std::unique_ptr<cudf::table> toCudfTable(
+    const facebook::velox::RowVectorPtr& veloxTable,
+    facebook::velox::memory::MemoryPool* pool,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    std::optional<std::string> timestampTimeZone,
+    ToCudfTiming* timing);
 
 facebook::velox::RowVectorPtr toVeloxColumn(
     const cudf::table_view& table,
