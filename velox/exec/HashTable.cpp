@@ -54,7 +54,8 @@ HashTable<ignoreNullKeys>::HashTable(
     bool hasCountFlag,
     uint32_t minTableSizeForParallelJoinBuild,
     memory::MemoryPool* pool,
-    uint64_t bloomFilterMaxSize)
+    uint64_t bloomFilterMaxSize,
+    bool hybridMode)
     : BaseHashTable(std::move(hashers)),
       pool_(pool),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
@@ -71,18 +72,38 @@ HashTable<ignoreNullKeys>::HashTable(
     }
   }
 
-  rows_ = std::make_unique<RowContainer>(
-      keys,
-      !ignoreNullKeys,
-      accumulators,
-      dependentTypes,
-      allowDuplicates,
-      isJoinBuild,
-      hasProbedFlag,
-      hasCountFlag,
-      hashMode_ != HashMode::kHash,
-      /*useListRowIndex=*/false,
-      pool);
+  if (hybridMode) {
+    // Hybrid layout: keys stay row-wise; the only dependent column is a
+    // BIGINT rowId that keys the columnar payload kept in 'hybridData_'.
+    const std::vector<TypePtr> rowIdType = {BIGINT()};
+    rows_ = std::make_unique<RowContainer>(
+        keys,
+        !ignoreNullKeys,
+        accumulators,
+        rowIdType,
+        allowDuplicates,
+        isJoinBuild,
+        hasProbedFlag,
+        hasCountFlag,
+        hashMode_ != HashMode::kHash,
+        /*useListRowIndex=*/false,
+        pool);
+    hybridData_ =
+        std::make_unique<HybridContainer>(keys, dependentTypes, rows_.get());
+  } else {
+    rows_ = std::make_unique<RowContainer>(
+        keys,
+        !ignoreNullKeys,
+        accumulators,
+        dependentTypes,
+        allowDuplicates,
+        isJoinBuild,
+        hasProbedFlag,
+        hasCountFlag,
+        hashMode_ != HashMode::kHash,
+        /*useListRowIndex=*/false,
+        pool);
+  }
   nextOffset_ = rows_->nextOffset();
 }
 
@@ -752,8 +773,15 @@ void HashTable<ignoreNullKeys>::allocateTables(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
-  for (auto* rowContainer : allRows()) {
-    rowContainer->clear();
+  if (hybridData_ != nullptr) {
+    // HybridContainer::clear() also clears its underlying RowContainer.
+    for (auto* hybridContainer : allHybridContainers()) {
+      hybridContainer->clear();
+    }
+  } else {
+    for (auto* rowContainer : allRows()) {
+      rowContainer->clear();
+    }
   }
   if (table_) {
     if (!freeTable) {
@@ -1834,6 +1862,19 @@ std::vector<RowContainer*> HashTable<ignoreNullKeys>::allRows() const {
 }
 
 template <bool ignoreNullKeys>
+std::vector<HybridContainer*> HashTable<ignoreNullKeys>::allHybridContainers()
+    const {
+  VELOX_CHECK_NOT_NULL(hybridData_);
+  std::vector<HybridContainer*> hybridContainers;
+  hybridContainers.reserve(otherTables_.size() + 1);
+  hybridContainers.push_back(hybridData_.get());
+  for (auto& other : otherTables_) {
+    hybridContainers.push_back(other->hybridData_.get());
+  }
+  return hybridContainers;
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::checkHashBitsOverlap(
     int8_t spillInputStartPartitionBit) {
   if (spillInputStartPartitionBit != kNoSpillInputStartPartitionBit &&
@@ -1993,6 +2034,18 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     otherTables_.emplace_back(
         std::unique_ptr<HashTable<ignoreNullKeys>>(
             dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+  }
+
+  // Hybrid layout mode: register all hybrid containers (this table's and the
+  // per-driver 'otherTables_') so extraction can resolve rows from any
+  // container by id.
+  if (hybridData_ != nullptr) {
+    std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
+    hybridDataChannel[hybridData_->getId()] = hybridData_.get();
+    for (auto& table : otherTables_) {
+      hybridDataChannel[table->hybridData()->getId()] = table->hybridData();
+    }
+    hybridData_->setAllContainers(hybridDataChannel);
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags

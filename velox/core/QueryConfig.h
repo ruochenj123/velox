@@ -984,6 +984,99 @@ class QueryConfig {
       0,
       "Maximum byte size of Bloom filter from hash probe. 0 disables.")
 
+  /// If true, hash join stores only key columns in the row container; payload
+  /// (dependent) columns stay in their original columnar vectors and are
+  /// referenced by a 64-bit row id stored as an extra dependent column.
+  VELOX_QUERY_CONFIG(
+      kHybridJoinEnabled,
+      hybridJoinEnabled,
+      "hybrid_join_enabled",
+      bool,
+      false,
+      "Store only join keys row-wise; keep payload columns columnar.")
+
+  /// If true, reorder rows by containerId during hybrid join extraction for
+  /// better cache locality. Can be disabled for testing to get deterministic
+  /// output order.
+  VELOX_QUERY_CONFIG(
+      kHybridJoinReorderEnabled,
+      hybridJoinReorderEnabled,
+      "hybrid_join_reorder_enabled",
+      bool,
+      true,
+      "Reorder rows by container id during hybrid join extraction.")
+
+  /// If true, order by stores only sort-key columns in the row container;
+  /// payload columns stay columnar behind a 64-bit row id.
+  VELOX_QUERY_CONFIG(
+      kHybridSortEnabled,
+      hybridSortEnabled,
+      "hybrid_sort_enabled",
+      bool,
+      false,
+      "Store only sort keys row-wise; keep payload columns columnar.")
+
+  /// If true, use scattered (non-coalesced) mode for hybrid join payload
+  /// extraction. Payload batches are kept separate instead of being merged
+  /// into one large batch; row ids encode (batchId, rowInBatch) instead of a
+  /// global row index. Avoids coalesceBatches() overhead but may have worse
+  /// cache locality during extraction.
+  VELOX_QUERY_CONFIG(
+      kHybridJoinScatteredModeEnabled,
+      hybridJoinScatteredModeEnabled,
+      "hybrid_join_scattered_mode_enabled",
+      bool,
+      true,
+      "Keep hybrid join payload batches separate (scattered row ids).")
+
+  /// If true, hybrid sort keeps payload batches scattered instead of
+  /// coalescing them before output extraction. Sort's output permutation is
+  /// fully random, so scattered extraction is usually much slower; default
+  /// off (coalesced, with the merge overlapped with the key sort).
+  VELOX_QUERY_CONFIG(
+      kHybridSortScatteredEnabled,
+      hybridSortScatteredEnabled,
+      "hybrid_sort_scattered_enabled",
+      bool,
+      false,
+      "Keep hybrid sort payload batches scattered (usually slower).")
+
+  /// Minimum total nominal byte width of build-side payload (dependent)
+  /// columns that the probe actually reads -- columns in the join output plus
+  /// columns referenced by the join filter -- for hybrid join to stay
+  /// enabled. Fixed-width types count their exact size; VARCHAR/VARBINARY
+  /// count 32 bytes (16-byte view + 16 bytes nominal out-of-line body); other
+  /// variable-width types count 16. Dependents that are stored but never
+  /// read count 0. Below the threshold the per-output-row row-id decode tax
+  /// outweighs the row-store write savings, so hybrid is disabled.
+  VELOX_QUERY_CONFIG(
+      kHybridJoinMinPayloadBytes,
+      hybridJoinMinPayloadBytes,
+      "hybrid_join_min_payload_bytes",
+      uint32_t,
+      24,
+      "Minimum read payload bytes for hybrid join to stay enabled.")
+
+  /// Minimum total nominal byte width of non-sort-key (payload) columns for
+  /// hybrid sort to stay enabled. Same per-type widths as
+  /// hybrid_join_min_payload_bytes. Sort outputs every payload column, so
+  /// the width is summed over all of them.
+  ///
+  /// The default of 8 is the break-even implied by the design: hybrid
+  /// replaces the payload bytes a row would occupy in the container with a
+  /// single 8-byte row reference, so the container only shrinks when the
+  /// payload exceeds that reference. Measured on the sort sweep (SF30
+  /// lineitem, 16 drivers, OrderBy CPU hybrid vs baseline): 24B payload
+  /// 1.24x, 16B 1.07x, 8B 1.03x (a wash, kept), 0B disabled. Below 8B the
+  /// reference costs more than the payload it replaces.
+  VELOX_QUERY_CONFIG(
+      kHybridSortMinPayloadBytes,
+      hybridSortMinPayloadBytes,
+      "hybrid_sort_min_payload_bytes",
+      uint32_t,
+      8,
+      "Minimum payload bytes for hybrid sort to stay enabled.")
+
   /// The minimum number of table rows that can trigger the parallel hash join
   /// table build.
   VELOX_QUERY_CONFIG(

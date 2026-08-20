@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
+#include <thread>
+
 #include "SortBuffer.h"
 #include "velox/exec/MemoryReclaimer.h"
+#include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Spiller.h"
 
 namespace facebook::velox::exec {
@@ -28,7 +31,10 @@ SortBuffer::SortBuffer(
     tsan_atomic<bool>* nonReclaimableSection,
     common::PrefixSortConfig prefixSortConfig,
     const common::SpillConfig* spillConfig,
-    exec::SpillStats* spillStats)
+    exec::SpillStats* spillStats,
+    bool hybridSortEnabled,
+    bool hybridSortScattered,
+    uint32_t hybridSortMinPayloadBytes)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -36,7 +42,9 @@ SortBuffer::SortBuffer(
       prefixSortConfig_(prefixSortConfig),
       spillConfig_(spillConfig),
       spillStats_(spillStats),
-      sortedRows_(0, memory::StlAllocator<char*>(*pool)) {
+      sortedRows_(0, memory::StlAllocator<char*>(*pool)),
+      hybridSortEnabled_(hybridSortEnabled),
+      hybridSortScattered_(hybridSortScattered) {
   VELOX_CHECK_GE(input_->children().size(), sortCompareFlags_.size());
   VELOX_CHECK_GT(sortCompareFlags_.size(), 0);
   VELOX_CHECK_EQ(sortColumnIndices.size(), sortCompareFlags_.size());
@@ -44,15 +52,19 @@ SortBuffer::SortBuffer(
 
   std::vector<TypePtr> sortedColumnTypes;
   std::vector<TypePtr> nonSortedColumnTypes;
+  std::vector<std::string> nonSortedColumnNames;
   std::vector<std::string> sortedSpillColumnNames;
   std::vector<TypePtr> sortedSpillColumnTypes;
   sortedColumnTypes.reserve(sortColumnIndices.size());
   nonSortedColumnTypes.reserve(input->size() - sortColumnIndices.size());
+  nonSortedColumnNames.reserve(input->size() - sortColumnIndices.size());
+  payloadChannels_.reserve(input->size() - sortColumnIndices.size());
   sortedSpillColumnNames.reserve(input->size());
   sortedSpillColumnTypes.reserve(input->size());
   std::unordered_set<column_index_t> sortedChannelSet;
   // Sorted key columns.
   for (column_index_t i = 0; i < sortColumnIndices.size(); ++i) {
+    keyColumnMap_.emplace_back(IdentityProjection(i, sortColumnIndices.at(i)));
     columnMap_.emplace_back(IdentityProjection(i, sortColumnIndices.at(i)));
     sortedColumnTypes.emplace_back(input_->childAt(sortColumnIndices.at(i)));
     sortedSpillColumnTypes.emplace_back(
@@ -69,12 +81,61 @@ SortBuffer::SortBuffer(
     }
     columnMap_.emplace_back(nonSortedIndex++, i);
     nonSortedColumnTypes.emplace_back(input_->childAt(i));
+    nonSortedColumnNames.emplace_back(input->nameOf(i));
+    payloadChannels_.push_back(i);
     sortedSpillColumnTypes.emplace_back(input_->childAt(i));
     sortedSpillColumnNames.emplace_back(input->nameOf(i));
   }
 
-  data_ = std::make_unique<RowContainer>(
-      sortedColumnTypes, nonSortedColumnTypes, /*useListRowIndex=*/true, pool_);
+  // Hybrid sort does not support the spill paths yet; gracefully fall back to
+  // the standard row-layout path when spilling is configured.
+  // hybrid+spill deferred; see transplant plan Phase 5.
+  if (spillConfig_ != nullptr) {
+    hybridSortEnabled_ = false;
+  }
+  // Hybrid layout only pays off when there are payload columns to keep
+  // columnar.
+  hybridSortEnabled_ = hybridSortEnabled_ && !nonSortedColumnTypes.empty();
+  // Payload-width eligibility gate (symmetry with the hybrid join gate; the
+  // default threshold of 1 byte keeps hybrid on whenever any payload
+  // exists). Sort outputs every payload column, so all of them count.
+  if (hybridSortEnabled_) {
+    int64_t payloadBytes = 0;
+    for (const auto& type : nonSortedColumnTypes) {
+      payloadBytes += hybridPayloadNominalWidth(type);
+    }
+    if (payloadBytes < static_cast<int64_t>(hybridSortMinPayloadBytes)) {
+      hybridSortEnabled_ = false;
+    }
+    VLOG(1) << "hybrid sort payload gate: payloadBytes=" << payloadBytes
+            << " threshold=" << hybridSortMinPayloadBytes << " hybridSort="
+            << (hybridSortEnabled_ ? "enabled" : "disabled");
+  }
+  if (hybridSortEnabled_) {
+    const std::vector<TypePtr> rowIdType = {BIGINT()};
+    data_ = std::make_unique<RowContainer>(
+        sortedColumnTypes, rowIdType, /*useListRowIndex=*/true, pool_);
+    hybridData_ = std::make_unique<HybridContainer>(
+        sortedColumnTypes, nonSortedColumnTypes, data_.get());
+    // Register the (single) container in the extraction registry.
+    std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
+    hybridDataChannel[0] = hybridData_.get();
+    hybridData_->setAllContainers(hybridDataChannel);
+    if (hybridSortScattered_) {
+      // Must be set before the first addPayload so per-batch decoded
+      // payloads are populated for the scattered extraction kernels.
+      hybridData_->setScatteredModeEnabled(true);
+    }
+
+    payloadTypes_ =
+        ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
+  } else {
+    data_ = std::make_unique<RowContainer>(
+        sortedColumnTypes,
+        nonSortedColumnTypes,
+        /*useListRowIndex=*/true,
+        pool_);
+  }
   spillerStoreType_ =
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
 }
@@ -96,13 +157,44 @@ void SortBuffer::addInput(const VectorPtr& input) {
     rows[row] = data_->newRow();
   }
   const auto* inputRow = input->as<RowVector>();
-  for (const auto& columnProjection : columnMap_) {
-    DecodedVector decoded(
-        *inputRow->childAt(columnProjection.outputChannel), allRows);
-    data_->store(
-        decoded,
-        folly::Range(rows.data(), input->size()),
-        columnProjection.inputChannel);
+  if (hybridSortEnabled_) {
+    if (hybridSortScattered_) {
+      // Scattered ids: driverId (8 bits) | batchId (24) | rowInBatch (32).
+      const auto batchId = hybridData_->getNumBatches();
+      for (int row = 0; row < input->size(); ++row) {
+        uint64_t encodedId = HybridRowId::encodeScattered(batchId, row);
+        data_->storeSingleRowId(encodedId, rows[row]);
+      }
+    } else {
+      const auto currentRows = hybridData_->getNumRows();
+      for (int row = 0; row < input->size(); ++row) {
+        // Store RowId: driverId (8 bits) | globalRowId (56 bits).
+        uint64_t encodedId = (static_cast<uint64_t>(0) << 56) |
+            (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+        data_->storeSingleRowId(encodedId, rows[row]);
+      }
+    }
+    // Store the sort key columns row-wise.
+    for (const auto& columnProjection : keyColumnMap_) {
+      DecodedVector decoded(
+          *inputRow->childAt(columnProjection.outputChannel), allRows);
+      data_->store(
+          decoded,
+          folly::Range(rows.data(), input->size()),
+          columnProjection.inputChannel);
+    }
+    // Gather payload columns (zero-copy: shares the input's children).
+    hybridData_->addPayload(
+        wrapColumns(inputRow, payloadChannels_, payloadTypes_, pool_));
+  } else {
+    for (const auto& columnProjection : columnMap_) {
+      DecodedVector decoded(
+          *inputRow->childAt(columnProjection.outputChannel), allRows);
+      data_->store(
+          decoded,
+          folly::Range(rows.data(), input->size()),
+          columnProjection.inputChannel);
+    }
   }
   numInputRows_ += allRows.size();
 }
@@ -123,17 +215,57 @@ void SortBuffer::noMoreInput() {
     return;
   }
 
+  // Coalesced hybrid mode: run the payload merge on a background thread,
+  // overlapped with the key sort below. The merge touches only the payload
+  // batches; the sort touches only the key container (data_) — fully
+  // disjoint. The thread is joined before updateEstimatedOutputRowSize(),
+  // which is the first reader of hybridData_ after this point. Scattered
+  // mode skips coalescing entirely; extraction reads per-batch vectors.
+  std::thread coalesceThread;
+  std::exception_ptr coalesceError;
+  const bool overlapCoalesce = hybridData_ != nullptr &&
+      !hybridSortScattered_ && inputSpiller_ == nullptr;
+  if (overlapCoalesce) {
+    coalesceThread = std::thread([&]() {
+      try {
+        hybridData_->coalesceBatches();
+      } catch (...) {
+        coalesceError = std::current_exception();
+      }
+    });
+  } else if (hybridData_ != nullptr && !hybridSortScattered_) {
+    hybridData_->coalesceBatches();
+  }
+
   if (inputSpiller_ == nullptr) {
-    VELOX_CHECK_EQ(numInputRows_, data_->numRows());
+    try {
+      VELOX_CHECK_EQ(numInputRows_, data_->numRows());
+      // Sort the pointers to the rows in RowContainer (data_) instead of
+      // sorting the rows.
+      // TODO: Reuse 'RowContainer::rowPointers_'.
+      sortedRows_.resize(numInputRows_);
+      RowContainerIterator iter;
+      data_->listRows(&iter, numInputRows_, sortedRows_.data());
+      PrefixSort::sort(
+          data_.get(),
+          sortCompareFlags_,
+          prefixSortConfig_,
+          pool_,
+          sortedRows_);
+    } catch (...) {
+      if (coalesceThread.joinable()) {
+        coalesceThread.join();
+      }
+      throw;
+    }
+    if (coalesceThread.joinable()) {
+      coalesceThread.join();
+      if (coalesceError) {
+        std::rethrow_exception(coalesceError);
+      }
+    }
+    // Runs after the coalesce join: reads hybridData_ under hybrid mode.
     updateEstimatedOutputRowSize();
-    // Sort the pointers to the rows in RowContainer (data_) instead of sorting
-    // the rows.
-    // TODO: Reuse 'RowContainer::rowPointers_'.
-    sortedRows_.resize(numInputRows_);
-    RowContainerIterator iter;
-    data_->listRows(&iter, numInputRows_, sortedRows_.data());
-    PrefixSort::sort(
-        data_.get(), sortCompareFlags_, prefixSortConfig_, pool_, sortedRows_);
   } else {
     // Spill the remaining in-memory state to disk if spilling has been
     // triggered on this sort buffer. This is to simplify query OOM prevention
@@ -337,7 +469,9 @@ void SortBuffer::ensureSortFits() {
 }
 
 void SortBuffer::updateEstimatedOutputRowSize() {
-  const auto optionalRowSize = data_->estimateRowSize();
+  const auto optionalRowSize = hybridSortEnabled_
+      ? hybridData_->estimateRowSize()
+      : data_->estimateRowSize();
   if (!optionalRowSize.has_value() || optionalRowSize.value() == 0) {
     return;
   }
@@ -408,12 +542,28 @@ void SortBuffer::prepareOutput(vector_size_t batchSize) {
 
 void SortBuffer::getOutputWithoutSpill() {
   VELOX_DCHECK_EQ(numInputRows_, sortedRows_.size());
-  for (const auto& columnProjection : columnMap_) {
-    data_->extractColumn(
-        sortedRows_.data() + numOutputRows_,
-        output_->size(),
-        columnProjection.inputChannel,
-        output_->childAt(columnProjection.outputChannel));
+  if (hybridSortEnabled_) {
+    // Reused across output batches; getOutput is single-threaded per buffer.
+    static thread_local std::vector<HybridRowId> outputRowIds;
+    outputRowIds.resize(output_->size());
+    hybridData_->getRowIds(
+        sortedRows_.data() + numOutputRows_, output_->size(), outputRowIds);
+    for (const auto& columnProjection : columnMap_) {
+      hybridData_->extractColumn(
+          sortedRows_.data() + numOutputRows_,
+          output_->size(),
+          columnProjection.inputChannel,
+          output_->childAt(columnProjection.outputChannel),
+          outputRowIds);
+    }
+  } else {
+    for (const auto& columnProjection : columnMap_) {
+      data_->extractColumn(
+          sortedRows_.data() + numOutputRows_,
+          output_->size(),
+          columnProjection.inputChannel,
+          output_->childAt(columnProjection.outputChannel));
+    }
   }
   numOutputRows_ += output_->size();
 }

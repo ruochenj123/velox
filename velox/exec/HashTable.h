@@ -448,9 +448,19 @@ class BaseHashTable {
     return rows_.get();
   }
 
+  /// Returns the hybrid container holding the columnar payload of the build
+  /// side (hybrid layout mode only, nullptr otherwise).
+  HybridContainer* hybridData() const {
+    return hybridData_.get();
+  }
+
   /// Returns all the row containers of a composed hash table such as for hash
   /// join use.
   virtual std::vector<RowContainer*> allRows() const = 0;
+
+  /// Returns all the hybrid containers of a composed hash table (hybrid layout
+  /// mode only).
+  virtual std::vector<HybridContainer*> allHybridContainers() const = 0;
 
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
@@ -516,6 +526,10 @@ class BaseHashTable {
   std::vector<std::unique_ptr<VectorHasher>> hashers_;
   std::unique_ptr<RowContainer> rows_;
 
+  // Hybrid layout mode: columnar payload storage keyed by the BIGINT rowId
+  // dependent column stored in 'rows_'. Null when hybrid mode is off.
+  std::unique_ptr<HybridContainer> hybridData_{nullptr};
+
   ParallelJoinBuildStats parallelJoinBuildStats_;
   CpuWallTiming vectorHasherMergeTiming_;
 };
@@ -553,7 +567,8 @@ class HashTable : public BaseHashTable {
       bool hasCountFlag,
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
-      uint64_t bloomFilterMaxSize = 0);
+      uint64_t bloomFilterMaxSize = 0,
+      bool hybridMode = false);
 
   ~HashTable() override = default;
 
@@ -581,7 +596,8 @@ class HashTable : public BaseHashTable {
       bool hasCountFlag,
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
-      uint64_t bloomFilterMaxSize = 0) {
+      uint64_t bloomFilterMaxSize = 0,
+      bool hybridMode = false) {
     return std::make_unique<HashTable>(
         std::move(hashers),
         std::vector<Accumulator>{},
@@ -592,7 +608,8 @@ class HashTable : public BaseHashTable {
         hasCountFlag,
         minTableSizeForParallelJoinBuild,
         pool,
-        bloomFilterMaxSize);
+        bloomFilterMaxSize,
+        hybridMode);
   }
 
   void groupProbe(HashLookup& lookup, int8_t spillInputStartPartitionBit)
@@ -765,6 +782,8 @@ class HashTable : public BaseHashTable {
 
   std::vector<RowContainer*> allRows() const override;
 
+  std::vector<HybridContainer*> allHybridContainers() const override;
+
   std::string toString() override;
 
   /// Returns the details of the range of buckets. The range starts from
@@ -785,6 +804,12 @@ class HashTable : public BaseHashTable {
       folly::Range<char* const*> rows,
       int32_t columnIndex,
       const VectorPtr& result) override {
+    // Under hybrid mode 'rows_' only has numKeys + 1 (rowId) columns;
+    // indexing 'columnHasNulls_' or 'rows_' with payload channels is
+    // out-of-bounds. Hybrid probes must extract via HybridContainer.
+    VELOX_DCHECK(
+        hybridData_ == nullptr,
+        "hybrid probe must not reach BaseHashTable::extractColumn");
     RowContainer::extractColumn(
         rows.data(),
         rows.size(),

@@ -53,6 +53,13 @@ DEFINE_bool(
     false,
     "Include custom statistics along with execution statistics");
 DEFINE_bool(include_results, false, "Include results in the output");
+DEFINE_int32(
+    include_results_max_rows,
+    0,
+    "Cap the number of result rows printed by --include_results (0 = all). "
+    "Exists so --include_results can serve as an eyeball sample on large "
+    "results without emitting one line per output row; --result_checksum is "
+    "what actually covers every row and column.");
 DEFINE_int32(num_drivers, 4, "Number of drivers");
 
 DEFINE_int32(num_splits_per_file, 10, "Number of splits per file");
@@ -97,6 +104,48 @@ DEFINE_bool(
     false,
     "Runs one warmup of the query before "
     "measured run. Use to run warm after clearing caches.");
+
+DEFINE_bool(
+    hybrid_join_enabled,
+    false,
+    "Enable hybrid join optimization");
+
+DEFINE_bool(
+    hybrid_sort_enabled,
+    false,
+    "Enable hybrid sort optimization");
+
+DEFINE_bool(
+    hybrid_join_scattered_mode_enabled,
+    true,
+    "Enable scattered (non-coalesced) mode for hybrid join payload extraction "
+    "(matches QueryConfig default; set =false to force coalesced mode)");
+
+DEFINE_bool(
+    hybrid_join_reorder_enabled,
+    true,
+    "Enable driver-aware reorder of rows by containerId during hybrid join "
+    "payload extraction (set =false to disable)");
+
+DEFINE_bool(
+    hybrid_sort_scattered_enabled,
+    false,
+    "Keep hybrid sort payload batches scattered instead of coalesced "
+    "(usually slower; matches QueryConfig default false)");
+
+DEFINE_int32(
+    hybrid_join_min_payload_bytes,
+    24,
+    "Minimum nominal byte width of build-side payload columns actually read "
+    "by the probe for hybrid join to stay enabled (matches QueryConfig "
+    "default 24; set =0 to disable the gate)");
+
+DEFINE_int32(
+    hybrid_sort_min_payload_bytes,
+    8,
+    "Minimum nominal byte width of non-sort-key payload columns for hybrid "
+    "sort to stay enabled (matches QueryConfig default 8 = the 8-byte row "
+    "reference hybrid stores in place of the payload)");
 
 DEFINE_int64(
     max_coalesced_bytes,
@@ -155,6 +204,7 @@ void QueryBenchmarkBase::printResults(
     std::ostream& out) {
   out << "Results:" << std::endl;
   bool printType = true;
+  int64_t printed = 0;
   for (const auto& vector : results) {
     // Print RowType only once.
     if (printType) {
@@ -162,7 +212,14 @@ void QueryBenchmarkBase::printResults(
       printType = false;
     }
     for (vector_size_t i = 0; i < vector->size(); ++i) {
+      if (FLAGS_include_results_max_rows > 0 &&
+          printed >= FLAGS_include_results_max_rows) {
+        out << "... (truncated at " << FLAGS_include_results_max_rows
+            << " rows by --include_results_max_rows)" << std::endl;
+        return;
+      }
       out << vector->toString(i) << std::endl;
+      ++printed;
     }
   }
 }
@@ -264,6 +321,22 @@ QueryBenchmarkBase::run(
       params.queryConfigs = queryConfigs;
       params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
           std::to_string(FLAGS_split_preload_per_driver);
+      if (FLAGS_hybrid_join_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
+      }
+      if (FLAGS_hybrid_sort_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
+      }
+      params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
+          FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
+      params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
+          FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
+      params.queryConfigs[core::QueryConfig::kHybridSortScatteredEnabled] =
+          FLAGS_hybrid_sort_scattered_enabled ? "true" : "false";
+      params.queryConfigs[core::QueryConfig::kHybridJoinMinPayloadBytes] =
+          std::to_string(FLAGS_hybrid_join_min_payload_bytes);
+      params.queryConfigs[core::QueryConfig::kHybridSortMinPayloadBytes] =
+          std::to_string(FLAGS_hybrid_sort_min_payload_bytes);
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
 
       auto addSplits = [&](TaskCursor* taskCursor) {
@@ -283,6 +356,11 @@ QueryBenchmarkBase::run(
       };
       auto result = readCursor(params, addSplits);
       ensureTaskCompletion(result.first->task().get());
+      // Query-level engine-tracked footprint: peak of the task's root memory
+      // pool (all operator pools are children). Per-operator peaks occur at
+      // different times and cannot be summed into a query-level number.
+      std::cout << "Query peak memory bytes: "
+                << result.first->task()->pool()->peakBytes() << std::endl;
       if (++repeat >= FLAGS_num_repeats) {
         return result;
       }

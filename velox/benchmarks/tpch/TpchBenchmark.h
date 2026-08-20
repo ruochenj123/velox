@@ -16,7 +16,10 @@
 #pragma once
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
+#include "velox/exec/tests/utils/TpcdsQueryBuilder.h"
 #include "velox/exec/tests/utils/TpchQueryBuilder.h"
+
+DECLARE_bool(use_tpcds);
 
 class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
  public:
@@ -26,8 +29,17 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
 
   void runMain(std::ostream& out, facebook::velox::RunStats& runStats) override;
 
+  // Returns the plan for 'queryId' from the TPC-DS builder when --use_tpcds
+  // is set, from the TPC-H builder otherwise.
+  facebook::velox::exec::test::TpchPlan getQueryPlan(int32_t queryId) const {
+    if (FLAGS_use_tpcds) {
+      return tpcdsQueryBuilder_->getQueryPlan(queryId);
+    }
+    return queryBuilder_->getQueryPlan(queryId);
+  }
+
   void runQuery(int32_t queryId) {
-    const auto planContext = queryBuilder_->getQueryPlan(queryId);
+    const auto planContext = getQueryPlan(queryId);
     run(planContext, queryConfigs_);
   }
 
@@ -38,6 +50,8 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
   void initQueryBuilder();
 
   std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder> queryBuilder_;
+  std::shared_ptr<facebook::velox::exec::test::TpcdsQueryBuilder>
+      tpcdsQueryBuilder_;
 };
 
 extern std::unique_ptr<TpchBenchmark> benchmark;

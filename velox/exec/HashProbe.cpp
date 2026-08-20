@@ -63,26 +63,79 @@ RowTypePtr HashProbe::makeTableType(
 namespace {
 // Copy values from 'rows' of 'table' according to 'projections' in
 // 'result'. Reuses 'result' children where possible.
+// 'allowSorting': If false, disables sorting even if the hybridData supports
+// it. This is needed when the caller also has probe-side columns that won't be
+// reordered - we must keep build-side and probe-side in the same order.
 void extractColumns(
     BaseHashTable* table,
     folly::Range<char* const*> rows,
     folly::Range<const IdentityProjection*> projections,
     memory::MemoryPool* pool,
     const std::vector<TypePtr>& resultTypes,
-    std::vector<VectorPtr>& resultVectors) {
+    std::vector<VectorPtr>& resultVectors,
+    bool allowSorting = true) {
   VELOX_CHECK_EQ(resultTypes.size(), resultVectors.size());
-  for (auto projection : projections) {
-    const auto resultChannel = projection.outputChannel;
-    VELOX_CHECK_LT(resultChannel, resultVectors.size());
+  auto* hybridData = table->hybridData();
+  if (hybridData != nullptr) {
+    // Per-driver scratch: reused across output batches to avoid a fresh
+    // 16B-per-row heap allocation on every call.
+    static thread_local std::vector<HybridRowId> outputRowIds;
+    outputRowIds.resize(rows.size());
+    hybridData->getRowIds(rows.data(), rows.size(), outputRowIds);
 
-    auto& child = resultVectors[resultChannel];
-    // TODO: Consider reuse of complex types.
-    if (!child || !BaseVector::isVectorWritable(child) ||
-        !child->isFlatEncoding()) {
-      child = BaseVector::create(resultTypes[resultChannel], rows.size(), pool);
+    // For single container, extract directly without sorting overhead.
+    // For multiple containers, sort by containerId for better cache locality.
+    // Note: sorting is safe here because the output order of hash join results
+    // does not need to match any specific order (SQL doesn't guarantee order).
+    // Sorting can be disabled via query config for deterministic testing,
+    // or disabled by caller when probe-side columns must stay in sync.
+    const bool useSorting = allowSorting && hybridData->shouldUseSorting();
+
+    const char* const* extractRows = rows.data();
+    std::vector<HybridRowId>* extractRowIds = &outputRowIds;
+    HybridContainer::SortedRows sorted;
+
+    if (useSorting) {
+      sorted = hybridData->sortByContainerId(
+          rows.data(), folly::Range<const vector_size_t*>{}, outputRowIds);
+      extractRows = sorted.rows.data();
+      extractRowIds = &sorted.rowIds;
     }
-    child->resize(rows.size());
-    table->extractColumn(rows, projection.inputChannel, child);
+
+    for (auto projection : projections) {
+      const auto resultChannel = projection.outputChannel;
+      VELOX_CHECK_LT(resultChannel, resultVectors.size());
+
+      auto& child = resultVectors[resultChannel];
+      // TODO: Consider reuse of complex types.
+      if (!child || !BaseVector::isVectorWritable(child) ||
+          !child->isFlatEncoding()) {
+        child =
+            BaseVector::create(resultTypes[resultChannel], rows.size(), pool);
+      }
+      child->resize(rows.size());
+      hybridData->extractColumn(
+          extractRows,
+          extractRowIds->size(),
+          projection.inputChannel,
+          child,
+          *extractRowIds);
+    }
+  } else {
+    for (auto projection : projections) {
+      const auto resultChannel = projection.outputChannel;
+      VELOX_CHECK_LT(resultChannel, resultVectors.size());
+
+      auto& child = resultVectors[resultChannel];
+      // TODO: Consider reuse of complex types.
+      if (!child || !BaseVector::isVectorWritable(child) ||
+          !child->isFlatEncoding()) {
+        child =
+            BaseVector::create(resultTypes[resultChannel], rows.size(), pool);
+      }
+      child->resize(rows.size());
+      table->extractColumn(rows, projection.inputChannel, child);
+    }
   }
 }
 
@@ -363,11 +416,34 @@ void HashProbe::initializeResultIter() {
   std::vector<vector_size_t> varSizeListColumns;
   uint64_t fixedSizeListColumnsSizeSum{0};
   varSizeListColumns.reserve(tableOutputProjections_.size());
-  for (const auto column : listColumns) {
-    if (table_->rows()->columnTypes()[column]->isFixedWidth()) {
-      fixedSizeListColumnsSizeSum += table_->rows()->fixedSizeAt(column);
-    } else {
-      varSizeListColumns.push_back(column);
+  auto* hybridData = table_->hybridData();
+  if (hybridData != nullptr) {
+    // Hybrid layout: the row container stores only keys + rowId, so payload
+    // column indexes are out of bounds for the row container's column
+    // metadata. Estimate payload columns from the HybridContainer's columnar
+    // stats instead: fixed-width payloads by type size, var-size payloads by
+    // their average flat size. Only var-size KEY columns (which do live in
+    // the row container) go into 'varSizeListColumns' for per-row sizing.
+    const auto types = hybridData->columnTypes();
+    for (const auto column : listColumns) {
+      if (types[column]->isFixedWidth()) {
+        fixedSizeListColumnsSizeSum += hybridData->fixedSizeAt(column);
+      } else if (hybridData->isKey(column)) {
+        varSizeListColumns.push_back(column);
+      } else if (hybridData->getNumRows() > 0) {
+        // Average var-size payload bytes per row (row pointer unused for
+        // payload columns).
+        fixedSizeListColumnsSizeSum +=
+            hybridData->estimateVariableSizeAt(nullptr, column);
+      }
+    }
+  } else {
+    for (const auto column : listColumns) {
+      if (table_->rows()->columnTypes()[column]->isFixedWidth()) {
+        fixedSizeListColumnsSizeSum += table_->rows()->fixedSizeAt(column);
+      } else {
+        varSizeListColumns.push_back(column);
+      }
     }
   }
 
@@ -884,13 +960,16 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isLeftSemiProjectJoin(joinType_)) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
+    // Disable sorting when there are probe columns to keep build and probe in
+    // sync.
     extractColumns(
         table_.get(),
         folly::Range<char* const*>(outputTableRows_->as<char*>(), size),
         tableOutputProjections_,
         pool(),
         outputType_->children(),
-        output_->children());
+        output_->children(),
+        /*allowSorting=*/projectedInputColumns_.empty());
   }
 }
 
@@ -951,13 +1030,17 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
         outputType_->childAt(out), numOut, pool());
   }
 
+  // NOTE: for right semi project join the 'match' column below is extracted
+  // from 'outputTableRows' in their original order, so the build columns must
+  // not be permuted by container-id sorting.
   extractColumns(
       table_.get(),
       folly::Range<char**>(outputTableRows, numOut),
       tableOutputProjections_,
       pool(),
       outputType_->children(),
-      output_->children());
+      output_->children(),
+      /*allowSorting=*/!isRightSemiProjectJoin(joinType_));
 
   if (isRightSemiProjectJoin(joinType_)) {
     // Populate 'match' column.
@@ -1340,13 +1423,17 @@ RowVectorPtr HashProbe::createFilterInput(vector_size_t size) {
         size, outputRowMapping_, input_->childAt(projection.inputChannel));
   }
 
+  // allowSorting must stay false here: probe-side filter columns above are
+  // wrapped in original row order, so permuting build columns by containerId
+  // would evaluate the filter on misaligned rows.
   extractColumns(
       table_.get(),
       folly::Range<char* const*>(outputTableRows_->as<char*>(), size),
       filterTableProjections_,
       pool(),
       filterInputType_->children(),
-      filterColumns);
+      filterColumns,
+      /*allowSorting=*/false);
 
   return std::make_shared<RowVector>(
       pool(), filterInputType_, nullptr, size, std::move(filterColumns));
@@ -1452,17 +1539,47 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
     return;
   }
   VELOX_CHECK(table_->rows(), "Should not move rows in hash joins");
+  auto* hybridData = table_->hybridData();
+  std::vector<HybridRowId> outputRowIds;
   char* data[kBatchSize];
 
   while (auto numBuildRows = iterator(data, kBatchSize)) {
     // Extract build-side columns once per build batch.
     filterTableInput_->resize(numBuildRows);
     filterTableInputRows_.resizeFill(numBuildRows, true);
-    for (auto& projection : filterTableProjections_) {
-      table_->extractColumn(
-          folly::Range<char* const*>(data, numBuildRows),
-          projection.inputChannel,
-          filterTableInput_->childAt(projection.outputChannel));
+    if (hybridData != nullptr) {
+      outputRowIds.resize(numBuildRows);
+      hybridData->getRowIds(data, numBuildRows, outputRowIds);
+
+      // Sorting stays disabled here: the filter is evaluated per build batch
+      // against probe-side constants, so keep the original row order.
+      const bool useSorting = false;
+      const char* const* extractRows = data;
+      std::vector<HybridRowId>* extractRowIds = &outputRowIds;
+      HybridContainer::SortedRows sorted;
+
+      if (useSorting) {
+        sorted = hybridData->sortByContainerId(
+            data, folly::Range<const vector_size_t*>{}, outputRowIds);
+        extractRows = sorted.rows.data();
+        extractRowIds = &sorted.rowIds;
+      }
+
+      for (auto& projection : filterTableProjections_) {
+        hybridData->extractColumn(
+            extractRows,
+            extractRowIds->size(),
+            projection.inputChannel,
+            filterTableInput_->childAt(projection.outputChannel),
+            *extractRowIds);
+      }
+    } else {
+      for (auto& projection : filterTableProjections_) {
+        table_->extractColumn(
+            folly::Range<char* const*>(data, numBuildRows),
+            projection.inputChannel,
+            filterTableInput_->childAt(projection.outputChannel));
+      }
     }
 
     // Skip probe rows that already passed the filter on a previous build batch.

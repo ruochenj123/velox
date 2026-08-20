@@ -90,6 +90,15 @@ RowVectorPtr wrap(
     const std::vector<VectorPtr>& childVectors,
     memory::MemoryPool* pool);
 
+/// Builds a RowVector that shares (zero-copy) the children of 'input' selected
+/// by 'channels', preserving row-level nulls. Used by the hybrid layout to
+/// retain payload columns in columnar form.
+RowVectorPtr wrapColumns(
+    const RowVector* input,
+    const std::vector<column_index_t>& channels,
+    const RowTypePtr& types,
+    memory::MemoryPool* pool);
+
 /// Represents unique dictionary wrappers over a set of vectors when
 /// wrapping these inside another dictionary. When multiple wrapped
 /// vectors with the same wrapping get re-wrapped, we replace the
@@ -323,5 +332,21 @@ std::unique_ptr<VectorSerde::Options> getVectorSerdeOptions(
     common::CompressionKind compressionKind,
     const std::string& kind,
     std::optional<float> minCompressionRatio = std::nullopt);
+
+/// Nominal per-row byte width of a payload column used by the hybrid-layout
+/// eligibility gates (hybrid_join_min_payload_bytes /
+/// hybrid_sort_min_payload_bytes): exact size for fixed-width types, 32 for
+/// VARCHAR/VARBINARY (16-byte StringView + 16 bytes nominal out-of-line
+/// body), 16 for other variable-width types.
+inline int64_t hybridPayloadNominalWidth(const TypePtr& type) {
+  if (type->isFixedWidth()) {
+    return type->cppSizeInBytes();
+  }
+  if (type->kind() == TypeKind::VARCHAR ||
+      type->kind() == TypeKind::VARBINARY) {
+    return 32;
+  }
+  return 16;
+}
 
 } // namespace facebook::velox::exec

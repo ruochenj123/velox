@@ -244,6 +244,16 @@ class FilterProjectAdapter : public OperatorAdapter {
         reducesTransfer = estimateRowBytes(planNode->outputType()) <
             estimateRowBytes(srcNode->outputType());
       }
+      // Row-wise benchmark pipelines pack rows on the CPU (CudfFromVelox
+      // pinned pack / keys-only pack), so a scan-adjacent projection — e.g.
+      // computed join-key columns for the multi-key / duplicate-key matcher
+      // benchmarks — must stay UPSTREAM of the pack even when it widens the
+      // row: the row/boundary join operators consume its output directly and
+      // a GPU CudfFilterProject between pack and join would break the
+      // RowStoreVector format contract.
+      if (CudfConfig::getInstance().benchmarkRowWiseGather) {
+        reducesTransfer = true;
+      }
 
       if (scanAdjacent && reducesTransfer) {
         LOG_FALLBACK(

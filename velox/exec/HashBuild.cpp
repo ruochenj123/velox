@@ -96,6 +96,8 @@ HashBuild::HashBuild(
 
   // Identify the non-key build side columns and make a decoder for each.
   const int32_t numDependents = inputType->size() - numKeys;
+  std::vector<std::string> dependentNames;
+  std::vector<TypePtr> dependentTypes;
   if (!dropDuplicates_) {
     if (numDependents > 0) {
       // Number of join keys (numKeys) may be less then number of input columns
@@ -105,17 +107,101 @@ HashBuild::HashBuild(
       // t.k1 = u.k AND t.k2 = u.k.
       dependentChannels_.reserve(numDependents);
       decoders_.reserve(numDependents);
+      dependentNames.reserve(numDependents);
+      dependentTypes.reserve(numDependents);
     }
 
     for (auto i = 0; i < inputType->size(); ++i) {
       if (keyChannelMap_.find(i) == keyChannelMap_.end()) {
         dependentChannels_.emplace_back(i);
         decoders_.emplace_back(std::make_unique<DecodedVector>());
+        dependentNames.emplace_back(inputType->nameOf(i));
+        dependentTypes.emplace_back(inputType->childAt(i));
       }
     }
   }
 
   tableType_ = hashJoinTableType(joinNode_);
+  dependentTypes_ = ROW(std::move(dependentNames), std::move(dependentTypes));
+
+  // Hybrid mode stores payload row-wise in HybridContainer; requires
+  // dependent (payload) columns.
+  hybridJoin_ = driverCtx->queryConfig().hybridJoinEnabled() &&
+      !dependentChannels_.empty() && !isLeftSemiFilterJoin(joinType_) &&
+      !isLeftSemiProjectJoin(joinType_) && !isAntiJoin(joinType_);
+
+  // Hybrid+spill deferred; transplant Phase 5. Disable hybrid whenever a
+  // spill config is present for this operator, mirroring the sort path.
+  if (spillConfig_.has_value()) {
+    hybridJoin_ = false;
+  }
+
+  // Plan-time payload-width eligibility gate: hybrid only pays off when the
+  // probe actually reads enough payload bytes per output row; otherwise the
+  // fixed per-row row-id decode tax dominates. The read set mirrors
+  // HashProbe::initialize()/initializeFilter(): a dependent is read if its
+  // name appears in the join output type (tableOutputProjections_) or is
+  // referenced by the join filter and does not resolve to the probe side
+  // (filterTableProjections_). Dependents stored but never read contribute 0.
+  if (hybridJoin_) {
+    const auto& outputType = joinNode_->outputType();
+    const auto& probeType = joinNode_->sources()[0]->outputType();
+    // Collect field names referenced by the join filter expression.
+    std::unordered_set<std::string> filterFields;
+    if (joinNode_->filter() != nullptr) {
+      std::function<void(const core::ITypedExpr*)> collectFields =
+          [&](const core::ITypedExpr* expr) {
+            if (const auto* field =
+                    dynamic_cast<const core::FieldAccessTypedExpr*>(expr)) {
+              filterFields.insert(field->name());
+            }
+            for (const auto& exprInput : expr->inputs()) {
+              collectFields(exprInput.get());
+            }
+          };
+      collectFields(joinNode_->filter().get());
+    }
+    int64_t readPayloadBytes = 0;
+    for (const auto channel : dependentChannels_) {
+      const auto& name = inputType->nameOf(channel);
+      const bool readByOutput =
+          outputType->getChildIdxIfExists(name).has_value();
+      // Filter fields resolve to the probe side first (see
+      // HashProbe::initializeFilter()); only fields absent from the probe
+      // type read from the table.
+      const bool readByFilter = filterFields.count(name) != 0 &&
+          !probeType->getChildIdxIfExists(name).has_value();
+      if (readByOutput || readByFilter) {
+        readPayloadBytes += hybridPayloadNominalWidth(inputType->childAt(channel));
+      }
+    }
+    const auto minPayloadBytes =
+        driverCtx->queryConfig().hybridJoinMinPayloadBytes();
+    if (readPayloadBytes < static_cast<int64_t>(minPayloadBytes)) {
+      hybridJoin_ = false;
+    }
+    VLOG(1) << "hybrid join payload gate: node " << planNodeId()
+            << " readPayloadBytes=" << readPayloadBytes
+            << " threshold=" << minPayloadBytes << " hybridJoin="
+            << (hybridJoin_ ? "enabled" : "disabled");
+    stats_.wlock()->addRuntimeStat(
+        "hybridJoinReadPayloadBytes", RuntimeCounter(readPayloadBytes));
+    stats_.wlock()->addRuntimeStat(
+        "hybridJoinGateEnabled", RuntimeCounter(hybridJoin_ ? 1 : 0));
+  }
+
+  // Scattered mode: keep payload batches separate instead of coalescing.
+  scatteredModeEnabled_ = hybridJoin_ &&
+      driverCtx->queryConfig().hybridJoinScatteredModeEnabled();
+
+  driverId_ = driverCtx->driverId;
+  if (hybridJoin_) {
+    VELOX_CHECK_LE(
+        driverId_,
+        255,
+        "driverId {} exceeds maximum 255 for hybrid join mode",
+        driverId_);
+  }
 
   stateCleared_ = false;
 }
@@ -245,7 +331,9 @@ void HashBuild::setupTable() {
         true, // hasProbedFlag
         false, // hasCountFlag
         queryConfig.minTableRowsForParallelJoinBuild(),
-        tableMemoryPool());
+        tableMemoryPool(),
+        0, // bloomFilterMaxSize
+        hybridJoin_);
   } else {
     // Right semi join needs to tag build rows that were probed.
     const bool needProbedFlag = joinNode_->isRightSemiFilterJoin();
@@ -260,7 +348,9 @@ void HashBuild::setupTable() {
           needProbedFlag, // hasProbedFlag
           hasCountFlag,
           queryConfig.minTableRowsForParallelJoinBuild(),
-          tableMemoryPool());
+          tableMemoryPool(),
+          0, // bloomFilterMaxSize
+          hybridJoin_);
     } else {
       // Ignore null keys
       table_ = HashTable<true>::createForJoin(
@@ -271,10 +361,27 @@ void HashBuild::setupTable() {
           hasCountFlag,
           queryConfig.minTableRowsForParallelJoinBuild(),
           tableMemoryPool(),
-          queryConfig.hashProbeBloomFilterPushdownMaxSize());
+          queryConfig.hashProbeBloomFilterPushdownMaxSize(),
+          hybridJoin_);
     }
   }
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
+
+  if (hybridJoin_) {
+    table_->hybridData()->setId(static_cast<uint8_t>(driverId_));
+    // Initialize allContainers_ with itself so extraction works before the
+    // per-driver tables are merged in prepareJoinTable().
+    std::unordered_map<uint8_t, HybridContainer*> selfContainer;
+    selfContainer[static_cast<uint8_t>(driverId_)] = table_->hybridData();
+    table_->hybridData()->setAllContainers(selfContainer);
+    // Set reorder flag from query config - can be disabled for deterministic
+    // testing.
+    table_->hybridData()->setReorderEnabled(
+        queryConfig.hybridJoinReorderEnabled());
+    // Set scattered mode flag - when enabled, payloads are not coalesced.
+    table_->hybridData()->setScatteredModeEnabled(scatteredModeEnabled_);
+  }
+
   if (abandonHashBuildDedupMinPct_ == 0 && !joinNode_->isCountingJoin()) {
     // Building a HashTable without duplicates is disabled if
     // abandonBuildNoDupHashMinPct_ is 0. Counting joins always require dedup.
@@ -554,27 +661,65 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->childAt(spillProbedFlagChannel_)->asFlatVector<bool>();
   }
 
-  activeRows_.applyToSelected([&](auto rowIndex) {
-    char* newRow = rows->newRow();
-    if (nextOffset) {
-      *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
-    }
-    // Store the columns for each row in sequence. At probe time
-    // strings of the row will probably be in consecutive places, so
-    // reading one will prime the cache for the next.
-    for (auto i = 0; i < hashers.size(); ++i) {
-      rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
-    }
-    for (auto i = 0; i < dependentChannels_.size(); ++i) {
-      rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
-    }
-    if (spillProbedFlagVector != nullptr) {
-      VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
-      if (spillProbedFlagVector->valueAt(rowIndex)) {
-        rows->setProbedFlag(&newRow, 1);
+  if (hybridJoin_) {
+    // Hybrid mode is disabled whenever spilling is possible, so the input can
+    // never come from spill restore with a probed-flag column here.
+    VELOX_DCHECK_NULL(spillProbedFlagVector);
+    const auto baseRow = table_->hybridData()->getNumRows();
+    const auto batchId = table_->hybridData()->getNumBatches();
+    const bool useScattered = scatteredModeEnabled_;
+
+    activeRows_.applyToSelected([&](auto rowIndex) {
+      char* newRow = rows->newRow();
+      if (nextOffset) {
+        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
       }
-    }
-  });
+      // Store the columns for each row in sequence. At probe time
+      // strings of the row will probably be in consecutive places, so
+      // reading one will prime the cache for the next.
+      for (auto i = 0; i < hashers.size(); ++i) {
+        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+      // Store RowId:
+      // - Coalesced mode: driverId (8 bits) | globalRowId (56 bits)
+      // - Scattered mode: driverId (8 bits) | batchId (24 bits) | rowInBatch
+      //   (32 bits)
+      uint64_t encodedId;
+      if (useScattered) {
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            HybridRowId::encodeScattered(batchId, rowIndex);
+      } else {
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      }
+      rows->storeSingleRowId(encodedId, newRow);
+    });
+    auto payloadInput = wrapColumns(
+        input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
+    table_->hybridData()->addPayload(std::move(payloadInput));
+  } else {
+    activeRows_.applyToSelected([&](auto rowIndex) {
+      char* newRow = rows->newRow();
+      if (nextOffset) {
+        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+      }
+      // Store the columns for each row in sequence. At probe time
+      // strings of the row will probably be in consecutive places, so
+      // reading one will prime the cache for the next.
+      for (auto i = 0; i < hashers.size(); ++i) {
+        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+      for (auto i = 0; i < dependentChannels_.size(); ++i) {
+        rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
+      }
+      if (spillProbedFlagVector != nullptr) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
+        if (spillProbedFlagVector->valueAt(rowIndex)) {
+          rows->setProbedFlag(&newRow, 1);
+        }
+      }
+    });
+  }
 }
 
 void HashBuild::ensureInputFits(RowVectorPtr& input) {
@@ -789,6 +934,29 @@ void HashBuild::noMoreInput() {
 }
 
 void HashBuild::noMoreInputInternal() {
+  // Coalesce batches in this driver's HybridContainer on a background
+  // thread, overlapped with the remaining build work: for non-last drivers
+  // the merge runs while the last driver is still consuming input; for the
+  // last driver it runs under prepareJoinTable() (the coalesce touches only
+  // payload batches, the table build only the key rows — disjoint). The
+  // last driver joins its own and all peers' threads after the table build,
+  // before the probe handoff; close() joins defensively on early teardown.
+  // Scattered mode keeps batches separate and never coalesces.
+  // NOTE: 'table_' can be null when a cached hash table short-circuits
+  // initialize() before setupTable().
+  if (hybridJoin_ && table_ != nullptr && table_->hybridData() != nullptr &&
+      !scatteredModeEnabled_) {
+    VELOX_CHECK(!hybridCoalesceThread_.joinable());
+    auto* hybridData = table_->hybridData();
+    hybridCoalesceThread_ = std::thread([this, hybridData]() {
+      try {
+        hybridData->coalesceBatches();
+      } catch (...) {
+        hybridCoalesceError_ = std::current_exception();
+      }
+    });
+  }
+
   if (!finishHashBuild()) {
     return;
   }
@@ -828,6 +996,7 @@ bool HashBuild::finishHashBuild() {
   };
 
   if (getHashTableFromCache()) {
+    joinHybridCoalesceThread();
     return true;
   }
 
@@ -923,6 +1092,14 @@ bool HashBuild::finishHashBuild() {
   stats_.wlock()->addRuntimeStat(
       std::string(BaseHashTable::kBuildWallNanos),
       RuntimeCounter(timing.wallNanos, RuntimeCounter::Unit::kNanos));
+
+  // Join the background payload-coalesce threads (own + peers) so every
+  // hybrid container is fully coalesced before the probe side starts
+  // extracting from them.
+  joinHybridCoalesceThread();
+  for (auto* build : otherBuilds) {
+    build->joinHybridCoalesceThread();
+  }
 
   addRuntimeStats();
 
@@ -1404,7 +1581,24 @@ bool HashBuild::nonReclaimableState() const {
       nonReclaimableSection_ || !spiller_ || spiller_->finalized();
 }
 
+void HashBuild::joinHybridCoalesceThread() {
+  if (hybridCoalesceThread_.joinable()) {
+    hybridCoalesceThread_.join();
+    if (hybridCoalesceError_) {
+      auto err = hybridCoalesceError_;
+      hybridCoalesceError_ = nullptr;
+      std::rethrow_exception(err);
+    }
+  }
+}
+
 void HashBuild::close() {
+  // Defensive join on early teardown (e.g. query abort while parked waiting
+  // for peers); errors are irrelevant at close and deliberately swallowed.
+  if (hybridCoalesceThread_.joinable()) {
+    hybridCoalesceThread_.join();
+    hybridCoalesceError_ = nullptr;
+  }
   Operator::close();
 
   {

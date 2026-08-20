@@ -77,6 +77,34 @@ void gatherAndConcatRows(
 /// @param output_row_width   Total output row width (8-byte aligned).
 /// @param d_out_buffer       Pre-allocated output buffer [num_output * output_row_width].
 /// @param stream             CUDA stream.
+/// Null-sidecar arguments for the selective gather (2026-08-17 null
+/// support). All pointers optional: out_null_bytes == nullptr disables the
+/// null path entirely; per-side src pointers may independently be null for
+/// null-free stores. *_src_field / *_dst_field are device arrays parallel to
+/// the FieldMapping arrays, giving each mapping's source and destination
+/// FIELD INDEX (sidecar bits are addressed by field index, not byte offset).
+struct NullGatherArgs {
+  const uint8_t* probe_null_bytes = nullptr;
+  int32_t probe_null_stride = 0;
+  const uint8_t* build_null_bytes = nullptr;
+  int32_t build_null_stride = 0;
+  const int32_t* probe_src_field = nullptr;
+  const int32_t* probe_dst_field = nullptr;
+  const int32_t* build_src_field = nullptr;
+  const int32_t* build_dst_field = nullptr;
+  uint8_t* out_null_bytes = nullptr;
+  int32_t out_null_stride = 0;
+};
+
+/// Sidecar -> Arrow validity mask for one column (mask bit set = valid).
+void sidecarToMask(
+    const uint8_t* d_null_bytes,
+    int32_t null_stride,
+    int32_t field_idx,
+    int32_t num_rows,
+    uint32_t* d_mask_words,
+    cudaStream_t stream);
+
 void selectiveGatherAndConcat(
     const GpuFixedRowStore& probeStore,
     const int32_t* d_probe_map,
@@ -89,7 +117,13 @@ void selectiveGatherAndConcat(
     int32_t num_output,
     int32_t output_row_width,
     uint8_t* d_out_buffer,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const int32_t* d_probe_src_field = nullptr,
+    const int32_t* d_probe_dst_field = nullptr,
+    const int32_t* d_build_src_field = nullptr,
+    const int32_t* d_build_dst_field = nullptr,
+    uint8_t* d_out_null_bytes = nullptr,
+    int32_t out_null_stride = 0);
 
 /// Transpose columnar data into a fixed-stride row buffer on GPU.
 void columnsToRows(

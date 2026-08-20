@@ -441,6 +441,32 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         emitRowStore_ = 1;
       }
     }
+    // ---- Boundary-hybrid resolution (keys-only pack) ----
+    // Ask the downstream join operator which columns are join keys: only
+    // those cross the boundary; everything else is retained host-side and
+    // attached to the emitted RowStoreVector. Probe side packs leftKeys,
+    // build side packs rightKeys — both in JOIN-KEY order, so probe key k
+    // and build key k line up field-for-field in the keys-only row layout.
+    // FusedRowHashJoinProbe is deliberately NOT supported (boundary-hybrid
+    // is the single-join §3 design; the fused chain has its own path).
+    boundaryMode_ = 0;
+    if (CudfConfig::getInstance().benchmarkBoundaryHybrid && rowWiseMode &&
+        next != nullptr) {
+      if (auto* probe = dynamic_cast<RowHashJoinProbe*>(next)) {
+        for (const auto& key : probe->joinNode()->leftKeys()) {
+          boundaryKeyNames_.push_back(key->name());
+        }
+        boundaryMode_ = 1;
+      } else if (auto* build = dynamic_cast<RowHashJoinBuild*>(next)) {
+        for (const auto& key : build->joinNode()->rightKeys()) {
+          boundaryKeyNames_.push_back(key->name());
+        }
+        boundaryMode_ = 1;
+      }
+    }
+    addRuntimeStat(
+        "fromVeloxBoundaryMode",
+        RuntimeCounter(static_cast<int64_t>(boundaryMode_)));
     const auto syncCfg =
         operatorCtx_->driverCtx()->queryConfig().get<std::string>(
             kPinnedPackSync, "auto");
@@ -469,6 +495,9 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     // standard path (from_arrow + GPU transpose downstream) intact.
     return nullptr;
   }
+  // Boundary-hybrid is only meaningful on the row path straight into a
+  // RowHashJoinBuild/Probe (resolved above).
+  const bool boundary = boundaryMode_ == 1 && rowMode;
 
   // ---- One-time layout: offsets/widths + cudf dtypes ----
   // NOTE: derive the layout from the INPUT's actual row type, not
@@ -480,6 +509,57 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     return nullptr;
   }
   const int numCols = static_cast<int>(inRowType->size());
+  if (!rowLayoutReady_ && boundary) {
+    // ---- Keys-only layout: pack exactly the join-key columns, in join-key
+    // order. The stride is the KEY row width, so toCudfBytes below reports
+    // the true boundary traffic (keys only). Unsupported key types are a
+    // hard error rather than a silent fallback: the downstream boundary
+    // probe/build REQUIRES the keys-only layout, and a full-width fallback
+    // pack would be misread as keys.
+    boundaryPackChannels_.clear();
+    std::vector<FieldDesc> fields;
+    fields.reserve(boundaryKeyNames_.size());
+    int32_t offset = 0;
+    for (const auto& name : boundaryKeyNames_) {
+      const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
+      boundaryPackChannels_.push_back(ch);
+      const auto& type = inRowType->childAt(ch);
+      FieldDesc fd;
+      switch (type->kind()) {
+        case TypeKind::TINYINT:
+          fd.byte_width = 1;
+          break;
+        case TypeKind::SMALLINT:
+          fd.byte_width = 2;
+          break;
+        case TypeKind::INTEGER: // includes DATE
+        case TypeKind::REAL:
+          fd.byte_width = 4;
+          break;
+        case TypeKind::BIGINT:
+        case TypeKind::DOUBLE:
+          fd.byte_width = 8;
+          break;
+        default:
+          VELOX_FAIL(
+              "boundary-hybrid: unsupported join-key type {} for column {}",
+              type->toString(),
+              name);
+      }
+      // NATURAL-ALIGN each key: extract_keys_kernel reads 4/8-byte keys with
+      // reinterpret_cast wide loads, which fault on unaligned addresses when
+      // a narrow key precedes a wide one in a composite key. Padding bytes
+      // are deterministic (the slot is zeroed once at allocation).
+      offset = (offset + fd.byte_width - 1) & ~(fd.byte_width - 1);
+      fd.offset = offset;
+      fields.push_back(fd);
+      offset += fd.byte_width;
+    }
+    rowFields_ = std::move(fields);
+    rowWidth_ = (offset + 7) & ~7; // 8-byte aligned keys-only stride
+    dataWidth_ = offset;
+    rowLayoutReady_ = true;
+  }
   if (!rowLayoutReady_) {
     int32_t offset = 0;
     std::vector<FieldDesc> fields;
@@ -540,13 +620,39 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   std::vector<VectorPtr> keepAlive;
   keepAlive.reserve(selectedInputs.size() * numCols);
   std::vector<const uint8_t*> srcs(selectedInputs.size() * numCols);
+  // Null sidecar (2026-08-17): nullable FLAT children are packable in row
+  // mode -- their validity rides in a per-row sidecar appended after the row
+  // region. Boundary (keys-only) and col-major modes keep the old refusal.
+  std::vector<const uint64_t*> rawNullsPtrs(
+      selectedInputs.size() * numCols, nullptr);
+  bool anyNulls = false;
+  const bool allowNulls = rowMode && !boundary;
   for (size_t b = 0; b < selectedInputs.size(); b++) {
     for (int c = 0; c < numCols; c++) {
       auto child =
           BaseVector::loadedVectorShared(selectedInputs[b]->childAt(c));
+      if (child != nullptr && allowNulls && child->mayHaveNulls() &&
+          child->encoding() == VectorEncoding::Simple::FLAT &&
+          child->valuesAsVoid() != nullptr) {
+        rawNullsPtrs[b * numCols + c] = child->rawNulls();
+        anyNulls = anyNulls || child->rawNulls() != nullptr;
+        srcs[b * numCols + c] =
+            static_cast<const uint8_t*>(child->valuesAsVoid());
+        keepAlive.push_back(std::move(child));
+        continue;
+      }
       if (child == nullptr ||
           child->encoding() != VectorEncoding::Simple::FLAT ||
           child->mayHaveNulls() || child->valuesAsVoid() == nullptr) {
+        // Boundary mode cannot fall back per-batch: the downstream probe/
+        // build requires EVERY batch in keys-only layout with host payload
+        // attached; a silent full-width batch would corrupt results.
+        VELOX_CHECK(
+            !boundary,
+            "boundary-hybrid: probe/build input batch has a non-flat or "
+            "nullable column (col {}), which the keys-only pinned pack "
+            "cannot handle",
+            c);
         return nullptr; // per-batch fallback; schema itself may be fine
       }
       srcs[b * numCols + c] =
@@ -567,9 +673,12 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   }
 
   // ---- Acquire a pinned slot (ping-ponged; event-guarded reuse) ----
-  const int64_t totalBytes = rowMode
+  const int32_t nullStride = (numCols + 7) / 8;
+  const int64_t nullRegionBytes =
+      (rowMode && anyNulls) ? static_cast<int64_t>(totalRows) * nullStride : 0;
+  const int64_t totalBytes = (rowMode
       ? static_cast<int64_t>(totalRows) * rowWidth_
-      : dataWidth_ * static_cast<int64_t>(totalRows);
+      : dataWidth_ * static_cast<int64_t>(totalRows)) + nullRegionBytes;
   if (pinnedSlots_[0] == nullptr) {
     // totalBytes of the first batch is the size hint: probe-side operators
     // draw big recycled slots, build-side operators draw small ones.
@@ -609,13 +718,18 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   uint8_t* const base = slot.host;
   if (rowMode) {
     const int32_t rowWidth = rowWidth_;
+    // Boundary mode packs only the key channels (rowFields_ was computed
+    // over boundaryPackChannels_); normal mode packs every channel, where
+    // rowFields_.size() == numCols and packed index == channel index.
+    const int numPacked = static_cast<int>(rowFields_.size());
     int64_t rowsSoFar = 0;
     for (size_t b = 0; b < selectedInputs.size(); b++) {
       const int64_t n = selectedInputs[b]->size();
       uint8_t* const tile = base + rowsSoFar * rowWidth;
-      for (int c = 0; c < numCols; c++) {
-        const int32_t off = rowFields_[c].offset;
-        const int32_t w = rowFields_[c].byte_width;
+      for (int k = 0; k < numPacked; k++) {
+        const int c = boundary ? boundaryPackChannels_[k] : k;
+        const int32_t off = rowFields_[k].offset;
+        const int32_t w = rowFields_[k].byte_width;
         const uint8_t* src = srcs[b * numCols + c];
         if (w == 8) {
           const uint64_t* s = reinterpret_cast<const uint64_t*>(src);
@@ -637,6 +751,30 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         }
       }
       rowsSoFar += n;
+    }
+    // ---- Null sidecar fill (2026-08-17): bit SET = NULL ----
+    if (anyNulls) {
+      uint8_t* const nullBase =
+          base + static_cast<int64_t>(totalRows) * rowWidth;
+      std::memset(nullBase, 0, static_cast<size_t>(totalRows) * nullStride);
+      int64_t rowsBefore = 0;
+      for (size_t b = 0; b < selectedInputs.size(); b++) {
+        const int64_t n = selectedInputs[b]->size();
+        for (int c = 0; c < numCols; c++) {
+          const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
+          if (nulls == nullptr) {
+            continue;
+          }
+          const uint8_t byteMask = static_cast<uint8_t>(1u << (c & 7));
+          const int32_t byteIdx = c >> 3;
+          for (int64_t r = 0; r < n; r++) {
+            if (velox::bits::isBitNull(nulls, r)) {
+              nullBase[(rowsBefore + r) * nullStride + byteIdx] |= byteMask;
+            }
+          }
+        }
+        rowsBefore += n;
+      }
     }
   } else {
     // Col-major: per column region, sequential memcpy per input chunk --
@@ -685,7 +823,7 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     auto fieldsHostCopy = rowFields_;
     // All batches share the one uploaded FieldDesc buffer (no per-batch
     // device alloc + D2D copy); the shared_ptr keeps it alive downstream.
-    result = std::make_shared<RowStoreVector>(
+    auto rowStoreResult = std::make_shared<RowStoreVector>(
         pool,
         outputType_,
         totalRows,
@@ -694,6 +832,35 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         std::move(fieldsHostCopy),
         rowWidth_,
         stream);
+    if (anyNulls) {
+      // The single H2D above carried rows + sidecar (totalBytes includes
+      // the null region); record the stride so consumers can find it.
+      rowStoreResult->setNullSidecar(nullStride);
+    }
+    if (boundary) {
+      // ---- Host retention: the payload never crosses the boundary. ----
+      // Rebuild each selected input as a RowVector of its LOADED children
+      // (the same vectors keepAlive pinned for the pack, so this is a
+      // buffer-sharing wrap, not a copy) and attach them to the emitted
+      // vector. Concatenated in this exact order they equal the GPU rows
+      // row-for-row, which is the identity the join's host gather uses.
+      std::vector<RowVectorPtr> retained;
+      retained.reserve(selectedInputs.size());
+      for (size_t b = 0; b < selectedInputs.size(); b++) {
+        std::vector<VectorPtr> children(numCols);
+        for (int c = 0; c < numCols; c++) {
+          children[c] = keepAlive[b * numCols + c];
+        }
+        retained.push_back(std::make_shared<RowVector>(
+            pool,
+            inRowType,
+            nullptr,
+            selectedInputs[b]->size(),
+            std::move(children)));
+      }
+      rowStoreResult->setBoundaryPayload(std::move(retained));
+    }
+    result = std::move(rowStoreResult);
   } else {
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(numCols);

@@ -40,7 +40,10 @@ class SortBuffer {
       tsan_atomic<bool>* nonReclaimableSection,
       common::PrefixSortConfig prefixSortConfig,
       const common::SpillConfig* spillConfig = nullptr,
-      exec::SpillStats* spillStats = nullptr);
+      exec::SpillStats* spillStats = nullptr,
+      bool hybridSortEnabled = false,
+      bool hybridSortScattered = false,
+      uint32_t hybridSortMinPayloadBytes = 1);
 
   ~SortBuffer();
 
@@ -170,5 +173,23 @@ class SortBuffer {
 
   // The number of rows that has been returned.
   uint64_t numOutputRows_{0};
+
+  // Hybrid layout support: sort keys stay row-wise in 'data_' (plus a BIGINT
+  // rowId dependent column) while payload columns are retained columnar in
+  // 'hybridData_' and materialized lazily at output time.
+  bool hybridSortEnabled_{false};
+
+  // Keep payload batches separate (scattered row ids) instead of coalescing
+  // into one batch at noMoreInput. Avoids the coalesce copy and its ~2x
+  // transient memory peak; extraction uses the scattered kernels.
+  bool hybridSortScattered_{false};
+  std::unique_ptr<HybridContainer> hybridData_{nullptr};
+  // Projections for the sort key columns only ('data_' channel -> input
+  // channel).
+  std::vector<IdentityProjection> keyColumnMap_;
+  // Input channels of the non-sorted (payload) columns.
+  std::vector<column_index_t> payloadChannels_;
+  // Row type of the payload columns stored in 'hybridData_'.
+  RowTypePtr payloadTypes_;
 };
 } // namespace facebook::velox::exec

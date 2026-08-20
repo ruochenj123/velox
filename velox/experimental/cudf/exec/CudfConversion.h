@@ -144,6 +144,26 @@ class CudfFromVelox : public CudfOperatorBase {
   //   -1 = not yet determined, 0 = emit CudfVector, 1 = emit RowStoreVector
   int emitRowStore_ = -1;
 
+  // ---- Boundary-hybrid (keys-only pack) ----
+  //
+  // When CudfConfig::benchmarkBoundaryHybrid is set and the downstream
+  // consumer is RowHashJoinProbe/RowHashJoinBuild, the pinned pack transfers
+  // ONLY the join-key columns (in join-key order); the full input batches are
+  // retained host-side and attached to the emitted RowStoreVector (see
+  // RowStoreVector::setBoundaryPayload). Resolved once alongside
+  // emitRowStore_ by asking the downstream join operator for its key names:
+  // probe side -> leftKeys, build side -> rightKeys.
+  //   -1 = unresolved, 0 = off (normal full-row pack), 1 = keys-only pack
+  int boundaryMode_ = -1;
+  // Join-key column names (join-key order), stashed at resolution; resolved
+  // to child indices of the ACTUAL input row type on first pack (the input
+  // type can differ from outputType_, e.g. a scan batch carrying a
+  // filter-only column).
+  std::vector<std::string> boundaryKeyNames_;
+  // Input child index of each packed key, in join-key order (parallel to the
+  // keys-only rowFields_ layout).
+  std::vector<int32_t> boundaryPackChannels_;
+
   // ONE stream for every RowStoreVector this operator produces.
   //
   // The columnar path takes a fresh stream from the pool on each doGetOutput,

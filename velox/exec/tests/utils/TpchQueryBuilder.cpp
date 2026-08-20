@@ -20,7 +20,17 @@
 #include "velox/dwio/common/ReaderFactory.h"
 #include "velox/tpch/gen/TpchGen.h"
 
+#include <algorithm>
 #include <fstream>
+#include <gflags/gflags.h>
+
+DECLARE_int32(s_selectivity_pct);
+DECLARE_int32(synth_payload_cols);
+DECLARE_int32(synth_sort_keys);
+DECLARE_bool(synth_join_sort);
+DECLARE_int32(synth_join_keys);
+DECLARE_int32(synth_wide_payload_cols);
+DECLARE_int32(synth_wide_sort_keys);
 
 namespace facebook::velox::exec::test {
 
@@ -201,6 +211,15 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getJoinLSPlan();
     case 30:
       return getJoinOCPlan();
+    // Hybrid single-operator benchmarks (synthetic tables R/S)
+    case 31:
+      return getQ31Plan();
+    case 40:
+      return getQ40Plan();
+    case 41:
+      return getQ41Plan();
+    case 43:
+      return getQ43Plan();
     default:
       VELOX_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -2861,6 +2880,279 @@ TpchPlan TpchQueryBuilder::getJoinOCPlan() const {
   return context;
 }
 
+// Q31: Single join S x R with Sort (for late-m testing with custom tables)
+// Uses join_benchmark_v2 data: R (100M rows, 17 cols) and S (200M rows, 5 cols)
+// Pattern: S (probe) JOIN R (build) -> Sort by (row_id, l_suppkey,
+// l_returnflag, l_linestatus)
+// Output: 16 columns from R (4 keys + 12 payloads, excluding l_comment)
+TpchPlan TpchQueryBuilder::getQ31Plan() const {
+  // Build-side columns (R): 4 join keys + up to 12 payload columns.
+  // Payload order interleaves the two VARCHARs early so width sweeps
+  // (--synth_payload_cols=2/4/8/12) include string payloads from N=4 on.
+  static const std::vector<std::string> kJoinKeys = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus"};
+  static const std::vector<std::string> kPayloadOrder = {
+      "l_orderkey",       "l_partkey",  "l_extendedprice", "l_shipmode",
+      "l_shipinstruct",   "l_quantity", "l_discount",      "l_tax",
+      "l_linenumber",     "l_shipdate", "l_commitdate",    "l_receiptdate",
+      "l_comment"}; // 13th payload: wide VARCHAR (~27B avg)
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 13);
+  std::vector<std::string> rColumns = kJoinKeys;
+  rColumns.insert(
+      rColumns.end(),
+      kPayloadOrder.begin(),
+      kPayloadOrder.begin() + numPayloads);
+
+  // Probe-side columns (S) - only join keys (will be renamed to avoid
+  // conflicts)
+  std::vector<std::string> sColumns = {
+      "row_id", // join key
+      "l_suppkey", // join key
+      "l_returnflag", // join key
+      "l_linestatus" // join key
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+
+  // Build side: R (has the payloads)
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns, {})
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // HashJoin: S (probe) x R (build) on the first --synth_join_keys of the
+  // 4 key columns (row_id alone is unique, so match cardinality is
+  // identical for any key count; extra keys only add key-processing cost).
+  // --s_selectivity_pct thins the probe stream via row_id % 10 (uniform,
+  // matching rows only); --synth_join_sort appends the 4-key sort.
+  const int numJoinKeys = std::clamp(FLAGS_synth_join_keys, 1, 4);
+  static const std::vector<std::string> kProbeRenames = {
+      "row_id AS s_row_id",
+      "l_suppkey AS s_suppkey",
+      "l_returnflag AS s_returnflag",
+      "l_linestatus AS s_linestatus"};
+  static const std::vector<std::string> kProbeKeys = {
+      "s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"};
+  PlanBuilder sBuilder(planNodeIdGenerator, pool_.get());
+  sBuilder.filtersAsNode(filtersAsNode_)
+      .tableScan(kTableS, sSelectedRowType, sFileColumns, {})
+      .captureScanNodeId(sPlanNodeId);
+  if (FLAGS_s_selectivity_pct < 100) {
+    sBuilder.filter(
+        fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  }
+  sBuilder
+      .project({kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys})
+      .hashJoin(
+          {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
+          {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
+          r,
+          "", // no filter
+          rColumns); // output: 4 key cols + selected payloads
+  if (FLAGS_synth_join_sort) {
+    sBuilder.orderBy(kJoinKeys, false);
+  }
+  auto plan = sBuilder.planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q31_p{}_sel{}_j{}{}",
+      numPayloads,
+      FLAGS_s_selectivity_pct,
+      numJoinKeys,
+      FLAGS_synth_join_sort ? "_sort" : "");
+  context.plan = std::move(plan);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q40: Configurable sort benchmark on lineitem
+// Uses 4 sort keys (l_linenumber, l_suppkey, l_partkey, l_orderkey)
+// and 16 columns (full lineitem schema)
+//
+// This query tests hybrid sort performance on a simple TableScan -> Sort
+// pattern without join overhead.
+TpchPlan TpchQueryBuilder::getQ40Plan() const {
+  // Sort keys ordered by increasing cardinality; --synth_sort_keys=k
+  // takes the first k. --synth_payload_cols=N controls carried payload
+  // width (same ordering as Q31: VARCHARs from N=4 on).
+  static const std::vector<std::string> kAllSortKeys = {
+      "l_linenumber", // INTEGER - 1-7 values
+      "l_suppkey", // BIGINT - ~10K unique values
+      "l_partkey", // BIGINT - ~200K unique values
+      "l_orderkey" // BIGINT - ~60M unique values
+  };
+  static const std::vector<std::string> kPayloadOrder = {
+      "l_extendedprice", "l_shipmode",   "l_shipinstruct", "l_quantity",
+      "l_discount",      "l_tax",        "l_shipdate",     "l_commitdate",
+      "l_receiptdate",   "l_returnflag", "l_linestatus",   "l_comment"};
+  const int numKeys = std::clamp(FLAGS_synth_sort_keys, 1, 4);
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 12);
+  std::vector<std::string> sortKeys(
+      kAllSortKeys.begin(), kAllSortKeys.begin() + numKeys);
+  // Scan carries all sort-key candidates plus the selected payloads so
+  // total width is k-independent within a payload setting.
+  std::vector<std::string> selectedColumns = kAllSortKeys;
+  selectedColumns.insert(
+      selectedColumns.end(),
+      kPayloadOrder.begin(),
+      kPayloadOrder.begin() + numPayloads);
+
+  const auto selectedRowType = getRowType(kLineitem, selectedColumns);
+  const auto& fileColumnNames = getFileColumnNames(kLineitem);
+
+  core::PlanNodeId lineitemPlanNodeId;
+
+  auto plan = PlanBuilder(pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(kLineitem, selectedRowType, fileColumnNames, {})
+                  .captureScanNodeId(lineitemPlanNodeId)
+                  .orderBy(sortKeys, false)
+                  .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format("q40_k{}_p{}", numKeys, numPayloads);
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+
+// Wide-payload sort. Mirrors the benchmark in Velox's "Why Sort is row-based
+// in Velox" post (velox-lib.io/blog/why-row-based-sort, Dec 2025), which
+// measured a keys-only sort gathering payloads from the ORIGINAL per-batch
+// vectors at 1.9-3.9x SLOWER than row-based sort at 64/128/256 payload
+// columns. Our hybrid sort coalesces payload batches into one contiguous base
+// (overlapped with the key sort), removing the per-batch indirection they
+// identified as the root cause; this query tests whether that fix holds at
+// THEIR column counts -- the lineitem-based Q40 tops out at 12 payload cols.
+// LIMIT omitted so the final sort does full work.
+
+// Q43: TPC-H lineitem |><| orders on l_orderkey = o_orderkey, BUILD ON
+// ORDERS -- the smaller side and the exact plan of the GPU offload bench
+// (intro Fig 1: same query, both engines, both building on orders).
+// lineitem is filtered l_shipdate < '1994-02-21' (~30% of rows at any SF).
+// Output = 10 fixed-width lineitem columns + 4 orders payloads (14 cols;
+// matches the bench's supported set; orders payload = exactly 24 bytes, the
+// hybrid join gate threshold). A final sum/count aggregation keeps the
+// client from materializing ~SF*1.8M output rows while the join's
+// getOutput still performs the full extraction.
+TpchPlan TpchQueryBuilder::getQ43Plan() const {
+  std::vector<std::string> lineitemCols = {
+      "l_orderkey",      "l_partkey",  "l_suppkey",  "l_linenumber",
+      "l_quantity",      "l_extendedprice", "l_discount", "l_tax",
+      "l_commitdate",    "l_receiptdate",   "l_shipdate"};
+  std::vector<std::string> ordersCols = {
+      "o_orderkey", "o_custkey", "o_totalprice", "o_orderdate",
+      "o_shippriority"};
+
+  auto lineitemType = getRowType(kLineitem, lineitemCols);
+  auto ordersType = getRowType(kOrders, ordersCols);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  auto shipDateFilter = formatDateFilter(
+      "l_shipdate", lineitemType, "", "'1994-02-21'");
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId;
+  core::PlanNodeId ordersScanId;
+
+  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(kOrders, ordersType, ordersFileColumns, {})
+                    .captureScanNodeId(ordersScanId)
+                    .planNode();
+
+  std::vector<std::string> outputCols = {
+      "l_orderkey",      "l_partkey",  "l_suppkey",  "l_linenumber",
+      "l_quantity",      "l_extendedprice", "l_discount", "l_tax",
+      "l_commitdate",    "l_receiptdate",   "o_custkey",  "o_totalprice",
+      "o_orderdate",     "o_shippriority"};
+
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kLineitem, lineitemType, lineitemFileColumns, {shipDateFilter})
+          .captureScanNodeId(lineitemScanId)
+          .hashJoin(
+              {"l_orderkey"},
+              {"o_orderkey"},
+              orders,
+              "",
+              outputCols)
+          // Integer-cent sums: double addition is non-associative, so
+          // cross-arm accumulation-order differences flip the last ulp of a
+          // raw double sum and break exact checksum gating. Integer sums are
+          // order-independent. Aggregation inputs must be field accesses, so
+          // project the casts first.
+          .project(
+              {"cast(l_extendedprice * 100.0 as bigint) as l_price_cents",
+               "cast(o_totalprice * 100.0 as bigint) as o_price_cents",
+               "cast(l_quantity as bigint) as l_qty_int"})
+          .partialAggregation(
+              {},
+              {"count(1)",
+               "sum(l_price_cents)",
+               "sum(o_price_cents)",
+               "sum(l_qty_int)"})
+          .localPartition(std::vector<std::string>{})
+          .finalAggregation()
+          .planNode();
+
+  TpchPlan context;
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemScanId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersScanId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+TpchPlan TpchQueryBuilder::getQ41Plan() const {
+  const int numPayloads = std::clamp(FLAGS_synth_wide_payload_cols, 0, 256);
+  const int numKeys = std::clamp(FLAGS_synth_wide_sort_keys, 1, 16);
+  std::vector<std::string> sortKeys;
+  sortKeys.reserve(numKeys);
+  for (int i = 1; i <= numKeys; ++i) {
+    sortKeys.push_back(fmt::format("k{}", i));
+  }
+  std::vector<std::string> selectedColumns = sortKeys;
+  selectedColumns.reserve(2 + numPayloads);
+  for (int i = 0; i < numPayloads; ++i) {
+    selectedColumns.push_back(fmt::format("c{}", i));
+  }
+
+  const auto selectedRowType = getRowType(kTableWide, selectedColumns);
+  const auto& fileColumnNames = getFileColumnNames(kTableWide);
+
+  core::PlanNodeId widePlanNodeId;
+  auto plan = PlanBuilder(pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(kTableWide, selectedRowType, fileColumnNames, {})
+                  .captureScanNodeId(widePlanNodeId)
+                  .orderBy(sortKeys, false)
+                  .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format("q41_k{}_p{}", numKeys, numPayloads);
+  context.plan = std::move(plan);
+  context.dataFiles[widePlanNodeId] = getTableFilePaths(kTableWide);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kLineitem,
     kOrders,
@@ -2869,7 +3161,10 @@ const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kRegion,
     kPart,
     kSupplier,
-    kPartsupp};
+    kPartsupp,
+    kTableR,
+    kTableS,
+    kTableWide};
 
 const std::unordered_map<std::string, std::vector<std::string>>
     TpchQueryBuilder::kTables_ = {
@@ -2896,6 +3191,51 @@ const std::unordered_map<std::string, std::vector<std::string>>
             tpch::getTableSchema(tpch::Table::TBL_SUPPLIER)->names()),
         std::make_pair(
             "partsupp",
-            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP)->names())};
+            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP)->names()),
+        // Wide-payload sort table (gen_widesort.sh): 2 sort keys + 256
+        // BIGINT payload columns, sized to the payload widths used in
+        // Velox's "Why Sort is row-based" evaluation (64/128/256).
+        std::make_pair(
+            "wide",
+            [] {
+              std::vector<std::string> names;
+              names.reserve(272);
+              for (int i = 1; i <= 16; ++i) {
+                names.push_back(fmt::format("k{}", i));
+              }
+              for (int i = 0; i < 256; ++i) {
+                names.push_back(fmt::format("c{}", i));
+              }
+              return names;
+            }()),
+        // Custom join benchmark tables R and S
+        std::make_pair(
+            "R",
+            std::vector<std::string>{
+                "row_id",
+                "l_suppkey",
+                "l_returnflag",
+                "l_linestatus",
+                "l_orderkey",
+                "l_partkey",
+                "l_linenumber",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+                "l_tax",
+                "l_shipdate",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipinstruct",
+                "l_shipmode",
+                "l_comment"}),
+        std::make_pair(
+            "S",
+            std::vector<std::string>{
+                "row_id",
+                "l_suppkey",
+                "l_returnflag",
+                "l_linestatus",
+                "s_orderkey"})};
 
 } // namespace facebook::velox::exec::test

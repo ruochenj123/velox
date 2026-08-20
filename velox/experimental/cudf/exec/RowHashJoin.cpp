@@ -93,6 +93,27 @@ std::pair<std::vector<FieldDesc>, int32_t> computeRowLayout(
   return {fields, rowWidth};
 }
 
+/// Fixed-stride row stores have no null representation. Every table_view
+/// that is transposed into a row store MUST be null-free; reading head()
+/// under a null mask silently fabricates values (observed on TPC-DS
+/// wr_return_amt: identical row counts, diverging content checksums -- see
+/// REVIEW-ROUND2.md, 2026-08-17). Hard-fail per the row path's own
+/// unsupported-batch rule; the columnar cudf path remains the fallback for
+/// nullable data.
+void checkTransposeInputNullFree(
+    const cudf::table_view& table,
+    const char* site) {
+  for (int i = 0; i < table.num_columns(); i++) {
+    VELOX_CHECK_EQ(
+        table.column(i).null_count(),
+        0,
+        "RowHashJoin {}: column {} has nulls; the fixed-stride row store "
+        "cannot represent them (null support tracked in REVIEW-ROUND2.md)",
+        site,
+        i);
+  }
+}
+
 /// Transpose a cudf::table_view (already on GPU) into a row buffer on GPU.
 /// Returns the row buffer as rmm::device_buffer.
 void transposeToRows(
@@ -104,6 +125,7 @@ void transposeToRows(
   int32_t numRows = table.num_rows();
   int32_t numCols = table.num_columns();
   if (numRows == 0 || numCols == 0) return;
+  checkTransposeInputNullFree(table, "transposeToRows");
 
   // Collect column data pointers
   std::vector<const uint8_t*> colPtrs(numCols);
@@ -221,6 +243,7 @@ void transposeToRowsExcluding(
   int32_t numRows = table.num_rows();
   int32_t numCols = table.num_columns() - 1;
   if (numRows == 0 || numCols <= 0) return;
+  checkTransposeInputNullFree(table, "transposeToRowsSkip");
 
   std::vector<const uint8_t*> colPtrs;
   colPtrs.reserve(numCols);
@@ -266,6 +289,7 @@ void transposeKeyColumnsToRows(
   int32_t numRows = table.num_rows();
   int32_t numCols = static_cast<int32_t>(keyColIndices.size());
   if (numRows == 0 || numCols == 0) return;
+  checkTransposeInputNullFree(table, "transposeKeyColumnsToRows");
   std::vector<const uint8_t*> colPtrs;
   colPtrs.reserve(numCols);
   for (auto idx : keyColIndices) {
@@ -382,6 +406,9 @@ void RowHashJoinBuild::doNoMoreInput() {
   std::vector<FieldDesc> fields;
   rmm::device_buffer rowBuffer;
   rmm::device_buffer fieldsBuffer;
+  // Null sidecar for the combined build store (2026-08-17 null support).
+  rmm::device_buffer buildNullBuffer2;
+  int32_t buildNullStride2 = 0;
   std::vector<rmm::device_buffer> keyBuffers;
   std::shared_ptr<cudf::hash_join> hashJoin;
 
@@ -415,6 +442,137 @@ void RowHashJoinBuild::doNoMoreInput() {
   const bool wantFusedMap =
       CudfConfig::getInstance().isProbeFused(joinNode_->id());
   const bool skipHashJoin = wantFusedMap;
+
+  // ---- Row-native N:M matcher (CudfConfig::benchmarkRowTable) ----
+  // Build the chained multimap DIRECTLY over the key rows of the row store
+  // (keys-only store under boundary-hybrid; full row store otherwise). In
+  // this mode neither extractKeyColumns nor cudf::hash_join runs at all:
+  // keyBuffers stay empty and hashJoin stays null.
+  const bool useRowTable = CudfConfig::getInstance().benchmarkRowTable;
+  VELOX_CHECK(
+      !(useRowTable && wantFusedMap),
+      "benchmarkRowTable is the single-join row matcher; it does not combine "
+      "with benchmarkFusedProbe (which keeps its own N:1 device map)");
+  RowNativeHashTable rowTable{};
+  rmm::device_buffer rowTableHeads;
+  rmm::device_buffer rowTableNextFp;
+  rmm::device_buffer rowTablePackedKeys;
+  bool hasRowTable = false;
+  auto buildRowTable = [&](const GpuFixedRowStore& store,
+                           const std::vector<FieldDesc>& storeFields,
+                           const std::vector<cudf::size_type>& keyIdx) {
+    VELOX_CHECK_LE(
+        keyIdx.size(),
+        static_cast<size_t>(kRowTableMaxKeys),
+        "row-table matcher: too many join key columns");
+    RowKeyLayout kl{};
+    kl.numKeys = static_cast<int32_t>(keyIdx.size());
+    for (int32_t k = 0; k < kl.numKeys; k++) {
+      kl.offset[k] = storeFields[keyIdx[k]].offset;
+      kl.width[k] = storeFields[keyIdx[k]].byte_width;
+      VELOX_CHECK(
+          kl.width[k] == 4 || kl.width[k] == 8,
+          "row-table matcher: fixed-width 4/8-byte keys only");
+    }
+    const int32_t cap = rowTableCapacity(store.num_rows);
+    rowTableHeads = rmm::device_buffer(
+        static_cast<size_t>(cap) * sizeof(int32_t), stream);
+    rowTableNextFp = rmm::device_buffer(
+        static_cast<size_t>(std::max<int32_t>(store.num_rows, 1)) *
+            sizeof(uint64_t),
+        stream);
+    rowTable.heads = static_cast<int32_t*>(rowTableHeads.data());
+    rowTable.nextFp = static_cast<uint64_t*>(rowTableNextFp.data());
+    rowTable.capacity = cap;
+    rowTable.numRows = store.num_rows;
+    rowTable.buildStore = store;
+    rowTable.keys = kl;
+
+    // ---- Composite-key range packing (benchmarkRowTablePackKeys) ----
+    // One min/max pass over the build keys, one 2K-word D2H at build finalize
+    // (the only sync this adds, once per join). Pack engages iff the summed
+    // per-key bit-widths fit one uint64; otherwise the table runs unpacked.
+    RowKeyPack pack{};
+    if (CudfConfig::getInstance().benchmarkRowTablePackKeys &&
+        kl.numKeys >= 2 && store.num_rows > 0) {
+      const size_t mmWords = 2 * static_cast<size_t>(kl.numKeys);
+      rmm::device_buffer dMinmax(mmWords * sizeof(uint64_t), stream);
+      auto* mm = static_cast<uint64_t*>(dMinmax.data());
+      // mins pre-filled with 0xFF (UINT64_MAX), maxs with 0x00.
+      cudaMemsetAsync(
+          mm, 0xFF, static_cast<size_t>(kl.numKeys) * sizeof(uint64_t),
+          stream.value());
+      cudaMemsetAsync(
+          mm + kl.numKeys, 0x00,
+          static_cast<size_t>(kl.numKeys) * sizeof(uint64_t), stream.value());
+      rowTableComputeKeyMinMax(store, kl, mm, stream.value());
+      std::vector<uint64_t> hostMinmax(mmWords);
+      cudaMemcpyAsync(
+          hostMinmax.data(), mm, mmWords * sizeof(uint64_t),
+          cudaMemcpyDeviceToHost, stream.value());
+      stream.synchronize();
+      int32_t totalBits = 0;
+      for (int32_t k = 0; k < kl.numKeys; k++) {
+        const uint64_t mn = hostMinmax[k];
+        const uint64_t mx = hostMinmax[kl.numKeys + k];
+        const uint64_t span = mx - mn;
+        pack.mins[k] = mn;
+        pack.spans[k] = span;
+        // Cap at 63: a zero-span key contributes 0 bits and rel is always 0,
+        // but a shift amount of 64 would be UB.
+        pack.shifts[k] = std::min<int32_t>(totalBits, 63);
+        totalBits += span == 0 ? 0 : 64 - __builtin_clzll(span);
+      }
+      if (totalBits <= 64) {
+        pack.enabled = 1;
+        // <= 32 bits: the fingerprint IS the packed key -> verify-free walk,
+        // no stored-key array needed. Otherwise store packedKeys[numRows] so
+        // verify is one dense 8-byte load instead of K strided row loads.
+        pack.exactFp = totalBits <= 32 ? 1 : 0;
+        if (!pack.exactFp) {
+          rowTablePackedKeys = rmm::device_buffer(
+              static_cast<size_t>(store.num_rows) * sizeof(uint64_t), stream);
+          rowTable.packedKeys =
+              static_cast<const uint64_t*>(rowTablePackedKeys.data());
+        }
+        addRuntimeStat(
+            "rowTablePackedKeyBits", RuntimeCounter(totalBits));
+      }
+    }
+    rowTable.pack = pack;
+
+    buildRowNativeHashTable(rowTable, stream.value());
+    hasRowTable = true;
+  };
+  // Matcher-build phase timing (row table build vs extract+cudf::hash_join),
+  // reported as "matcherBuildWallNanos" when benchmarkLogGatherTime is set.
+  cudaEvent_t mbStart, mbEnd;
+  const bool timeMatcherBuild =
+      CudfConfig::getInstance().benchmarkLogGatherTime;
+  bool matcherBuildTimed = false;
+  auto matcherBuildBegin = [&]() {
+    if (timeMatcherBuild) {
+      cudaEventCreate(&mbStart);
+      cudaEventCreate(&mbEnd);
+      cudaEventRecord(mbStart, stream.value());
+      matcherBuildTimed = true;
+    }
+  };
+  auto matcherBuildEnd = [&]() {
+    if (matcherBuildTimed) {
+      cudaEventRecord(mbEnd, stream.value());
+      cudaEventSynchronize(mbEnd);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, mbStart, mbEnd);
+      addRuntimeStat(
+          "matcherBuildWallNanos",
+          RuntimeCounter(
+              static_cast<int64_t>(ms * 1e6), RuntimeCounter::Unit::kNanos));
+      cudaEventDestroy(mbStart);
+      cudaEventDestroy(mbEnd);
+      matcherBuildTimed = false;
+    }
+  };
   bool packEnabled = false;
   std::vector<int64_t> packMin, packMax;
   std::vector<int32_t> packShift;
@@ -546,6 +704,19 @@ void RowHashJoinBuild::doNoMoreInput() {
     hasDeviceMap = true;
   };
 
+  // ---- Boundary-hybrid build (CudfConfig::benchmarkBoundaryHybrid) ----
+  // The upstream CudfFromVelox packed ONLY the join-key columns to the GPU
+  // (keys-only row layout, join-key order) and attached the full host
+  // batches to each RowStoreVector. Here the keys concatenate exactly like
+  // the normal RowStoreVector path (so cudf::hash_join's build row ids are
+  // global over the concatenation), while the payload batches are fed — in
+  // the SAME order — into a host-side BoundaryHostStore whose prefix sums
+  // invert global row id -> (batchId, rowInBatch). Build payload bytes never
+  // touch PCIe.
+  const bool boundaryBuild =
+      firstRowStore != nullptr && firstRowStore->boundaryKeysOnly();
+  std::shared_ptr<BoundaryHostStore> boundaryStore;
+
   if (firstRowStore) {
     // ---- RowStoreVector path: concatenate GPU row buffers ----
     rowWidth = firstRowStore->rowWidth();
@@ -556,10 +727,28 @@ void RowHashJoinBuild::doNoMoreInput() {
       numRows += inp->size();
     }
 
+    // Null sidecar (2026-08-17): if ANY input carries one, the combined
+    // store needs one; inputs without contribute zeroed (all-valid) bytes.
+    for (auto& inp : inputs_) {
+      if (auto r = std::dynamic_pointer_cast<RowStoreVector>(inp)) {
+        if (r->nullStride() > 0) {
+          VELOX_CHECK(
+              buildNullStride2 == 0 || buildNullStride2 == r->nullStride(),
+              "row store null strides disagree across build batches");
+          buildNullStride2 = r->nullStride();
+        }
+      }
+    }
+    if (buildNullStride2 > 0) {
+      buildNullBuffer2 =
+          rmm::device_buffer(numRows * buildNullStride2, stream);
+    }
+
     // Allocate combined buffer and copy each chunk
     int64_t totalBytes = numRows * rowWidth;
     rowBuffer = rmm::device_buffer(totalBytes, stream);
     int64_t offset = 0;
+    int64_t nullOffset = 0;
     for (auto& inp : inputs_) {
       auto rsv = std::dynamic_pointer_cast<RowStoreVector>(inp);
       VELOX_CHECK_NOT_NULL(rsv);
@@ -571,6 +760,51 @@ void RowHashJoinBuild::doNoMoreInput() {
             cudaMemcpyDeviceToDevice, stream.value());
         offset += chunkBytes;
       }
+      if (buildNullStride2 > 0 && rsv->size() > 0) {
+        const int64_t nb =
+            static_cast<int64_t>(rsv->size()) * buildNullStride2;
+        if (rsv->nullStride() > 0) {
+          cudaMemcpyAsync(
+              static_cast<uint8_t*>(buildNullBuffer2.data()) + nullOffset,
+              rsv->gpuRowData() + rsv->gpuRowBytes(),
+              nb, cudaMemcpyDeviceToDevice, stream.value());
+        } else {
+          cudaMemsetAsync(
+              static_cast<uint8_t*>(buildNullBuffer2.data()) + nullOffset,
+              0, nb, stream.value());
+        }
+        nullOffset += nb;
+      }
+      if (boundaryBuild) {
+        // Host retention IN GPU-CONCAT ORDER: this loop appends host batches
+        // in exactly the order their key rows were appended above, which is
+        // what makes hostStore->idForGlobalRow() the inverse of the GPU's
+        // global build row id.
+        VELOX_CHECK(
+            rsv->boundaryKeysOnly(),
+            "boundary-hybrid build: mixed keys-only and full-row inputs");
+        const auto& hostBatches = rsv->boundaryHostBatches();
+        VELOX_CHECK(
+            rsv->size() == 0 || !hostBatches.empty(),
+            "boundary-hybrid build: input lost its host payload");
+        if (boundaryStore == nullptr && !hostBatches.empty()) {
+          auto hostType =
+              std::dynamic_pointer_cast<const RowType>(hostBatches[0]->type());
+          VELOX_CHECK_NOT_NULL(hostType);
+          boundaryStore =
+              std::make_shared<BoundaryHostStore>(hostType, pool());
+        }
+        for (const auto& hb : hostBatches) {
+          boundaryStore->addBatch(hb);
+        }
+        rsv->clearBoundaryPayload(); // store holds the refs now
+      }
+    }
+    if (boundaryBuild && boundaryStore != nullptr) {
+      VELOX_CHECK_EQ(
+          boundaryStore->totalRows(),
+          numRows,
+          "boundary-hybrid build: host retention rows != GPU key rows");
     }
     inputs_.clear();
 
@@ -582,9 +816,26 @@ void RowHashJoinBuild::doNoMoreInput() {
     auto rightKeys = joinNode_->rightKeys();
     auto rightType = joinNode_->sources()[1]->outputType();
     std::vector<cudf::size_type> keyColIndices;
-    for (auto& k : rightKeys) {
-      keyColIndices.push_back(
-          static_cast<cudf::size_type>(rightType->getChildIdx(k->name())));
+    if (boundaryBuild) {
+      // Keys-only layout: field k IS rightKeys[k] (CudfFromVelox packed the
+      // key columns in join-key order), so the key indices are simply 0..K-1
+      // — NOT the child indices in rightType.
+      VELOX_CHECK_EQ(
+          fields.size(),
+          rightKeys.size(),
+          "boundary-hybrid build: keys-only layout width mismatch");
+      VELOX_CHECK(
+          !wantFusedMap,
+          "boundary-hybrid does not support the fused probe (single-join "
+          "design); unset benchmarkFusedProbe");
+      for (size_t k = 0; k < rightKeys.size(); k++) {
+        keyColIndices.push_back(static_cast<cudf::size_type>(k));
+      }
+    } else {
+      for (auto& k : rightKeys) {
+        keyColIndices.push_back(
+            static_cast<cudf::size_type>(rightType->getChildIdx(k->name())));
+      }
     }
 
     GpuFixedRowStore tmpStore;
@@ -594,19 +845,27 @@ void RowHashJoinBuild::doNoMoreInput() {
     tmpStore.num_fields = fields.size();
     tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
 
-    std::vector<cudf::column_view> keyViews;
-    extractKeyColumns(
-        tmpStore, fields, keyColIndices, numRows, stream,
-        keyBuffers, keyViews);
+    matcherBuildBegin();
+    if (useRowTable) {
+      // Row-native matcher: chained multimap straight over the key rows.
+      // No extract_keys, no cudf::hash_join.
+      buildRowTable(tmpStore, fields, keyColIndices);
+    } else {
+      std::vector<cudf::column_view> keyViews;
+      extractKeyColumns(
+          tmpStore, fields, keyColIndices, numRows, stream,
+          keyBuffers, keyViews);
 
-    if (!skipHashJoin) {
-      auto keyTable = cudf::table_view(keyViews);
-      hashJoin = std::make_shared<cudf::hash_join>(
-          keyTable, cudf::null_equality::UNEQUAL, stream);
+      if (!skipHashJoin) {
+        auto keyTable = cudf::table_view(keyViews);
+        hashJoin = std::make_shared<cudf::hash_join>(
+            keyTable, cudf::null_equality::UNEQUAL, stream);
+      }
+      if (wantFusedMap) {
+        buildFusedMap(keyViews, numRows);
+      }
     }
-    if (wantFusedMap) {
-      buildFusedMap(keyViews, numRows);
-    }
+    matcherBuildEnd();
   } else {
     // ---- CudfVector path: concatenate + transpose ----
     // Per-phase GPU timing (VELOX_CUDF_BUILD_PROFILE): stamp the stream at each phase
@@ -728,25 +987,39 @@ void RowHashJoinBuild::doNoMoreInput() {
       tmpStore.num_fields = fields.size();
       tmpStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
 
-      std::vector<cudf::column_view> keyViews;
-      extractKeyColumns(
-          tmpStore, fields, keyColIndices, numRows, stream,
-          keyBuffers, keyViews);
-      stamp(3);
+      if (useRowTable) {
+        // Row-native matcher: build straight from the transposed row store;
+        // no key extraction, no cudf::hash_join.
+        matcherBuildBegin();
+        buildRowTable(tmpStore, fields, keyColIndices);
+        matcherBuildEnd();
+        stamp(3);
+        stamp(4);
+        stamp(5);
+      } else {
+        matcherBuildBegin();
+        std::vector<cudf::column_view> keyViews;
+        extractKeyColumns(
+            tmpStore, fields, keyColIndices, numRows, stream,
+            keyBuffers, keyViews);
+        stamp(3);
 
-      // hashJoin feeds non-fused RowHashJoinProbe (sub-joins); skipHashJoin is set
-      // only when EVERY join is fused, so it is then dead work. deviceMap is built
-      // from the columnar key columns (coalesced key load).
-      if (!skipHashJoin) {
-        auto keyTable = cudf::table_view(keyViews);
-        hashJoin = std::make_shared<cudf::hash_join>(
-            keyTable, cudf::null_equality::UNEQUAL, stream);
+        // hashJoin feeds non-fused RowHashJoinProbe (sub-joins); skipHashJoin
+        // is set only when EVERY join is fused, so it is then dead work.
+        // deviceMap is built from the columnar key columns (coalesced key
+        // load).
+        if (!skipHashJoin) {
+          auto keyTable = cudf::table_view(keyViews);
+          hashJoin = std::make_shared<cudf::hash_join>(
+              keyTable, cudf::null_equality::UNEQUAL, stream);
+        }
+        matcherBuildEnd();
+        stamp(4);
+        if (wantFusedMap && !fusedMapBuilt) {
+          buildFusedMap(keyViews, numRows);
+        }
+        stamp(5);
       }
-      stamp(4);
-      if (wantFusedMap && !fusedMapBuilt) {
-        buildFusedMap(keyViews, numRows);
-      }
-      stamp(5);
     }
 
     if (profBuild) {
@@ -786,6 +1059,11 @@ void RowHashJoinBuild::doNoMoreInput() {
   gpuStore.num_rows = numRows;
   gpuStore.num_fields = fields.size();
   gpuStore.fields = static_cast<const FieldDesc*>(fieldsBuffer.data());
+  if (buildNullStride2 > 0) {
+    gpuStore.null_bytes =
+        static_cast<const uint8_t*>(buildNullBuffer2.data());
+    gpuStore.null_stride = buildNullStride2;
+  }
 
   // (The fused-probe device hash table `deviceMap` was built above, inside the
   // input-specific branch, from the columnar key columns -- coalesced key load,
@@ -813,6 +1091,19 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.packSentinel = packSentinel;
   bd.columnarBuild = columnarBuild;
   bd.buildTable = std::move(columnarBuildTablePtr);
+  bd.nullBuffer = std::move(buildNullBuffer2);
+  bd.nullStride = buildNullStride2;
+  // Boundary-hybrid: hand the probe the host payload store; gpuRowStore then
+  // holds keys only and is used solely for hash-table construction above.
+  bd.boundaryHybrid = boundaryBuild;
+  bd.hostStore = std::move(boundaryStore);
+  // Row-native matcher: hand the probe the chained multimap (device pointers
+  // stay valid — rmm::device_buffer moves preserve the allocation).
+  bd.hasRowTable = hasRowTable;
+  bd.rowTable = rowTable;
+  bd.rowTableHeads = std::move(rowTableHeads);
+  bd.rowTableNextFp = std::move(rowTableNextFp);
+  bd.rowTablePackedKeys = std::move(rowTablePackedKeys);
 
   // Key-only row store (fingerprint verify under columnar payload).
   if (hasKeyRowStore) {
@@ -947,6 +1238,30 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(buildData_);
   auto& bd = *buildData_;
+
+  // ---- Boundary-hybrid probe path ----
+  // Keys-only input + host-retained payload: GPU does keys-in / id-pairs-out
+  // only; the output RowVector is materialized on the CPU. See
+  // boundaryProbe() for the full flow.
+  if (bd.boundaryHybrid) {
+    auto boundaryInput = std::dynamic_pointer_cast<RowStoreVector>(input_);
+    VELOX_CHECK(
+        boundaryInput != nullptr && boundaryInput->boundaryKeysOnly(),
+        "boundary-hybrid probe requires a keys-only RowStoreVector input "
+        "with host payload attached (produced by CudfFromVelox's keys-only "
+        "pinned pack)");
+    auto out = boundaryProbe(boundaryInput, boundaryInput->stream());
+    boundaryInput.reset();
+    input_.reset();
+    finished_ = noMoreInput_;
+    if (logTimeline && driverId == 0) {
+      printf("OPTRACE %lld d0 p%d RowJoinProbe end %lld\n",
+             (long long)timeNow(), pipelineId,
+             (long long)(out ? out->size() : 0));
+    }
+    return out;
+  }
+
   int32_t buildRowWidth = bd.rowWidth;
 
   // Dual-path: detect RowStoreVector (pre-transposed) vs CudfVector (needs transpose)
@@ -1051,6 +1366,8 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     auto rightType = joinNode_->sources()[1]->outputType();
     const auto& buildHostFields = buildData_->hostFields;
 
+    // Per-mapping FIELD indices for the null sidecar copy (2026-08-17).
+    std::vector<int32_t> pSrcField, pDstField, bSrcField, bDstField;
     int32_t dstOffset = 0;
     for (int i = 0; i < outType->size(); i++) {
       auto name = outType->nameOf(i);
@@ -1061,11 +1378,15 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         byteWidth = probeFields_[srcCol].byte_width;
         probeGatherMappings_.push_back(
             {probeFields_[srcCol].offset, dstOffset, byteWidth});
+        pSrcField.push_back(srcCol);
+        pDstField.push_back(i);
       } else {
         int srcCol = rightType->getChildIdx(name);
         byteWidth = buildHostFields[srcCol].byte_width;
         buildGatherMappings_.push_back(
             {buildHostFields[srcCol].offset, dstOffset, byteWidth});
+        bSrcField.push_back(srcCol);
+        bDstField.push_back(i);
       }
       outputFields_.push_back({dstOffset, byteWidth});
       dstOffset += byteWidth;
@@ -1083,6 +1404,18 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
           buildGatherMappings_.data(),
           buildGatherMappings_.size() * sizeof(FieldMapping), stream);
     }
+    if (!pSrcField.empty()) {
+      probeGatherSrcFieldBuffer_ = rmm::device_buffer(
+          pSrcField.data(), pSrcField.size() * sizeof(int32_t), stream);
+      probeGatherDstFieldBuffer_ = rmm::device_buffer(
+          pDstField.data(), pDstField.size() * sizeof(int32_t), stream);
+    }
+    if (!bSrcField.empty()) {
+      buildGatherSrcFieldBuffer_ = rmm::device_buffer(
+          bSrcField.data(), bSrcField.size() * sizeof(int32_t), stream);
+      buildGatherDstFieldBuffer_ = rmm::device_buffer(
+          bDstField.data(), bDstField.size() * sizeof(int32_t), stream);
+    }
 
     addRuntimeStat("outputGatherProbeFields",
         RuntimeCounter(static_cast<int64_t>(probeGatherMappings_.size())));
@@ -1099,43 +1432,89 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     outputLayoutComputed_ = true;
   }
 
-  // ---- 2. Extract probe keys from row buffer (one buffer per join key) ----
+  // ---- 2+3. MATCHER: probe keys -> (probe, build) id pair lists ----
+  // Two interchangeable matchers behind one contract:
+  //   cudf arm            : extract the key column(s) from the probe row
+  //                         store, then cudf::hash_join::inner_join (cuco);
+  //   row arm (hasRowTable): the row-native chained multimap, probed with
+  //                         keys read straight from the probe row store —
+  //                         the extract_keys step does not run at all.
   const int numKeys = static_cast<int>(leftKeyIndices_.size());
-  if (static_cast<int>(probeKeyBuffers_.size()) != numKeys) {
-    probeKeyBuffers_.clear();
-    probeKeyBuffers_.resize(numKeys);
-    probeKeyCapacity_ = 0;
-  }
-  if (probeRows > probeKeyCapacity_) {
-    probeKeyCapacity_ = probeRows;
-    for (int k = 0; k < numKeys; k++) {
-      int32_t kw = probeFields_[leftKeyIndices_[k]].byte_width;
-      probeKeyBuffers_[k] = rmm::device_buffer((int64_t)probeRows * kw, stream);
-    }
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices;
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices;
+  int32_t numMatches = 0;
+
+  // Matcher-phase device timing ("matcherWallNanos"): covers extract+probe
+  // for the cudf arm and count+scan+refill for the row arm — gather excluded.
+  cudaEvent_t mStart, mEnd;
+  const bool timeMatcher = CudfConfig::getInstance().benchmarkLogGatherTime;
+  if (timeMatcher) {
+    cudaEventCreate(&mStart);
+    cudaEventCreate(&mEnd);
+    cudaEventRecord(mStart, stream.value());
   }
 
-  std::vector<cudf::column_view> probeKeyViews;
-  probeKeyViews.reserve(numKeys);
-  for (int k = 0; k < numKeys; k++) {
-    int32_t keyOffset = probeFields_[leftKeyIndices_[k]].offset;
-    int32_t keyWidth = probeFields_[leftKeyIndices_[k]].byte_width;
-    extractKeysFromRows(
-        probeGpuStore, keyOffset, keyWidth,
-        probeKeyBuffers_[k].data(), stream.value());
+  if (bd.hasRowTable) {
+    RowKeyLayout pk{};
+    pk.numKeys = numKeys;
+    for (int k = 0; k < numKeys; k++) {
+      pk.offset[k] = probeFields_[leftKeyIndices_[k]].offset;
+      pk.width[k] = probeFields_[leftKeyIndices_[k]].byte_width;
+    }
+    numMatches = rowTableProbe(
+        probeGpuStore, pk, probeRows, stream, leftIndices, rightIndices);
+  } else {
+    if (static_cast<int>(probeKeyBuffers_.size()) != numKeys) {
+      probeKeyBuffers_.clear();
+      probeKeyBuffers_.resize(numKeys);
+      probeKeyCapacity_ = 0;
+    }
+    if (probeRows > probeKeyCapacity_) {
+      probeKeyCapacity_ = probeRows;
+      for (int k = 0; k < numKeys; k++) {
+        int32_t kw = probeFields_[leftKeyIndices_[k]].byte_width;
+        probeKeyBuffers_[k] =
+            rmm::device_buffer((int64_t)probeRows * kw, stream);
+      }
+    }
+
+    std::vector<cudf::column_view> probeKeyViews;
+    probeKeyViews.reserve(numKeys);
+    for (int k = 0; k < numKeys; k++) {
+      int32_t keyOffset = probeFields_[leftKeyIndices_[k]].offset;
+      int32_t keyWidth = probeFields_[leftKeyIndices_[k]].byte_width;
+      extractKeysFromRows(
+          probeGpuStore, keyOffset, keyWidth,
+          probeKeyBuffers_[k].data(), stream.value());
     probeKeyViews.emplace_back(
         cudf::data_type{
             keyWidth == 8 ? cudf::type_id::INT64 : cudf::type_id::INT32},
         static_cast<cudf::size_type>(probeRows),
         probeKeyBuffers_[k].data(), nullptr, 0);
+    }
+
+    auto probeKeyTable = cudf::table_view(probeKeyViews);
+    auto [l, r] = bd.hashJoin->inner_join(
+        probeKeyTable, std::nullopt, stream, get_temp_mr());
+    leftIndices = std::move(l);
+    rightIndices = std::move(r);
+    numMatches = static_cast<int32_t>(leftIndices->size());
   }
 
-  // ---- 3. Hash probe ----
-  auto probeKeyTable = cudf::table_view(probeKeyViews);
-
-  auto [leftIndices, rightIndices] = bd.hashJoin->inner_join(
-      probeKeyTable, std::nullopt, stream, get_temp_mr());
-
-  int32_t numMatches = leftIndices->size();
+  if (timeMatcher) {
+    cudaEventRecord(mEnd, stream.value());
+    cudaEventSynchronize(mEnd);
+    float mMs = 0;
+    cudaEventElapsedTime(&mMs, mStart, mEnd);
+    addRuntimeStat(
+        "matcherWallNanos",
+        RuntimeCounter(
+            static_cast<int64_t>(mMs * 1e6), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "matcherMatches", RuntimeCounter(static_cast<int64_t>(numMatches)));
+    cudaEventDestroy(mStart);
+    cudaEventDestroy(mEnd);
+  }
 
   // ---- 4. Row gather ----
 
@@ -1159,6 +1538,23 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       probeGatherBuffer_ = rmm::device_buffer(neededOutput, stream);
     }
 
+    // Null sidecar for the output (2026-08-17): needed iff either input
+    // store carries one. Zeroed each batch; the gather ORs source bits in.
+    uint8_t* outNullBytes = nullptr;
+    if (probeGpuStore.null_stride > 0 || bd.gpuRowStore.null_stride > 0) {
+      outputNullStride_ =
+          (static_cast<int32_t>(outputType_->size()) + 7) / 8;
+      const int64_t nb =
+          static_cast<int64_t>(numMatches) * outputNullStride_;
+      if (nb > static_cast<int64_t>(outputNullBuffer_.size())) {
+        outputNullBuffer_ = rmm::device_buffer(nb, stream);
+      }
+      cudaMemsetAsync(outputNullBuffer_.data(), 0, nb, stream.value());
+      outNullBytes = static_cast<uint8_t*>(outputNullBuffer_.data());
+    } else {
+      outputNullStride_ = 0;
+    }
+
     selectiveGatherAndConcat(
         probeGpuStore,
         reinterpret_cast<const int32_t*>(leftIndices->data()),
@@ -1171,7 +1567,13 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         numMatches,
         outputRowWidth_,
         static_cast<uint8_t*>(probeGatherBuffer_.data()),
-        stream.value());
+        stream.value(),
+        static_cast<const int32_t*>(probeGatherSrcFieldBuffer_.data()),
+        static_cast<const int32_t*>(probeGatherDstFieldBuffer_.data()),
+        static_cast<const int32_t*>(buildGatherSrcFieldBuffer_.data()),
+        static_cast<const int32_t*>(buildGatherDstFieldBuffer_.data()),
+        outNullBytes,
+        outputNullStride_);
   }
 
   if (timeGather) {
@@ -1330,12 +1732,32 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
   columns.reserve(numCols);
   for (int i = 0; i < numCols; i++) {
     auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
+    rmm::device_buffer mask{};
+    cudf::size_type nullCount = 0;
+    if (outputNullStride_ > 0) {
+      // Convert this column's sidecar bits into an Arrow validity mask
+      // (2026-08-17 null support). UNKNOWN_NULL_COUNT defers counting.
+      mask = rmm::device_buffer(
+          cudf::bitmask_allocation_size_bytes(numMatches), stream);
+      sidecarToMask(
+          static_cast<const uint8_t*>(outputNullBuffer_.data()),
+          outputNullStride_,
+          i,
+          numMatches,
+          static_cast<uint32_t*>(mask.data()),
+          stream.value());
+      nullCount = cudf::null_count(
+          static_cast<const cudf::bitmask_type*>(mask.data()),
+          0,
+          static_cast<cudf::size_type>(numMatches),
+          stream);
+    }
     columns.push_back(std::make_unique<cudf::column>(
         cudfType,
         static_cast<cudf::size_type>(numMatches),
         std::move(*colBuffers[i]),      // data buffer (ownership moved)
-        rmm::device_buffer{},           // no null mask
-        0));                            // null count
+        std::move(mask),
+        nullCount));
   }
 
   auto table = std::make_unique<cudf::table>(std::move(columns));
@@ -1369,6 +1791,383 @@ void RowHashJoinProbe::doNoMoreInput() {
 
 bool RowHashJoinProbe::isFinished() {
   return finished_;
+}
+
+// ============================================================================
+// Boundary-hybrid probe (CudfConfig::benchmarkBoundaryHybrid)
+// ============================================================================
+//
+// The paper's §3 single-join design — hybrid layout AT the device boundary:
+//   1. ONLY the probe keys crossed PCIe (keys-only RowStoreVector); the
+//      payload columns of this batch are host-resident (attached batches).
+//   2. Extract the key column(s) from the keys-only row store, probe the
+//      build hash table on the GPU (cudf::hash_join::inner_join over the
+//      keys-only build store — the build payload also never left the host).
+//   3. Read back ONLY the surviving id pairs: (probe row within this batch,
+//      global build row id). Pinned staging + one stream sync — the same
+//      count-readback barrier the row join already pays, extended to the two
+//      id arrays.
+//   4. Materialize the output RowVector on the CPU: probe-side columns
+//      gather from THIS batch's retained host batches (ids are batch-local
+//      because we process batch-at-a-time); build-side columns gather
+//      through the build's global-id -> (batchId, rowInBatch) map into the
+//      build's retained batches. Both gathers run HybridContainer's
+//      scattered extraction (see BoundaryHostStore.h).
+//
+// Boundary traffic per probe row: K key bytes H2D + 8 bytes/survivor D2H,
+// versus the full-row pack's 50-100 B/row H2D — the mode's entire point.
+
+void RowHashJoinProbe::PinnedIdBuffer::ensure(int64_t n) {
+  if (n <= capacity) {
+    return;
+  }
+  if (data != nullptr) {
+    cudaFreeHost(data);
+    data = nullptr;
+  }
+  // Grow-by-doubling: cudaHostAlloc globally serializes the driver, so
+  // amortize (same rationale as the PinnedPackSlot pool).
+  capacity = std::max<int64_t>(n, capacity * 2);
+  cudaError_t err = cudaHostAlloc(
+      reinterpret_cast<void**>(&data),
+      capacity * sizeof(int32_t),
+      cudaHostAllocDefault);
+  VELOX_CHECK(
+      err == cudaSuccess,
+      "boundary-hybrid: cudaHostAlloc({} B) failed: {}",
+      capacity * sizeof(int32_t),
+      cudaGetErrorString(err));
+}
+
+RowHashJoinProbe::PinnedIdBuffer::~PinnedIdBuffer() {
+  if (data != nullptr) {
+    cudaFreeHost(data);
+  }
+}
+
+// ============================================================================
+// Row-native matcher probe (CudfConfig::benchmarkRowTable)
+// ============================================================================
+// Two-pass N:M probe mirroring cudf's count+retrieve, but with the keys read
+// straight from the probe ROW store and compared against the build KEY rows:
+//   pass 1: per-probe-row match counts (chain walk + fingerprint verify)
+//   scan  : cub exclusive sum -> per-row output offsets + total
+//   pass 2: refill (probeIdx, buildIdx) at the scanned offsets
+// One stream sync to read the total — the same per-batch barrier
+// cudf::hash_join::inner_join pays internally to size its output.
+int32_t RowHashJoinProbe::rowTableProbe(
+    const GpuFixedRowStore& probeStore,
+    const RowKeyLayout& probeKeys,
+    int32_t probeRows,
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>& leftIndices,
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>& rightIndices) {
+  auto& bd = *buildData_;
+  VELOX_CHECK(bd.hasRowTable, "rowTableProbe: build did not produce a table");
+  if (probeRows == 0) {
+    return 0;
+  }
+
+  if (probeRows > rowTableProbeCapacity_) {
+    rowTableProbeCapacity_ = probeRows;
+    rowTableCounts_ =
+        rmm::device_buffer((size_t)probeRows * sizeof(int32_t), stream);
+    rowTableOffsets_ =
+        rmm::device_buffer((size_t)probeRows * sizeof(int32_t), stream);
+    const size_t tb = rowTableScanTempBytes(probeRows);
+    if (tb > rowTableScanTempBytes_) {
+      rowTableScanTempBytes_ = tb;
+      rowTableScanTemp_ = rmm::device_buffer(tb, stream);
+    }
+  }
+  if (rowTableTotal_.size() == 0) {
+    rowTableTotal_ = rmm::device_buffer(sizeof(int32_t), stream);
+  }
+
+  auto* counts = static_cast<int32_t*>(rowTableCounts_.data());
+  auto* offsets = static_cast<int32_t*>(rowTableOffsets_.data());
+  auto* total = static_cast<int32_t*>(rowTableTotal_.data());
+
+  rowTableProbeCount(
+      bd.rowTable, probeStore, probeKeys, probeRows, counts, stream.value());
+  rowTableScanOffsets(
+      counts,
+      offsets,
+      probeRows,
+      rowTableScanTemp_.data(),
+      rowTableScanTempBytes_,
+      total,
+      stream.value());
+
+  int32_t numMatches = 0;
+  cudaMemcpyAsync(
+      &numMatches, total, sizeof(int32_t), cudaMemcpyDeviceToHost,
+      stream.value());
+  stream.synchronize();
+
+  if (numMatches > 0) {
+    leftIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
+        numMatches, stream, get_temp_mr());
+    rightIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
+        numMatches, stream, get_temp_mr());
+    rowTableProbeFill(
+        bd.rowTable,
+        probeStore,
+        probeKeys,
+        probeRows,
+        offsets,
+        leftIndices->data(),
+        rightIndices->data(),
+        stream.value());
+  }
+  return numMatches;
+}
+
+RowVectorPtr RowHashJoinProbe::boundaryProbe(
+    const std::shared_ptr<RowStoreVector>& rowStoreInput,
+    rmm::cuda_stream_view stream) {
+  auto& bd = *buildData_;
+  VELOX_CHECK(
+      bd.hasRowTable || bd.hashJoin != nullptr,
+      "boundary-hybrid probe: build produced neither a hash_join nor a "
+      "row-native table");
+  // NOTE: bd.hostStore may be null when the build side was EMPTY (no host
+  // batches were ever attached); every probe then yields zero matches and we
+  // return before touching it. Checked below, after the zero-match exit.
+
+  const int32_t probeRows = rowStoreInput->size();
+  const auto& keyFields = rowStoreInput->hostFields(); // keys-only, key order
+  const int numKeys = static_cast<int>(leftKeyIndices_.size());
+  VELOX_CHECK_EQ(
+      static_cast<int>(keyFields.size()),
+      numKeys,
+      "boundary-hybrid probe: input is not in keys-only layout");
+
+  // ---- 1+2. MATCHER: keys in, id pairs out ----
+  // (Field k is leftKeys[k]; the build key rows were packed in rightKeys
+  // order, so column k lines up on both sides.)
+  //   cudf arm            : extract key columns from the keys-only row store,
+  //                         then cudf::hash_join::inner_join;
+  //   row arm (hasRowTable): probe the row-native chained multimap with keys
+  //                         read straight from the keys-only row store — no
+  //                         extraction at all.
+  GpuFixedRowStore probeStore = rowStoreInput->getGpuRowStore();
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices;
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices;
+  int32_t numMatches = 0;
+
+  cudaEvent_t mStart, mEnd;
+  const bool timeMatcher = CudfConfig::getInstance().benchmarkLogGatherTime;
+  if (timeMatcher) {
+    cudaEventCreate(&mStart);
+    cudaEventCreate(&mEnd);
+    cudaEventRecord(mStart, stream.value());
+  }
+
+  if (bd.hasRowTable) {
+    RowKeyLayout pk{};
+    pk.numKeys = numKeys;
+    for (int k = 0; k < numKeys; k++) {
+      pk.offset[k] = keyFields[k].offset;
+      pk.width[k] = keyFields[k].byte_width;
+    }
+    numMatches = rowTableProbe(
+        probeStore, pk, probeRows, stream, leftIndices, rightIndices);
+  } else {
+    if (static_cast<int>(probeKeyBuffers_.size()) != numKeys) {
+      probeKeyBuffers_.clear();
+      probeKeyBuffers_.resize(numKeys);
+      probeKeyCapacity_ = 0;
+    }
+    if (probeRows > probeKeyCapacity_) {
+      probeKeyCapacity_ = probeRows;
+      for (int k = 0; k < numKeys; k++) {
+        probeKeyBuffers_[k] = rmm::device_buffer(
+            (int64_t)probeRows * keyFields[k].byte_width, stream);
+      }
+    }
+    std::vector<cudf::column_view> probeKeyViews;
+    probeKeyViews.reserve(numKeys);
+    for (int k = 0; k < numKeys; k++) {
+      extractKeysFromRows(
+          probeStore,
+          keyFields[k].offset,
+          keyFields[k].byte_width,
+          probeKeyBuffers_[k].data(),
+          stream.value());
+      probeKeyViews.emplace_back(
+          cudf::data_type{
+              keyFields[k].byte_width == 8 ? cudf::type_id::INT64
+                                           : cudf::type_id::INT32},
+          static_cast<cudf::size_type>(probeRows),
+          probeKeyBuffers_[k].data(),
+          nullptr,
+          0);
+    }
+
+    auto probeKeyTable = cudf::table_view(probeKeyViews);
+    auto [l, r] = bd.hashJoin->inner_join(
+        probeKeyTable, std::nullopt, stream, get_temp_mr());
+    leftIndices = std::move(l);
+    rightIndices = std::move(r);
+    numMatches = static_cast<int32_t>(leftIndices->size());
+  }
+
+  if (timeMatcher) {
+    cudaEventRecord(mEnd, stream.value());
+    cudaEventSynchronize(mEnd);
+    float mMs = 0;
+    cudaEventElapsedTime(&mMs, mStart, mEnd);
+    addRuntimeStat(
+        "matcherWallNanos",
+        RuntimeCounter(
+            static_cast<int64_t>(mMs * 1e6), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "matcherMatches", RuntimeCounter(static_cast<int64_t>(numMatches)));
+    cudaEventDestroy(mStart);
+    cudaEventDestroy(mEnd);
+  }
+
+  // ---- 3. Survivor-id readback: 2 * numMatches * 4 B, pinned, one sync ----
+  if (numMatches > 0) {
+    boundaryProbeIds_.ensure(numMatches);
+    boundaryBuildIds_.ensure(numMatches);
+    cudaMemcpyAsync(
+        boundaryProbeIds_.data,
+        leftIndices->data(),
+        (size_t)numMatches * sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    cudaMemcpyAsync(
+        boundaryBuildIds_.data,
+        rightIndices->data(),
+        (size_t)numMatches * sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  }
+  // One barrier per batch: the row join pays an equivalent per-batch barrier
+  // for its match-count readback, so this adds no extra serialization.
+  stream.synchronize();
+
+  addRuntimeStat(
+      "boundaryProbeRows", RuntimeCounter(static_cast<int64_t>(probeRows)));
+  addRuntimeStat(
+      "boundaryMatches", RuntimeCounter(static_cast<int64_t>(numMatches)));
+  addRuntimeStat(
+      "boundaryIdReadbackBytes",
+      RuntimeCounter(
+          2LL * numMatches * sizeof(int32_t), RuntimeCounter::Unit::kBytes));
+
+  if (numMatches == 0) {
+    return nullptr;
+  }
+  VELOX_CHECK_NOT_NULL(
+      bd.hostStore, "boundary-hybrid probe: build has no host payload store");
+
+  auto tpGatherStart = std::chrono::steady_clock::now();
+
+  // ---- 4a. Retain THIS batch's host payload (batch-local ids) ----
+  const auto& hostBatches = rowStoreInput->boundaryHostBatches();
+  VELOX_CHECK(
+      !hostBatches.empty(),
+      "boundary-hybrid probe: input lost its host payload");
+  if (boundaryProbeStore_ == nullptr) {
+    auto hostType =
+        std::dynamic_pointer_cast<const RowType>(hostBatches[0]->type());
+    VELOX_CHECK_NOT_NULL(hostType);
+    boundaryProbeStore_ =
+        std::make_unique<BoundaryHostStore>(hostType, pool());
+  } else {
+    boundaryProbeStore_->clearBatches(); // previous batch's payload released
+  }
+  for (const auto& hb : hostBatches) {
+    boundaryProbeStore_->addBatch(hb);
+  }
+  VELOX_CHECK_EQ(
+      boundaryProbeStore_->totalRows(),
+      static_cast<int64_t>(probeRows),
+      "boundary-hybrid probe: host retention rows != GPU key rows");
+
+  // ---- 4b. Output column -> source mapping (once) ----
+  // Every output column resolves against a retained-batch child: probe-side
+  // columns (INCLUDING the key — probe side is the simplest key source, per
+  // the design) from this batch's host batches, build-side columns from the
+  // build's host store.
+  if (!boundaryLayoutReady_) {
+    const auto& probeType = boundaryProbeStore_->rowType();
+    const auto& buildType = bd.hostStore->rowType();
+    for (int j = 0; j < outputType_->size(); j++) {
+      const auto& name = outputType_->nameOf(j);
+      auto probeIdx = probeType->getChildIdxIfExists(name);
+      if (probeIdx.has_value()) {
+        boundaryOutFromProbe_.push_back(
+            {j, static_cast<int32_t>(probeIdx.value())});
+      } else {
+        boundaryOutFromBuild_.push_back(
+            {j, static_cast<int32_t>(buildType->getChildIdx(name))});
+      }
+    }
+    boundaryLayoutReady_ = true;
+  }
+
+  // ---- 4c. Id decode: batch-local probe ids and global build ids become
+  // scattered (batchId, rowInBatch) HybridRowIds. ----
+  boundaryProbeStore_->idsForGlobalRows(
+      boundaryProbeIds_.data, numMatches, boundaryProbeRowIds_);
+  bd.hostStore->idsForGlobalRows(
+      boundaryBuildIds_.data, numMatches, boundaryBuildRowIds_);
+
+  // ---- 4d. Host gather: one scattered extraction pass per output column ----
+  std::vector<VectorPtr> children(outputType_->size());
+  for (const auto& [outIdx, childIdx] : boundaryOutFromProbe_) {
+    auto col =
+        BaseVector::create(outputType_->childAt(outIdx), numMatches, pool());
+    boundaryProbeStore_->gather(
+        childIdx, boundaryProbeRowIds_, col, boundarySentinelScratch_);
+    children[outIdx] = std::move(col);
+  }
+  for (const auto& [outIdx, childIdx] : boundaryOutFromBuild_) {
+    auto col =
+        BaseVector::create(outputType_->childAt(outIdx), numMatches, pool());
+    bd.hostStore->gather(
+        childIdx, boundaryBuildRowIds_, col, boundarySentinelScratch_);
+    children[outIdx] = std::move(col);
+  }
+
+  // This batch's host payload is no longer needed (output copied out).
+  boundaryProbeStore_->clearBatches();
+  rowStoreInput->clearBoundaryPayload();
+
+  {
+    auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - tpGatherStart)
+                     .count();
+    addRuntimeStat(
+        "boundaryHostGatherNanos",
+        RuntimeCounter(nanos, RuntimeCounter::Unit::kNanos));
+  }
+
+  // skip_output parity with the other arms: they run the (GPU) gather and
+  // then drop the batch; boundary runs its (host) gather — the cost under
+  // study — and drops the assembled batch the same way.
+  if (CudfConfig::getInstance().benchmarkSkipOutput) {
+    std::vector<VectorPtr> dummy(outputType_->size());
+    for (int i = 0; i < outputType_->size(); i++) {
+      dummy[i] =
+          BaseVector::createNullConstant(outputType_->childAt(i), 1, pool());
+    }
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, 1, std::move(dummy));
+  }
+
+  // CPU RowVector out. Downstream CudfToVelox passes non-CudfVector inputs
+  // through untouched, so this needs no D2H conversion stage.
+  return std::make_shared<RowVector>(
+      pool(),
+      outputType_,
+      nullptr,
+      static_cast<vector_size_t>(numMatches),
+      std::move(children));
 }
 
 // ============================================================================

@@ -257,6 +257,54 @@ struct CudfConfig {
  private:
   std::unordered_set<std::string> fusedProbeJoinIds_;
   mutable std::mutex fusedProbeMutex_;
+
+ public:
+  /// [Benchmark] BOUNDARY-HYBRID mode (the paper's §3 single-join design):
+  /// ONLY the join-key columns cross the device boundary. CudfFromVelox packs
+  /// just the key columns (in join-key order) into the pinned row slot and
+  /// RETAINS each input batch's full payload host-side; RowHashJoinBuild keeps
+  /// a keys-only GPU row store plus a host-side payload store mapping global
+  /// build row id -> (batchId, rowInBatch); RowHashJoinProbe probes on the
+  /// GPU, reads back only the surviving (probe-local, build-global) id pairs,
+  /// and materializes the output RowVector on the CPU from the retained
+  /// batches. Requires benchmarkRowWiseGather + benchmarkCpuColToRow (the
+  /// keys-only pack rides the pinned-pack path) and applies only to the
+  /// non-fused RowHashJoinBuild/Probe pair (inner join, no filter,
+  /// fixed-width types, N:1 probe).
+  ///
+  /// NOTE deliberately declared AFTER the private members: this struct is
+  /// compiled into several libraries that the fast incremental rebuild
+  /// (rebuild_cudf_exec.sh) does not touch. Appending at the very end keeps
+  /// every pre-existing member at its old offset, so stale objects that only
+  /// touch old members remain layout-compatible. The singleton instance is
+  /// constructed in ToCudf.cpp, which IS rebuilt, so it has the new size.
+  bool benchmarkBoundaryHybrid{false};
+
+  /// [Benchmark] ROW-NATIVE MATCHER: replace cudf::hash_join as the single
+  /// join's match-finder with RowNativeHashTable (GpuRowHashTable.cuh) — a
+  /// chained N:M GPU multimap built directly over the build side's key row
+  /// store and probed with keys read straight from the probe row store. No
+  /// key extraction to columnar buffers on either side (the extract_keys
+  /// step does not run; keyBuffers/hashJoin are not built). Applies to BOTH
+  /// the standard GPU-resident RowHashJoinProbe (pair lists feed the row
+  /// gather) and the boundary-hybrid probe (pair lists feed the id D2H +
+  /// host gather). Requires benchmarkRowWiseGather; incompatible with
+  /// benchmarkFusedProbe (the fused path keeps its own N:1 table).
+  ///
+  /// NOTE appended at the very end for the same stale-object layout reason
+  /// as benchmarkBoundaryHybrid above.
+  bool benchmarkRowTable{false};
+
+  /// [Benchmark] COMPOSITE-KEY RANGE PACKING for the row-native matcher
+  /// (benchmarkRowTable): at table-build time, compute per-key min/max over
+  /// the build side and, when the combined bit-width fits 64 bits, pack the
+  /// K key columns into ONE uint64 word ((v_k - min_k) << shift_k, the
+  /// Eiger/GpuFusedProbe scheme). Hash, fingerprint, and verify then operate
+  /// on the single packed word; probe keys outside the build range are
+  /// rejected before hashing. No effect for single-key joins or when the
+  /// ranges do not fit. NOTE appended at the very end for the same
+  /// stale-object layout reason as benchmarkBoundaryHybrid above.
+  bool benchmarkRowTablePackKeys{true};
 };
 
 } // namespace facebook::velox::cudf_velox

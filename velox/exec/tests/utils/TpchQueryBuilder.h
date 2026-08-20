@@ -26,6 +26,7 @@ struct TpchPlan {
   core::PlanNodePtr plan;
   std::unordered_map<core::PlanNodeId, std::vector<std::string>> dataFiles;
   dwio::common::FileFormat dataFileFormat;
+  std::string planName;
 };
 
 /// Contains type information, data files, and file column names for a table.
@@ -125,6 +126,12 @@ class TpchQueryBuilder {
   TpchPlan getJoinLSPlan() const;     // Q29: lineitem ⋈ supplier
   TpchPlan getJoinOCPlan() const;     // Q30: orders ⋈ customer
 
+  // Hybrid single-operator benchmarks (synthetic tables R/S; see Bolt).
+  TpchPlan getQ31Plan() const;  // S JOIN R -> Sort (2-way, 16 output cols)
+  TpchPlan getQ40Plan() const;  // Configurable sort benchmark on lineitem (4 sort keys, 16 cols)
+  TpchPlan getQ41Plan() const;  // Wide-payload sort on the synthetic 'wide' table (up to 256 payload cols)
+  TpchPlan getQ43Plan() const;  // lineitem |><| orders join, build on orders (intro Fig 1 workload)
+
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
     return tableMetadata_.at(tableName).dataFiles;
@@ -157,6 +164,10 @@ class TpchQueryBuilder {
   static constexpr const char* kPart = "part";
   static constexpr const char* kSupplier = "supplier";
   static constexpr const char* kPartsupp = "partsupp";
+  static constexpr const char* kTableR = "R";
+  static constexpr const char* kTableS = "S";
+  // Wide-payload sort table: k1, k2 (sort keys) + c0..c255 (BIGINT payload).
+  static constexpr const char* kTableWide = "wide";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   const bool filtersAsNode_;

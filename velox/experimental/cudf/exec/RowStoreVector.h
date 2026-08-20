@@ -76,8 +76,20 @@ class RowStoreVector : public RowVector {
     store.num_rows = size();
     store.num_fields = hostFields_.size();
     store.fields = static_cast<const FieldDesc*>(fieldsBuffer_->data());
+    if (nullStride_ > 0) {
+      // Sidecar rides in the tail of rowBuffer_ (rows region, then
+      // num_rows * nullStride_ null bytes) -- one H2D covers both.
+      store.null_bytes = static_cast<const uint8_t*>(rowBuffer_.data()) +
+          static_cast<int64_t>(size()) * rowWidth_;
+      store.null_stride = nullStride_;
+    }
     return store;
   }
+
+  /// Null sidecar (bit set = NULL) present in the tail of the row buffer.
+  /// 0 = null-free store. See GpuFixedRowStore::null_bytes.
+  void setNullSidecar(int32_t nullStride) { nullStride_ = nullStride; }
+  int32_t nullStride() const { return nullStride_; }
 
   /// Access host-side field descriptors
   const std::vector<FieldDesc>& hostFields() const { return hostFields_; }
@@ -90,6 +102,36 @@ class RowStoreVector : public RowVector {
     return static_cast<const uint8_t*>(rowBuffer_.data());
   }
   int64_t gpuRowBytes() const { return static_cast<int64_t>(size()) * rowWidth_; }
+
+  // ---- Boundary-hybrid (keys-only) support -------------------------------
+  //
+  // When benchmarkBoundaryHybrid is on, CudfFromVelox packs ONLY the join-key
+  // columns into the GPU row buffer (hostFields_ then describes the keys-only
+  // layout, in JOIN-KEY order, not input-column order) and attaches the
+  // original host batches here. Their concatenation is row-for-row identical
+  // to the GPU rows: GPU row i of this vector is row (i - start[b]) of host
+  // batch b, where start[] are the prefix sums of the batch sizes. The
+  // consumer (RowHashJoinBuild/Probe) uses this identity to gather payload
+  // host-side for join survivors only — the payload bytes never cross PCIe.
+  //
+  // The batches hold LOADED, FLAT children (tryPinnedPack rejects anything
+  // else), so host-side extraction reads raw flat buffers.
+  void setBoundaryPayload(std::vector<RowVectorPtr> hostBatches) {
+    boundaryHostBatches_ = std::move(hostBatches);
+    boundaryKeysOnly_ = true;
+  }
+  bool boundaryKeysOnly() const {
+    return boundaryKeysOnly_;
+  }
+  const std::vector<RowVectorPtr>& boundaryHostBatches() const {
+    return boundaryHostBatches_;
+  }
+  /// Release the retained host batches (called by the consumer once the
+  /// batch's survivors have been materialized, so host memory is not held
+  /// for the lifetime of the vector).
+  void clearBoundaryPayload() {
+    boundaryHostBatches_.clear();
+  }
 
  private:
   /// Create null-constant children so the RowVector base is valid
@@ -104,6 +146,16 @@ class RowStoreVector : public RowVector {
     }
     return children;
   }
+
+  // Boundary-hybrid: host-retained payload batches (see setBoundaryPayload).
+  // Constructed only in TUs covered by the incremental rebuild
+  // (CudfConversion.cpp / RowHashJoin.cpp / CudfBatchConcat.cpp), so growing
+  // this class is safe for the partial-rebuild workflow.
+  std::vector<RowVectorPtr> boundaryHostBatches_;
+  bool boundaryKeysOnly_ = false;
+  // Null sidecar stride in bytes per row (0 = none). Appended per the
+  // partial-rebuild note above.
+  int32_t nullStride_ = 0;
 
   rmm::device_buffer rowBuffer_; // GPU row data
   // GPU FieldDesc array. Shared: all batches from one producer point at the

@@ -403,6 +403,27 @@ RowVectorPtr wrap(
       pool, rowType, nullptr, size, wrappedChildren);
 }
 
+RowVectorPtr wrapColumns(
+    const RowVector* input,
+    const std::vector<column_index_t>& channels,
+    const RowTypePtr& types,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(input);
+
+  std::vector<VectorPtr> children;
+  children.reserve(channels.size());
+  for (auto& channel : channels) {
+    children.push_back(input->childAt(channel));
+  }
+
+  // Preserve row-level nulls if present on the input RowVector; otherwise
+  // nullptr.
+  BufferPtr rowNulls = input->nulls();
+
+  return std::make_shared<RowVector>(
+      pool, types, rowNulls, input->size(), children);
+}
+
 void loadColumns(const RowVectorPtr& input, core::ExecCtx& execCtx) {
   LocalDecodedVector decodedHolder(execCtx);
   LocalSelectivityVector baseRowsHolder(&execCtx);

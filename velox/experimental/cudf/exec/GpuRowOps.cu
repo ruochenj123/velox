@@ -30,11 +30,34 @@ __global__ void extract_keys_kernel(
   const uint8_t* src = row_buffer + (int64_t)idx * row_width + key_offset;
   uint8_t* dst = d_out + (int64_t)idx * key_width;
 
-  // Use wide copy for common key widths
+  // Use wide copy for common key widths. The row pack is TIGHT (no field
+  // alignment — see CudfFromVelox's row-mode layout), so a key can sit at a
+  // misaligned offset (e.g. an 8-byte computed key after a 4-byte column);
+  // guard the wide loads exactly like copy_field does. dst is always
+  // naturally aligned (idx * key_width).
   if (key_width == 8) {
-    *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(src);
+    if ((reinterpret_cast<uintptr_t>(src) & 7) == 0) {
+      *reinterpret_cast<uint64_t*>(dst) =
+          *reinterpret_cast<const uint64_t*>(src);
+    } else if ((reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+      const uint32_t lo = *reinterpret_cast<const uint32_t*>(src);
+      const uint32_t hi = *reinterpret_cast<const uint32_t*>(src + 4);
+      *reinterpret_cast<uint64_t*>(dst) =
+          static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    } else {
+      for (int b = 0; b < 8; b++) {
+        dst[b] = src[b];
+      }
+    }
   } else if (key_width == 4) {
-    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
+    if ((reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+      *reinterpret_cast<uint32_t*>(dst) =
+          *reinterpret_cast<const uint32_t*>(src);
+    } else {
+      for (int b = 0; b < 4; b++) {
+        dst[b] = src[b];
+      }
+    }
   } else {
     for (int b = 0; b < key_width; b++) {
       dst[b] = src[b];
@@ -276,11 +299,16 @@ __global__ void selective_gather_concat_kernel(
     int32_t num_build_mappings,
     uint8_t* __restrict__ dst,
     int32_t output_row_width,
-    int32_t num_output) {
+    int32_t num_output,
+    // ---- null sidecar (2026-08-17): all nullable-path params optional ----
+    NullGatherArgs nulls) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= num_output) return;
 
   uint8_t* out_row = dst + (int64_t)idx * output_row_width;
+  uint8_t* out_nb = nulls.out_null_bytes == nullptr
+      ? nullptr
+      : nulls.out_null_bytes + (int64_t)idx * nulls.out_null_stride;
 
   // Gather selected probe fields
   {
@@ -292,6 +320,17 @@ __global__ void selective_gather_concat_kernel(
           src_row + probe_mappings[f].src_offset,
           out_row + probe_mappings[f].dst_offset,
           probe_mappings[f].byte_width);
+    }
+    if (out_nb != nullptr && nulls.probe_null_bytes != nullptr) {
+      const uint8_t* src_nb =
+          nulls.probe_null_bytes + (int64_t)src_row_idx * nulls.probe_null_stride;
+      for (int f = 0; f < num_probe_mappings; f++) {
+        const int32_t sf = nulls.probe_src_field[f];
+        if (src_nb[sf >> 3] & (1u << (sf & 7))) {
+          const int32_t df = nulls.probe_dst_field[f];
+          out_nb[df >> 3] |= (1u << (df & 7));
+        }
+      }
     }
   }
 
@@ -306,7 +345,58 @@ __global__ void selective_gather_concat_kernel(
           out_row + build_mappings[f].dst_offset,
           build_mappings[f].byte_width);
     }
+    if (out_nb != nullptr && nulls.build_null_bytes != nullptr) {
+      const uint8_t* src_nb =
+          nulls.build_null_bytes + (int64_t)src_row_idx * nulls.build_null_stride;
+      for (int f = 0; f < num_build_mappings; f++) {
+        const int32_t sf = nulls.build_src_field[f];
+        if (src_nb[sf >> 3] & (1u << (sf & 7))) {
+          const int32_t df = nulls.build_dst_field[f];
+          out_nb[df >> 3] |= (1u << (df & 7));
+        }
+      }
+    }
   }
+}
+
+// Sidecar -> Arrow-style validity mask for one output column: mask bit SET =
+// VALID = sidecar bit CLEAR. Word-per-thread; trailing bits of the last word
+// are left set (cudf ignores bits past num_rows).
+__global__ void sidecar_to_mask_kernel(
+    const uint8_t* __restrict__ null_bytes,
+    int32_t null_stride,
+    int32_t field_idx,
+    int32_t num_rows,
+    uint32_t* __restrict__ mask_words) {
+  int w = blockIdx.x * blockDim.x + threadIdx.x;
+  int num_words = (num_rows + 31) / 32;
+  if (w >= num_words) return;
+  uint32_t out = 0xffffffffu;
+  const int base = w * 32;
+  const int n = min(32, num_rows - base);
+  for (int i = 0; i < n; i++) {
+    const uint8_t nb = null_bytes[(int64_t)(base + i) * null_stride +
+                                  (field_idx >> 3)];
+    if (nb & (1u << (field_idx & 7))) {
+      out &= ~(1u << i);
+    }
+  }
+  mask_words[w] = out;
+}
+
+void sidecarToMask(
+    const uint8_t* d_null_bytes,
+    int32_t null_stride,
+    int32_t field_idx,
+    int32_t num_rows,
+    uint32_t* d_mask_words,
+    cudaStream_t stream) {
+  if (num_rows == 0) return;
+  int num_words = (num_rows + 31) / 32;
+  int block = 256;
+  int grid = (num_words + block - 1) / block;
+  sidecar_to_mask_kernel<<<grid, block, 0, stream>>>(
+      d_null_bytes, null_stride, field_idx, num_rows, d_mask_words);
 }
 
 void selectiveGatherAndConcat(
@@ -321,11 +411,28 @@ void selectiveGatherAndConcat(
     int32_t num_output,
     int32_t output_row_width,
     uint8_t* d_out_buffer,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const int32_t* d_probe_src_field,
+    const int32_t* d_probe_dst_field,
+    const int32_t* d_build_src_field,
+    const int32_t* d_build_dst_field,
+    uint8_t* d_out_null_bytes,
+    int32_t out_null_stride) {
   if (num_output == 0) return;
 
   int block = 256;
   int grid = (num_output + block - 1) / block;
+  NullGatherArgs nulls{};
+  nulls.probe_null_bytes = probeStore.null_bytes;
+  nulls.probe_null_stride = probeStore.null_stride;
+  nulls.build_null_bytes = buildStore.null_bytes;
+  nulls.build_null_stride = buildStore.null_stride;
+  nulls.probe_src_field = d_probe_src_field;
+  nulls.probe_dst_field = d_probe_dst_field;
+  nulls.build_src_field = d_build_src_field;
+  nulls.build_dst_field = d_build_dst_field;
+  nulls.out_null_bytes = d_out_null_bytes;
+  nulls.out_null_stride = out_null_stride;
   selective_gather_concat_kernel<<<grid, block, 0, stream>>>(
       d_probe_map,
       probeStore.row_buffer,
@@ -339,7 +446,8 @@ void selectiveGatherAndConcat(
       num_build_mappings,
       d_out_buffer,
       output_row_width,
-      num_output);
+      num_output,
+      nulls);
 }
 
 // ============================================================================

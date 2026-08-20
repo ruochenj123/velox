@@ -28,7 +28,9 @@ add_library(
   CudfOrderBy.cpp
   CudfTopN.cpp
   DebugUtil.cpp
+  GpuFusedProbe.cu
   GpuResources.cpp
+  GpuRowHashTable.cu
   GpuRowOps.cu
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp

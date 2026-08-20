@@ -37,4 +37,11 @@ struct GpuFixedRowStore {
   int32_t num_rows;
   int32_t num_fields;
   const FieldDesc* fields;      // [num_fields] on device
+  // Optional null sidecar (2026-08-17 null support): bit SET = NULL, so an
+  // absent/zeroed sidecar means all-valid. Addressing:
+  //   null_bytes[row * null_stride + (field >> 3)] & (1 << (field & 7)).
+  // Defaults keep every legacy construction site null-free. Appended at the
+  // struct end for partial-rebuild ABI safety (see REVIEW-GUIDE).
+  const uint8_t* null_bytes = nullptr;
+  int32_t null_stride = 0;
 };

@@ -26,21 +26,29 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
 #include "velox/experimental/cudf/exec/GpuFusedProbe.cuh"
+#include "velox/experimental/cudf/exec/GpuRowHashTable.cuh"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/JoinBridge.h"
 #include "velox/exec/Operator.h"
 
+#include "velox/experimental/cudf/exec/BoundaryHostStore.h"
+
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
+
+#include <cuda_runtime.h>
 
 #include <memory>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
+
+class RowStoreVector; // RowStoreVector.h (included by the .cpp)
 
 // ============================================================================
 // Bridge: extends CudfHashJoinBridge to also carry row-store data
@@ -98,6 +106,39 @@ class RowHashJoinBridge : public exec::JoinBridge {
     std::vector<int64_t> packMax;
     std::vector<int32_t> packShift;
     uint64_t packSentinel{0};
+
+    // ---- Boundary-hybrid (CudfConfig::benchmarkBoundaryHybrid) ----
+    // When set, the GPU row store above holds ONLY the join-key columns
+    // (keys-only layout, join-key order: field k == rightKeys[k]) and the
+    // build PAYLOAD never left the host: it lives in `hostStore`, batches
+    // added in the exact GPU-concatenation order, so the build row ids
+    // produced by `hashJoin` (global over the concatenated build) map to
+    // (batchId, rowInBatch) via hostStore->idForGlobalRow(). The probe
+    // gathers build payload host-side for survivors only.
+    bool boundaryHybrid{false};
+    std::shared_ptr<BoundaryHostStore> hostStore;
+
+    // ---- Row-native N:M matcher (CudfConfig::benchmarkRowTable) ----
+    // Chained multimap built directly over the key rows of gpuRowStore
+    // (keys-only store under boundary-hybrid; full row store otherwise —
+    // either way the keys are read row-native, never extracted to columns).
+    // When set, hashJoin/keyBuffers above are NOT built and the probe runs
+    // the two-pass count+refill probe from GpuRowHashTable.cuh instead of
+    // cudf::hash_join::inner_join.
+    bool hasRowTable{false};
+    RowNativeHashTable rowTable{}; // device ptrs into the buffers below
+    rmm::device_buffer rowTableHeads; // [capacity] int32
+    rmm::device_buffer rowTableNextFp; // [numRows] uint64
+    // [numRows] uint64 stored packed keys; non-empty iff rowTable.pack is
+    // enabled without exactFp (composite-key range packing, 2026-08-19).
+    rmm::device_buffer rowTablePackedKeys;
+
+    // ---- Null sidecar (2026-08-17 null support; appended for ABI) ----
+    // Concatenated per-row null bytes for the build store (bit set = NULL).
+    // Present (nullStride > 0) iff any input RowStoreVector carried one;
+    // batches without a sidecar contribute zeroed (all-valid) bytes.
+    rmm::device_buffer nullBuffer;
+    int32_t nullStride{0};
   };
 
   void setBuildData(std::shared_ptr<BuildData> data);
@@ -126,6 +167,12 @@ class RowHashJoinBuild : public CudfOperatorBase {
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
   bool isFinished() override;
 
+  /// Boundary-hybrid: CudfFromVelox asks the downstream join operator which
+  /// columns are join keys so it can pack ONLY those across the boundary.
+  const std::shared_ptr<const core::HashJoinNode>& joinNode() const {
+    return joinNode_;
+  }
+
  protected:
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
@@ -152,12 +199,55 @@ class RowHashJoinProbe : public CudfOperatorBase {
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
   bool isFinished() override;
 
+  /// Boundary-hybrid: CudfFromVelox asks the downstream join operator which
+  /// columns are join keys so it can pack ONLY those across the boundary.
+  const std::shared_ptr<const core::HashJoinNode>& joinNode() const {
+    return joinNode_;
+  }
+
  protected:
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doNoMoreInput() override;
 
  private:
+  // ---- Boundary-hybrid (CudfConfig::benchmarkBoundaryHybrid) ----
+
+  // Grow-on-demand pinned host staging for the survivor-id readback (the D2H
+  // of the two int32 id arrays). Pinned so the copy is a true async DMA
+  // followed by one stream sync, not a pageable staging crawl.
+  struct PinnedIdBuffer {
+    int32_t* data = nullptr;
+    int64_t capacity = 0; // elements
+    void ensure(int64_t n);
+    ~PinnedIdBuffer();
+  };
+
+  // The entire boundary-hybrid probe path: extract keys from the keys-only
+  // row store, GPU probe, read back survivor (probe-local, build-global) id
+  // pairs, gather payload host-side from the retained batches, emit a CPU
+  // RowVector. Returns the output vector (or nullptr for zero matches).
+  RowVectorPtr boundaryProbe(
+      const std::shared_ptr<RowStoreVector>& rowStoreInput,
+      rmm::cuda_stream_view stream);
+
+  // Per-batch host retention of the CURRENT probe batch's payload (cleared
+  // after each batch; probe survivor ids are batch-local).
+  std::unique_ptr<BoundaryHostStore> boundaryProbeStore_;
+  PinnedIdBuffer boundaryProbeIds_; // survivors: probe row within batch
+  PinnedIdBuffer boundaryBuildIds_; // survivors: global build row id
+  // Output column -> source mapping (computed once): (output idx, child idx
+  // in the probe/build input row type).
+  bool boundaryLayoutReady_ = false;
+  std::vector<std::pair<int32_t, int32_t>> boundaryOutFromProbe_;
+  std::vector<std::pair<int32_t, int32_t>> boundaryOutFromBuild_;
+  // Reused scratch: scattered ids for the two gathers, plus the non-null
+  // sentinel `rows` array HybridContainer's extraction API requires
+  // (per-driver so the SHARED build-side store stays immutable in gather).
+  std::vector<exec::HybridRowId> boundaryProbeRowIds_;
+  std::vector<exec::HybridRowId> boundaryBuildRowIds_;
+  std::vector<const char*> boundarySentinelScratch_;
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 
@@ -189,6 +279,19 @@ class RowHashJoinProbe : public CudfOperatorBase {
   rmm::device_buffer outputFieldsBuffer_;          // FieldDesc[] on GPU for output
   bool outputLayoutComputed_ = false;
 
+  // ---- Null sidecar plumbing (2026-08-17; appended for ABI) ----
+  // Per-mapping source/destination FIELD indices (device int32 arrays,
+  // parallel to the FieldMapping buffers) so the gather can copy sidecar
+  // bits, which are addressed by field index rather than byte offset.
+  rmm::device_buffer probeGatherSrcFieldBuffer_;
+  rmm::device_buffer probeGatherDstFieldBuffer_;
+  rmm::device_buffer buildGatherSrcFieldBuffer_;
+  rmm::device_buffer buildGatherDstFieldBuffer_;
+  // Output null sidecar for the current batch (rows = numMatches) and the
+  // output stride; allocated only when an input store carries nulls.
+  rmm::device_buffer outputNullBuffer_;
+  int32_t outputNullStride_ = 0;
+
   // Pre-allocated device buffers (reused per batch)
   rmm::device_buffer probeRowBuffer_;      // probe rows on GPU
   rmm::device_buffer probeFieldsBuffer_;   // FieldDesc on GPU
@@ -199,6 +302,28 @@ class RowHashJoinProbe : public CudfOperatorBase {
   int64_t probeKeyCapacity_ = 0;
   int64_t gatherCapacity_ = 0;
   bool fieldsUploaded_ = false;
+
+  // ---- Row-native matcher scratch (CudfConfig::benchmarkRowTable) ----
+  // Reused across batches: per-probe-row match counts, scanned offsets, cub
+  // scan temp storage, and the device total. Grown on demand.
+  rmm::device_buffer rowTableCounts_; // [probeRows] int32
+  rmm::device_buffer rowTableOffsets_; // [probeRows] int32
+  rmm::device_buffer rowTableScanTemp_; // cub temp
+  rmm::device_buffer rowTableTotal_; // 1 int32
+  int64_t rowTableProbeCapacity_ = 0;
+  size_t rowTableScanTempBytes_ = 0;
+
+  // Runs the row-native two-pass probe (count + scan + refill) for the
+  // current batch: returns numMatches and fills left/right id vectors
+  // (probe-local, build-global row ids — same contract as
+  // cudf::hash_join::inner_join). Syncs `stream` once to read the total.
+  int32_t rowTableProbe(
+      const GpuFixedRowStore& probeStore,
+      const RowKeyLayout& probeKeys,
+      int32_t probeRows,
+      rmm::cuda_stream_view stream,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>& leftIndices,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>& rightIndices);
 
   bool initialized_ = false;
   bool finished_ = false;

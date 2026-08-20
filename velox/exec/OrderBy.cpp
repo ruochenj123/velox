@@ -68,7 +68,10 @@ OrderBy::OrderBy(
       &nonReclaimableSection_,
       driverCtx->prefixSortConfig(),
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
-      spillStats_.get());
+      spillStats_.get(),
+      driverCtx->queryConfig().hybridSortEnabled(),
+      driverCtx->queryConfig().hybridSortScatteredEnabled(),
+      driverCtx->queryConfig().hybridSortMinPayloadBytes());
 }
 
 void OrderBy::addInput(RowVectorPtr input) {

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <string_view>
+#include <thread>
 
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/HashTable.h"
@@ -406,6 +407,33 @@ class HashBuild final : public Operator {
   // Count the number of hash table input rows for building deduped
   // hash table. It will not be updated after abandonBuildNoDupHash_ is true.
   int64_t numHashInputRows_ = 0;
+
+  // For hybrid join: store only join keys row-wise in the hash table's
+  // RowContainer; payload (dependent) columns stay columnar in the
+  // HashTable's HybridContainer, referenced by an encoded 64-bit rowId
+  // stored as the single dependent column.
+  bool hybridJoin_{false};
+  // Use scattered (non-coalesced) payload batches; rowIds then encode
+  // (batchId, rowInBatch) instead of a global row index.
+  bool scatteredModeEnabled_{false};
+  int driverId_;
+
+ public:
+  // Joins this driver's background payload-coalesce thread (no-op if none).
+  // Called by the last build driver on itself and on all peers after the
+  // join table is built, and defensively from close().
+  void joinHybridCoalesceThread();
+
+ private:
+  // Background thread coalescing this driver's HybridContainer payload
+  // batches, overlapped with the last driver's remaining input processing
+  // and with the hash table build. Joined before the probe handoff.
+  std::thread hybridCoalesceThread_;
+  std::exception_ptr hybridCoalesceError_;
+  // ROW type of the dependent (payload) columns, 1:1 with
+  // 'dependentChannels_'. Used to wrap payload columns for the
+  // HybridContainer.
+  RowTypePtr dependentTypes_;
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

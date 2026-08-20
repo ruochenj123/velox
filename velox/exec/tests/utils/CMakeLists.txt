@@ -29,6 +29,7 @@ add_library(
   TableScanTestBase.cpp
   TestIndexStorageConnector.cpp
   TpchQueryBuilder.cpp
+  TpcdsQueryBuilder.cpp
   VectorTestUtil.cpp
   PortUtil.cpp
   SerializedPageUtil.cpp
@@ -56,6 +57,7 @@ velox_add_test_headers(
   TableWriterTestBase.h
   TestIndexStorageConnector.h
   TpchQueryBuilder.h
+  TpcdsQueryBuilder.h
   VectorTestUtil.h
 )
 
