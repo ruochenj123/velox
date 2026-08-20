@@ -335,3 +335,7 @@ pixi.lock
 nohup.out
 exp/vldb-benchmark/results/*.txt
 exp/vldb-benchmark/logs/*.log
+
+# stray in-source objs from rebuild_cudf_exec.sh
+velox/experimental/cudf/exec/CMakeFiles/
+.clangd

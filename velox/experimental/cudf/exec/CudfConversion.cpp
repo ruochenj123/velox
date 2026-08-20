@@ -43,6 +43,7 @@
 
 #include <mutex>
 
+#include <algorithm>
 #include <chrono>
 
 // Local CUDA error check for the row-ingest path (cudf's CUDF_CUDA_TRY is not
@@ -436,7 +437,6 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       // CudfBatchConcat handles RowStoreVector too (concatRowStore).
       if (dynamic_cast<RowHashJoinProbe*>(next) != nullptr ||
           dynamic_cast<RowHashJoinBuild*>(next) != nullptr ||
-          dynamic_cast<FusedRowHashJoinProbe*>(next) != nullptr ||
           dynamic_cast<CudfBatchConcat*>(next) != nullptr) {
         emitRowStore_ = 1;
       }
@@ -447,20 +447,22 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     // attached to the emitted RowStoreVector. Probe side packs leftKeys,
     // build side packs rightKeys — both in JOIN-KEY order, so probe key k
     // and build key k line up field-for-field in the keys-only row layout.
-    // FusedRowHashJoinProbe is deliberately NOT supported (boundary-hybrid
-    // is the single-join §3 design; the fused chain has its own path).
+    // Key names are captured for ANY adjacent row-join op: boundary mode
+    // packs exactly these; the row pack's null-KEY guard checks exactly
+    // these (null join keys are unrepresentable in the row matcher).
     boundaryMode_ = 0;
-    if (CudfConfig::getInstance().benchmarkBoundaryHybrid && rowWiseMode &&
-        next != nullptr) {
+    if (rowWiseMode && next != nullptr) {
       if (auto* probe = dynamic_cast<RowHashJoinProbe*>(next)) {
         for (const auto& key : probe->joinNode()->leftKeys()) {
           boundaryKeyNames_.push_back(key->name());
         }
-        boundaryMode_ = 1;
       } else if (auto* build = dynamic_cast<RowHashJoinBuild*>(next)) {
         for (const auto& key : build->joinNode()->rightKeys()) {
           boundaryKeyNames_.push_back(key->name());
         }
+      }
+      if (!boundaryKeyNames_.empty() &&
+          CudfConfig::getInstance().benchmarkBoundaryHybrid) {
         boundaryMode_ = 1;
       }
     }
@@ -477,8 +479,7 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     } else {
       pinnedPackSyncMode_ =
           (next != nullptr &&
-           (dynamic_cast<RowHashJoinProbe*>(next) != nullptr ||
-            dynamic_cast<FusedRowHashJoinProbe*>(next) != nullptr))
+           dynamic_cast<RowHashJoinProbe*>(next) != nullptr)
           ? 1
           : 0;
     }
@@ -617,8 +618,11 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   // ---- Load children; require flat, null-free, materialized ----
   // Loading a lazy child materializes the scan column -- work the merge path
   // did anyway. keepAlive pins loaded vectors for the duration of the pack.
-  std::vector<VectorPtr> keepAlive;
-  keepAlive.reserve(selectedInputs.size() * numCols);
+  // POSITIONALLY INDEXED [b * numCols + c]: the boundary host-retention
+  // block below rebuilds each batch from these slots, so every (b, c) must
+  // land at its own index (a dense push_back breaks the moment any channel
+  // is skipped).
+  std::vector<VectorPtr> keepAlive(selectedInputs.size() * numCols);
   std::vector<const uint8_t*> srcs(selectedInputs.size() * numCols);
   // Null sidecar (2026-08-17): nullable FLAT children are packable in row
   // mode -- their validity rides in a per-row sidecar appended after the row
@@ -627,18 +631,70 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       selectedInputs.size() * numCols, nullptr);
   bool anyNulls = false;
   const bool allowNulls = rowMode && !boundary;
+  // Resolve join-key channels once (names came from the adjacent join op).
+  if (!keyChannelsResolved_ && rowMode) {
+    for (const auto& name : boundaryKeyNames_) {
+      auto idx = inRowType->getChildIdxIfExists(name);
+      if (idx.has_value()) {
+        keyChannels_.push_back(static_cast<int32_t>(idx.value()));
+      }
+    }
+    keyChannelsResolved_ = true;
+  }
+  auto isKeyChannel = [&](int c) {
+    return std::find(keyChannels_.begin(), keyChannels_.end(), c) !=
+        keyChannels_.end();
+  };
   for (size_t b = 0; b < selectedInputs.size(); b++) {
     for (int c = 0; c < numCols; c++) {
+      // Boundary mode reads srcs[] only at the key channels; payload
+      // channels are retained host-side as whole batches, and
+      // BoundaryHostStore/HybridContainer::addPayload handles their
+      // loading, flattening, and nulls natively. No constraints here.
+      if (boundary && !isKeyChannel(c)) {
+        // Payload channel: LOAD it (host-side extraction needs loaded
+        // children) but impose no flat/null constraints — BoundaryHostStore/
+        // HybridContainer::addPayload decodes and flattens natively.
+        keepAlive[b * numCols + c] =
+            BaseVector::loadedVectorShared(selectedInputs[b]->childAt(c));
+        continue;
+      }
       auto child =
           BaseVector::loadedVectorShared(selectedInputs[b]->childAt(c));
-      if (child != nullptr && allowNulls && child->mayHaveNulls() &&
+      // Null JOIN KEYS are unrepresentable in the row matcher (it hashes
+      // raw key bytes; NULL must never match). Fail loudly rather than
+      // silently joining on residual bytes. Applies to both boundary
+      // (keys-only) and full-row packs.
+      if (child != nullptr && isKeyChannel(c) && child->mayHaveNulls() &&
+          child->rawNulls() != nullptr) {
+        VELOX_CHECK_EQ(
+            BaseVector::countNulls(child->nulls(), child->size()),
+            0,
+            "row pack: join key column '{}' (channel {}) contains NULLs; "
+            "null join keys are not supported by the row-wise join path",
+            inRowType->nameOf(c),
+            c);
+      }
+      // Key channel that passed the null guard (zero actual nulls): accept
+      // directly even if the nulls buffer exists, so a mayHaveNulls-flagged
+      // but clean key does not force a per-batch fallback.
+      if (child != nullptr && isKeyChannel(c) &&
+          child->encoding() == VectorEncoding::Simple::FLAT &&
+          child->valuesAsVoid() != nullptr) {
+        srcs[b * numCols + c] =
+            static_cast<const uint8_t*>(child->valuesAsVoid());
+        keepAlive[b * numCols + c] = std::move(child);
+        continue;
+      }
+      if (child != nullptr && allowNulls && !isKeyChannel(c) &&
+          child->mayHaveNulls() &&
           child->encoding() == VectorEncoding::Simple::FLAT &&
           child->valuesAsVoid() != nullptr) {
         rawNullsPtrs[b * numCols + c] = child->rawNulls();
         anyNulls = anyNulls || child->rawNulls() != nullptr;
         srcs[b * numCols + c] =
             static_cast<const uint8_t*>(child->valuesAsVoid());
-        keepAlive.push_back(std::move(child));
+        keepAlive[b * numCols + c] = std::move(child);
         continue;
       }
       if (child == nullptr ||
@@ -646,18 +702,18 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
           child->mayHaveNulls() || child->valuesAsVoid() == nullptr) {
         // Boundary mode cannot fall back per-batch: the downstream probe/
         // build requires EVERY batch in keys-only layout with host payload
-        // attached; a silent full-width batch would corrupt results.
+        // attached; a silent full-width batch would corrupt results. (Only
+        // KEY channels reach this check under boundary.)
         VELOX_CHECK(
             !boundary,
-            "boundary-hybrid: probe/build input batch has a non-flat or "
-            "nullable column (col {}), which the keys-only pinned pack "
-            "cannot handle",
+            "boundary-hybrid: join key column {} is non-flat or nullable; "
+            "the keys-only pinned pack cannot handle it",
             c);
         return nullptr; // per-batch fallback; schema itself may be fine
       }
       srcs[b * numCols + c] =
           static_cast<const uint8_t*>(child->valuesAsVoid());
-      keepAlive.push_back(std::move(child));
+      keepAlive[b * numCols + c] = std::move(child);
     }
   }
 

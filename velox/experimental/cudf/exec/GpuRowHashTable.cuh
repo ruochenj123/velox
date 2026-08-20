@@ -8,7 +8,7 @@
  * itself reads row-format keys — no key extraction to columnar buffers on
  * either side.
  *
- * This de-chains the fused-probe row-table design (GpuFusedProbe.cuh) into a
+ * This de-chains the fused-probe row-table design (now exec/attic/GpuFusedProbe.cuh) into a
  * general single-join matcher:
  *   - the fused GpuHashTable is single-match (open addressing, one build row
  *     per key -> N:1 only) and entangled with chain walking / accumulators;

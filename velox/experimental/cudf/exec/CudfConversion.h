@@ -163,6 +163,12 @@ class CudfFromVelox : public CudfOperatorBase {
   // Input child index of each packed key, in join-key order (parallel to the
   // keys-only rowFields_ layout).
   std::vector<int32_t> boundaryPackChannels_;
+  // Join-key CHANNEL indices in the input row type, resolved lazily on the
+  // first packed batch from boundaryKeyNames_ (which is filled for ANY
+  // adjacent row-join op, not just boundary mode). Used by the null-KEY
+  // guard: null join keys are unrepresentable in the row matcher.
+  std::vector<int32_t> keyChannels_;
+  bool keyChannelsResolved_{false};
 
   // ONE stream for every RowStoreVector this operator produces.
   //
