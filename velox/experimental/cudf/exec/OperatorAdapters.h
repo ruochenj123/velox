@@ -117,6 +117,17 @@ class OperatorAdapterRegistry {
   /// to the adapter, or nullptr if none found.
   const OperatorAdapter* findAdapter(const exec::Operator* op) const;
 
+  /// Priority lookup: the first adapter that can handle `op` AND can run it
+  /// on the GPU for this plan node; if none can, the first that can handle
+  /// it (so the caller still sees a "not GPU-runnable" property set). Lets
+  /// the row-wise join adapters sit in front of the columnar cudf ones and
+  /// hand unsupported join types (semi/anti/filtered) to cudf instead of
+  /// the CPU (2026-08-21).
+  const OperatorAdapter* findRunnableAdapter(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const;
+
   /// Get all registered adapters.
   const std::vector<std::unique_ptr<OperatorAdapter>>& getAdapters() const;
 

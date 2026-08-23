@@ -63,7 +63,49 @@ DEFINE_int32(
     50,
     "Percentage of GPU memory to allocate for cudf operators.");
 
-DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
+// Hybrid-layout fork: scans stay on the CPU by default (the CPU does
+// data-reductive work; only key-centric operators run on the GPU).
+DEFINE_bool(velox_cudf_table_scan, false, "Enable cuDF table scan");
+
+// ---- Hybrid-layout / whole-query-deferral arms (see DESIGN-whole-query-
+// deferral.md). Mirrors VeloxCudfJoinBench's flag -> CudfConfig mapping so
+// query-level runs and the single-join bench share one vocabulary. ----
+DEFINE_bool(gpu, true,
+    "Register the cuDF operator replacements. false = pure CPU Velox in the "
+    "SAME binary (same scan path), the apples-to-apples baseline.");
+DEFINE_bool(row_wise, false,
+    "Row-wise GPU joins (RowHashJoinBuild/Probe over fixed-stride row "
+    "stores) instead of the columnar cudf::hash_join operators.");
+DEFINE_bool(cpu_col_to_row, false,
+    "With --row_wise: CPU-side pinned pack into row stores (no GPU "
+    "transpose).");
+DEFINE_bool(boundary_hybrid, false,
+    "Boundary-hybrid: only join keys cross the boundary; payloads stay "
+    "host-resident and are gathered for survivors. Implies --row_wise "
+    "--cpu_col_to_row.");
+DEFINE_bool(row_table, false,
+    "Row-native chained matcher (RowNativeHashTable) instead of "
+    "cudf::hash_join inside the row-wise join operators.");
+DEFINE_bool(row_table_pack_keys, true,
+    "With --row_table: composite-key range packing when the ranges fit.");
+DEFINE_bool(keep_project_on_cpu, true,
+    "Keep FilterProject nodes on the CPU (elementwise projections such as "
+    "revenue = price*(1-discount) are computed before the boundary).");
+DEFINE_int32(concat_agg_rows, 0,
+    "With --concat_agg: explicit concat target rows (0 = use "
+    "cudf_gpu_batch_size_rows).");
+DEFINE_bool(concat_agg, false,
+    "Insert CudfBatchConcat before every CudfHashAggregation (upstream "
+    "concatOptimizationEnabled): re-batch small inputs to the GPU agg.");
+DEFINE_bool(concat_join, false,
+    "Columnar arm: insert CudfBatchConcat before each probe (GPU re-batch "
+    "to cudf_gpu_batch_size_rows).");
+DEFINE_bool(log_gather_time, false,
+    "Emit matcher/gather/boundary phase timings as operator stats.");
+DEFINE_int32(batch_size, 0,
+    "Engine output batch rows (preferred/max); 0 = Velox default (1024).");
+DEFINE_string(pinned_pack_sync, "auto",
+    "velox.cudf.pinned_pack_sync for the row-wise pack (auto|sync|async).");
 
 DEFINE_bool(cudf_debug_enabled, false, "Enable debug printing");
 
@@ -105,12 +147,54 @@ void CudfTpchBenchmark::initialize() {
       FLAGS_cudf_memory_percent;
 
   cudf_velox::CudfConfig::getInstance().debugEnabled = FLAGS_cudf_debug_enabled;
+
+  // ---- Hybrid-layout arms ----
+  auto& cfg = cudf_velox::CudfConfig::getInstance();
+  if (FLAGS_boundary_hybrid) {
+    FLAGS_row_wise = true;
+    FLAGS_cpu_col_to_row = true;
+  }
+  cfg.benchmarkRowWiseGather = FLAGS_row_wise;
+  cfg.benchmarkCpuColToRow = FLAGS_cpu_col_to_row;
+  cfg.benchmarkBoundaryHybrid = FLAGS_boundary_hybrid;
+  cfg.benchmarkRowTable = FLAGS_row_table;
+  cfg.benchmarkRowTablePackKeys = FLAGS_row_table_pack_keys;
+  cfg.benchmarkKeepProjectOnCpu = FLAGS_keep_project_on_cpu;
+  cfg.benchmarkLogGatherTime = FLAGS_log_gather_time;
+  cfg.benchmarkConcatBeforeJoin = FLAGS_concat_join;
+  cfg.concatOptimizationEnabled = FLAGS_concat_agg;
+  if (FLAGS_concat_agg) {
+    // Concat target: explicit --concat_agg_rows, else aligned with the GPU
+    // batch size (the default 100K would re-batch to SMALLER than the
+    // conversion already produces).
+    cfg.batchSizeMinThreshold = FLAGS_concat_agg_rows > 0
+        ? FLAGS_concat_agg_rows
+        : FLAGS_cudf_gpu_batch_size_rows;
+  }
+  if (FLAGS_concat_join) {
+    cfg.batchSizeMinThreshold = FLAGS_cudf_gpu_batch_size_rows;
+  }
+  // Scans/filters/projects stay on the CPU; the per-operator fallback is
+  // what lets the plan mix CPU and GPU operators.
+  cfg.allowCpuFallback = true;
+
   // Enable cuDF operators
-  cudf_velox::registerCudf();
+  if (FLAGS_gpu) {
+    cudf_velox::registerCudf();
+  }
 
   // Add custom configs
   queryConfigs_[facebook::velox::cudf_velox::CudfFromVelox::kGpuBatchSizeRows] =
       std::to_string(FLAGS_cudf_gpu_batch_size_rows);
+  queryConfigs_[facebook::velox::cudf_velox::CudfFromVelox::kPinnedPackSync] =
+      FLAGS_pinned_pack_sync;
+  if (FLAGS_batch_size > 0) {
+    const auto bs = std::to_string(FLAGS_batch_size);
+    queryConfigs_["preferred_output_batch_rows"] = bs;
+    queryConfigs_["max_output_batch_rows"] = bs;
+    queryConfigs_["preferred_output_batch_bytes"] =
+        std::to_string(1ULL << 30);
+  }
 }
 
 std::shared_ptr<config::ConfigBase>
@@ -154,7 +238,9 @@ CudfTpchBenchmark::listSplits(
 }
 
 void CudfTpchBenchmark::shutdown() {
-  cudf_velox::unregisterCudf();
+  if (FLAGS_gpu) {
+    cudf_velox::unregisterCudf();
+  }
   TpchBenchmark::shutdown();
 }
 

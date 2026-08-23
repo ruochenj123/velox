@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/GpuRowOps.cuh"
+#include "velox/experimental/cudf/exec/RowStoreVector.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -94,9 +96,26 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
     totalRows += v->size();
   }
 
-  rmm::device_buffer merged(
-      static_cast<int64_t>(totalRows) * rowWidth, stream);
+  // Null sidecar: if ANY input carries one, the merged store carries one
+  // (inputs without contribute zeroed = all-valid bytes). Strings (pointer
+  // slots, 2026-08-23): slots stay valid across the copy; the merged store
+  // just retains the inputs whose buffers they reference.
+  int32_t nullStride = 0;
+  bool anyStringRefs = false;
+  for (const auto& v : rowBuffer_) {
+    if (v->nullStride() > 0) {
+      VELOX_CHECK(
+          nullStride == 0 || nullStride == v->nullStride(),
+          "CudfBatchConcat: row store null strides disagree");
+      nullStride = v->nullStride();
+    }
+    anyStringRefs = anyStringRefs || v->hasStringRefs();
+  }
+  const int64_t rowBytes = static_cast<int64_t>(totalRows) * rowWidth;
+  const int64_t nullBytes = static_cast<int64_t>(totalRows) * nullStride;
+  rmm::device_buffer merged(rowBytes + nullBytes, stream);
   auto* dst = static_cast<uint8_t*>(merged.data());
+  auto* nullDst = dst + rowBytes;
   for (const auto& v : rowBuffer_) {
     const int64_t bytes = v->gpuRowBytes();
     if (bytes > 0) {
@@ -104,18 +123,41 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
           dst, v->gpuRowData(), bytes, cudaMemcpyDeviceToDevice, stream.value());
       dst += bytes;
     }
+    if (nullStride > 0 && v->size() > 0) {
+      const int64_t nb = static_cast<int64_t>(v->size()) * nullStride;
+      if (v->nullStride() > 0) {
+        cudaMemcpyAsync(
+            nullDst, v->gpuRowData() + v->gpuRowBytes(), nb,
+            cudaMemcpyDeviceToDevice, stream.value());
+      } else {
+        cudaMemsetAsync(nullDst, 0, nb, stream.value());
+      }
+      nullDst += nb;
+    }
   }
 
   rmm::device_buffer fieldsBuf(
       fields.data(), fields.size() * sizeof(FieldDesc), stream);
   auto fieldsHost = fields;
 
+  // Collect keep-alives BEFORE releasing the inputs.
+  std::vector<std::shared_ptr<void>> keepAlive;
+  if (anyStringRefs) {
+    for (const auto& v : rowBuffer_) {
+      if (v->hasStringRefs()) {
+        keepAlive.push_back(v);
+        for (const auto& o : v->stringKeepAlive()) {
+          keepAlive.push_back(o);
+        }
+      }
+    }
+  }
   rowBuffer_.clear();
   currentNumRows_ = 0;
 
   // Stream-ordered: the sources stay alive until their copies complete because
   // rmm frees on the same stream, so no synchronize is needed here.
-  return std::make_shared<RowStoreVector>(
+  auto out = std::make_shared<RowStoreVector>(
       pool(),
       outputType_,
       totalRows,
@@ -124,6 +166,13 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
       std::move(fieldsHost),
       rowWidth,
       stream);
+  if (nullStride > 0) {
+    out->setNullSidecar(nullStride);
+  }
+  if (anyStringRefs) {
+    out->addStringKeepAlives(keepAlive);
+  }
+  return out;
 }
 
 RowVectorPtr CudfBatchConcat::doGetOutput() {

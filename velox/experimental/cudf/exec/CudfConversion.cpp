@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/DedicatedStream.h"
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
@@ -34,6 +35,7 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <cudf/column/column.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -282,6 +284,10 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
       if (cudf::is_fixed_width(col.type())) {
         toCudfBytes +=
             static_cast<int64_t>(col.size()) * cudf::size_of(col.type());
+      } else if (col.type().id() == cudf::type_id::STRING) {
+        cudf::strings_column_view scv(col);
+        toCudfBytes += scv.chars_size(stream) +
+            static_cast<int64_t>(col.size() + 1) * sizeof(int32_t);
       }
     }
     addRuntimeStat(
@@ -308,8 +314,14 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
     auto tblView = tbl->view();
     for (int c = 0; c < tblView.num_columns(); c++) {
       auto const& col = tblView.column(c);
-      h2dBytes += static_cast<int64_t>(col.size()) *
-                  cudf::size_of(col.type());
+      if (cudf::is_fixed_width(col.type())) {
+        h2dBytes += static_cast<int64_t>(col.size()) *
+                    cudf::size_of(col.type());
+      } else if (col.type().id() == cudf::type_id::STRING) {
+        cudf::strings_column_view scv(col);
+        h2dBytes += scv.chars_size(stream) +
+            static_cast<int64_t>(col.size() + 1) * sizeof(int32_t);
+      }
     }
     addRuntimeStat(
         "h2dBytes",
@@ -389,23 +401,27 @@ class PinnedPackSlotPool {
 };
 } // namespace
 
-// ===== Fused pinned-pack conversion (the reworked cpu_col_to_row) =========
-//
-// The July version packed the ALREADY-MERGED vector (merge pass + pack pass)
-// with a column-major strided-write loop over the full GPU batch, and lost to
-// the from_arrow path it was meant to replace. The toCudf breakdown + nsys
-// trace (exp/2026-07-13-concat-vs-row/results/tocudf_split) showed the target
-// is beatable: ~96% of from_arrow's cost is the driver's SYNCHRONOUS pageable-
-// staging copy plus per-column machinery; actual DMA is ~4%. This version:
-//   - packs the selected inputs DIRECTLY into the pinned slot, fusing the
-//     mergeRowVectors pass away (one CPU pass over the bytes, total);
-//   - packs per ~10K-row scan batch, so the destination tile stays
-//     L2-resident even with the column-at-a-time inner loop;
-//   - row_wise=true  -> ROW-major layout -> RowStoreVector (no GPU transpose);
-//     row_wise=false -> COL-major layout -> cudf columns built from per-column
-//     pinned-source copies (no from_arrow, no null-mask memsets);
-//   - every cudaMemcpyAsync has a PINNED source: microsecond enqueue, DMA
-//     overlaps the next batch's pack via the ping-ponged slots.
+// Grow a pinned slot to at least `bytes`. cudaFreeHost/cudaHostAlloc
+// serialize the CUDA driver process-wide; slots are pooled and retained
+// across queries, so this is a first-query (warm-up) cost only.
+void CudfFromVelox::ensurePinnedSlotCapacity(
+    PinnedPackSlot& slot,
+    int64_t bytes) {
+  if (slot.capacity >= bytes) {
+    return;
+  }
+  if (slot.host != nullptr) {
+    VELOX_CUDA_CHECK(cudaFreeHost(slot.host));
+  }
+  slot.capacity = std::max<int64_t>(bytes, slot.capacity * 2);
+  VELOX_CUDA_CHECK(cudaHostAlloc(
+      reinterpret_cast<void**>(&slot.host),
+      slot.capacity,
+      cudaHostAllocDefault));
+  // Zero once so row-mode inter-field padding is deterministic.
+  std::memset(slot.host, 0, slot.capacity);
+}
+
 RowVectorPtr CudfFromVelox::tryPinnedPack(
     const std::vector<RowVectorPtr>& selectedInputs,
     vector_size_t totalRows) {
@@ -434,10 +450,25 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       }
     }
     if (rowWiseMode && next != nullptr) {
-      // CudfBatchConcat handles RowStoreVector too (concatRowStore).
+      // CudfBatchConcat handles RowStoreVector too (concatRowStore), but
+      // only counts as a row consumer when the operator AFTER it is a row
+      // join -- a concat feeding a columnar operator (e.g. the agg-rebatch
+      // concat, --concat_agg) must receive CudfVector.
+      exec::Operator* afterNext = nullptr;
+      if (auto* driver = operatorCtx_->driver()) {
+        const auto ops = driver->operators();
+        for (size_t i = 0; i + 2 < ops.size(); i++) {
+          if (ops[i] == this) {
+            afterNext = ops[i + 2];
+            break;
+          }
+        }
+      }
       if (dynamic_cast<RowHashJoinProbe*>(next) != nullptr ||
           dynamic_cast<RowHashJoinBuild*>(next) != nullptr ||
-          dynamic_cast<CudfBatchConcat*>(next) != nullptr) {
+          (dynamic_cast<CudfBatchConcat*>(next) != nullptr &&
+           (dynamic_cast<RowHashJoinProbe*>(afterNext) != nullptr ||
+            dynamic_cast<RowHashJoinBuild*>(afterNext) != nullptr))) {
         emitRowStore_ = 1;
       }
     }
@@ -587,6 +618,17 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         case TypeKind::DOUBLE:
           fd.byte_width = 8;
           break;
+        case TypeKind::VARCHAR:
+        case TypeKind::VARBINARY:
+          // Out-of-line strings (2026-08-21): 16B slot, row mode only; the
+          // col-major pinned path has no heap and keeps falling back.
+          if (!rowMode) {
+            pinnedPackState_ = -1;
+            return nullptr;
+          }
+          fd.byte_width = kRowStrSlotBytes;
+          fd.kind = kFieldString;
+          break;
         default:
           pinnedPackState_ = -1;
           return nullptr;
@@ -598,7 +640,13 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         pinnedPackState_ = -1;
         return nullptr;
       }
-      if (cudf::size_of(dtype) != fd.byte_width) {
+      if (fd.kind == kFieldString) {
+        // 8-align the slot so the 16B copy fast path and the u64 offset
+        // loads are naturally aligned (padding is zeroed once per slot).
+        offset = (offset + 7) & ~7;
+        fd.offset = offset;
+        hasStringFields_ = true;
+      } else if (cudf::size_of(dtype) != fd.byte_width) {
         pinnedPackState_ = -1; // width mismatch (e.g. decimals)
         return nullptr;
       }
@@ -661,6 +709,15 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       }
       auto child =
           BaseVector::loadedVectorShared(selectedInputs[b]->childAt(c));
+      // String channels (2026-08-21): Parquet strings often arrive
+      // dictionary-encoded; the pack reads FlatVector<StringView>, so
+      // flatten here (a copy of the StringViews, not of the bytes).
+      if (child != nullptr && rowMode && !boundary &&
+          rowFields_[c].kind == kFieldString &&
+          child->encoding() != VectorEncoding::Simple::FLAT) {
+        BaseVector::flattenVector(child);
+        child = BaseVector::loadedVectorShared(child);
+      }
       // Null JOIN KEYS are unrepresentable in the row matcher (it hashes
       // raw key bytes; NULL must never match). Fail loudly rather than
       // silently joining on residual bytes. Applies to both boundary
@@ -721,9 +778,10 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   auto stream = cudfGlobalStreamPool().get_stream();
   if (rowMode) {
     // All RowStoreVectors from this operator MUST share one stream (see
-    // rowStream_ docs in the header).
+    // rowStream_ docs in the header). DEDICATED, not pooled: see
+    // DedicatedStream.h for the stall this avoids.
     if (!rowStream_.has_value()) {
-      rowStream_ = stream;
+      rowStream_ = acquireDedicatedStream();
     }
     stream = rowStream_.value();
   }
@@ -732,9 +790,38 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   const int32_t nullStride = (numCols + 7) / 8;
   const int64_t nullRegionBytes =
       (rowMode && anyNulls) ? static_cast<int64_t>(totalRows) * nullStride : 0;
+  // Out-of-line string heap (2026-08-21): rides after the sidecar so one
+  // H2D carries rows + nulls + chars. Sized by a pre-pass over the
+  // StringViews (lengths only; no byte traffic).
+  int64_t heapBytes = 0;
+  if (rowMode && !boundary && hasStringFields_) {
+    for (size_t b = 0; b < selectedInputs.size(); b++) {
+      const int64_t n = selectedInputs[b]->size();
+      for (int c = 0; c < numCols; c++) {
+        if (rowFields_[c].kind != kFieldString) {
+          continue;
+        }
+        const auto* sv =
+            reinterpret_cast<const StringView*>(srcs[b * numCols + c]);
+        const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
+        for (int64_t r = 0; r < n; r++) {
+          if (nulls != nullptr && velox::bits::isBitNull(nulls, r)) {
+            continue;
+          }
+          if (sv[r].size() > kRowStrInlineMax) {
+            heapBytes += sv[r].size();
+          }
+        }
+      }
+    }
+  }
+  const int64_t heapOffset = rowMode
+      ? static_cast<int64_t>(totalRows) * rowWidth_ + nullRegionBytes
+      : 0;
   const int64_t totalBytes = (rowMode
       ? static_cast<int64_t>(totalRows) * rowWidth_
-      : dataWidth_ * static_cast<int64_t>(totalRows)) + nullRegionBytes;
+      : dataWidth_ * static_cast<int64_t>(totalRows)) + nullRegionBytes +
+      heapBytes;
   if (pinnedSlots_[0] == nullptr) {
     // totalBytes of the first batch is the size hint: probe-side operators
     // draw big recycled slots, build-side operators draw small ones.
@@ -757,20 +844,18 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     // returns instantly. A never-recorded event also synchronizes instantly.
     VELOX_CUDA_CHECK(cudaEventSynchronize(slot.done));
   }
-  if (slot.capacity < totalBytes) {
-    if (slot.host != nullptr) {
-      VELOX_CUDA_CHECK(cudaFreeHost(slot.host));
-    }
-    slot.capacity = std::max<int64_t>(totalBytes, slot.capacity * 2);
-    VELOX_CUDA_CHECK(cudaHostAlloc(
-        reinterpret_cast<void**>(&slot.host),
-        slot.capacity,
-        cudaHostAllocDefault));
-    // Zero once so row-mode inter-field padding is deterministic.
-    std::memset(slot.host, 0, slot.capacity);
-  }
+  ensurePinnedSlotCapacity(slot, totalBytes);
 
   // ---- Pack: ONE CPU pass, fused with the (former) merge ----
+  // Row mode allocates the DEVICE buffer up front: out-of-line string slots
+  // store absolute device pointers into the uploaded heap tail, so the
+  // device base must be known while packing (pointer slots, 2026-08-23).
+  rmm::device_buffer gpuRowBuf;
+  uint8_t* devHeapBase = nullptr;
+  if (rowMode) {
+    gpuRowBuf = rmm::device_buffer(totalBytes, stream);
+    devHeapBase = static_cast<uint8_t*>(gpuRowBuf.data()) + heapOffset;
+  }
   uint8_t* const base = slot.host;
   if (rowMode) {
     const int32_t rowWidth = rowWidth_;
@@ -778,6 +863,8 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     // over boundaryPackChannels_); normal mode packs every channel, where
     // rowFields_.size() == numCols and packed index == channel index.
     const int numPacked = static_cast<int>(rowFields_.size());
+    uint8_t* const heapBase = base + heapOffset;
+    int64_t heapCursor = 0;
     int64_t rowsSoFar = 0;
     for (size_t b = 0; b < selectedInputs.size(); b++) {
       const int64_t n = selectedInputs[b]->size();
@@ -787,6 +874,34 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         const int32_t off = rowFields_[k].offset;
         const int32_t w = rowFields_[k].byte_width;
         const uint8_t* src = srcs[b * numCols + c];
+        if (rowFields_[k].kind == kFieldString) {
+          // Inline StringViews (<= 12B) are byte-identical to the slot.
+          // Longer ones: len + prefix stay, the pointer becomes a heap
+          // offset and the bytes are appended to the heap region.
+          const auto* sv = reinterpret_cast<const StringView*>(src);
+          const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
+          uint8_t* d = tile + off;
+          for (int64_t r = 0; r < n; r++, d += rowWidth) {
+            if (nulls != nullptr && velox::bits::isBitNull(nulls, r)) {
+              std::memset(d, 0, kRowStrSlotBytes);
+              continue;
+            }
+            const auto& v = sv[r];
+            if (v.size() <= kRowStrInlineMax) {
+              std::memcpy(d, &v, kRowStrSlotBytes);
+            } else {
+              const uint32_t len = v.size();
+              std::memcpy(d, &len, 4);
+              std::memcpy(d + 4, v.data(), 4);
+              const uint64_t ptr =
+                  reinterpret_cast<uint64_t>(devHeapBase + heapCursor);
+              std::memcpy(d + 8, &ptr, 8);
+              std::memcpy(heapBase + heapCursor, v.data(), len);
+              heapCursor += len;
+            }
+          }
+          continue;
+        }
         if (w == 8) {
           const uint64_t* s = reinterpret_cast<const uint64_t*>(src);
           uint8_t* d = tile + off;
@@ -866,7 +981,6 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
           rowFields_.data(), rowFields_.size() * sizeof(FieldDesc), stream);
       stream.synchronize(); // one-time, first batch only
     }
-    rmm::device_buffer gpuRowBuf(totalBytes, stream);
     VELOX_CUDA_CHECK(cudaMemcpyAsync(
         gpuRowBuf.data(),
         slot.host,
@@ -892,6 +1006,10 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       // The single H2D above carried rows + sidecar (totalBytes includes
       // the null region); record the stride so consumers can find it.
       rowStoreResult->setNullSidecar(nullStride);
+    }
+    if (heapBytes > 0) {
+      // Out-of-line slots point into this vector's own uploaded heap tail.
+      rowStoreResult->setSelfStringHeap();
     }
     if (boundary) {
       // ---- Host retention: the payload never crosses the boundary. ----

@@ -132,6 +132,7 @@ class CudfFromVelox : public CudfOperatorBase {
   // (measured: ~1s/thread of stalls at 1M-row batches). Total pinned memory is
   // capped at the high-water mark of concurrently live conversion operators.
   PinnedPackSlot* pinnedSlots_[2] = {nullptr, nullptr};
+  static void ensurePinnedSlotCapacity(PinnedPackSlot& slot, int64_t bytes);
   int pinnedSlot_ = 0;
 
   // Whether this operator's DOWNSTREAM consumer can actually accept a
@@ -191,6 +192,7 @@ class CudfFromVelox : public CudfOperatorBase {
   int32_t rowWidth_ = 0;   // 8-byte aligned row stride (row mode)
   int64_t dataWidth_ = 0;  // raw sum of column widths, unpadded (col mode)
   bool rowLayoutReady_ = false;
+  bool hasStringFields_ = false; // any kFieldString in rowFields_ (row mode)
   // Uploaded once; SHARED by every RowStoreVector this operator emits (the
   // shared_ptr keeps it alive as long as any batch lives downstream).
   std::shared_ptr<rmm::device_buffer> rowFieldsDevice_;

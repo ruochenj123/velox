@@ -53,8 +53,14 @@ namespace {
 }
 
 /// \brief Makes an async resource
-[[nodiscard]] auto makeAsyncMr() {
-  return std::make_shared<rmm::mr::cuda_async_memory_resource>();
+/// Primed with `percent` of free device memory (2026-08-22): the async
+/// pool otherwise starts empty and grows on first touch, and those growth
+/// steps landed on the critical path of every first probe/build call
+/// (hundreds of ms per driver at 1M-row batches). Freed memory stays in the
+/// pool (release threshold defaults to the device total).
+[[nodiscard]] auto makeAsyncMr(int percent) {
+  return std::make_shared<rmm::mr::cuda_async_memory_resource>(
+      rmm::percent_of_free_device_memory(percent));
 }
 
 /// \brief Makes a managed resource
@@ -112,7 +118,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   if (mode == "pool")
     return makePoolMr(percent);
   if (mode == "async")
-    return makeAsyncMr();
+    return makeAsyncMr(percent);
   if (mode == "arena")
     return makeArenaMr(percent);
   if (mode == "managed")

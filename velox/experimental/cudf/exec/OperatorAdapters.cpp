@@ -76,6 +76,25 @@ const OperatorAdapter* OperatorAdapterRegistry::findAdapter(
   return nullptr;
 }
 
+const OperatorAdapter* OperatorAdapterRegistry::findRunnableAdapter(
+    const exec::Operator* op,
+    const core::PlanNodePtr& planNode,
+    exec::DriverCtx* ctx) const {
+  const OperatorAdapter* first = nullptr;
+  for (const auto& adapter : adapters_) {
+    if (!adapter->canHandle(op)) {
+      continue;
+    }
+    if (first == nullptr) {
+      first = adapter.get();
+    }
+    if (planNode != nullptr && adapter->canRunOnGPU(op, planNode, ctx)) {
+      return adapter.get();
+    }
+  }
+  return first;
+}
+
 const std::vector<std::unique_ptr<OperatorAdapter>>&
 OperatorAdapterRegistry::getAdapters() const {
   return adapters_;
@@ -1095,12 +1114,15 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
   if (CudfConfig::getInstance().benchmarkRowWiseGather) {
+    // Row-wise joins first; the columnar cudf join adapters stay registered
+    // behind them so join types the row path does not implement
+    // (semi/anti/filtered/outer) run on the GPU via cudf rather than falling
+    // back to the CPU (see findRunnableAdapter).
     registry.registerAdapter(std::make_unique<RowHashJoinBuildAdapter>());
     registry.registerAdapter(std::make_unique<RowHashJoinProbeAdapter>());
-  } else {
-    registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
-    registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   }
+  registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
+  registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<OrderByAdapter>());
   registry.registerAdapter(std::make_unique<TopNAdapter>());
   registry.registerAdapter(std::make_unique<LimitAdapter>());

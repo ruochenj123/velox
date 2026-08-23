@@ -1,7 +1,7 @@
 /*
  * GpuFixedRowStore.h
  *
- * Device-side fixed-stride row store types (no-strings variant).
+ * Device-side fixed-stride row store types (fixed-width + 16B string slots).
  * This header has NO Velox or folly dependencies so it can be
  * included from both .cpp (host) and .cu (device) files.
  */
@@ -14,10 +14,38 @@
 // Per-column metadata (shared between host and device)
 // ============================================================================
 
+// Field kinds. Strings (2026-08-21) live in a FIXED 16-byte slot so the row
+// stride stays constant; see RowStrSlot below.
+enum : int32_t { kFieldFixed = 0, kFieldString = 1 };
+
 struct FieldDesc {
   int32_t offset;      // byte offset within a row
-  int32_t byte_width;  // >0 for fixed-width types only
+  int32_t byte_width;  // fixed: type width; string: kRowStrSlotBytes (16)
+  int32_t kind = kFieldFixed;
 };
+
+// ============================================================================
+// Out-of-line strings (2026-08-21; pointer slots 2026-08-23)
+//
+// A string field occupies a 16-byte slot mirroring Velox's StringView:
+//   len <= 12 : [u32 len][12 bytes of data]              (inline)
+//   len  > 12 : [u32 len][4-byte prefix][u64 device ptr]  (out of line)
+// The pointer is an ABSOLUTE device address of the string's bytes, wherever
+// they already live (the pack's uploaded heap region, a cudf strings
+// column's chars buffer, another store's buffer). Slots therefore stay valid
+// across gather/concat/build with NO compaction or offset rebase; each
+// RowStoreVector instead keeps the referenced buffers alive (stringKeepAlive).
+// Bytes are copied only at materialization (strings column / CPU exit).
+// Inline slots are byte-identical to a FlatVector<StringView> element.
+// ============================================================================
+constexpr int32_t kRowStrSlotBytes = 16;
+constexpr uint32_t kRowStrInlineMax = 12;
+
+struct RowStrSlot {
+  uint32_t len;
+  uint8_t rest[12]; // inline bytes, or prefix[4] + u64 offset (LE)
+};
+static_assert(sizeof(RowStrSlot) == kRowStrSlotBytes, "slot must be 16B");
 
 /// Per-field mapping for selective gather: maps a field from a source row
 /// to a position in an output row.

@@ -101,9 +101,11 @@ bool CompileState::compile(bool allowCpuFallback) {
   auto getOperatorProperties =
       [&registry, this, &isValidPlanNodeId, ctx](const exec::Operator* op) {
         OperatorProperties props;
-        auto adapter = registry.findAdapter(op);
+        const bool validId = isValidPlanNodeId(op->planNodeId());
+        auto adapter = registry.findRunnableAdapter(
+            op, validId ? getPlanNode(op->planNodeId()) : nullptr, ctx);
         props.adapter = adapter;
-        if (adapter && isValidPlanNodeId(op->planNodeId())) {
+        if (adapter && validId) {
           static_cast<OperatorAdapter::Properties&>(props) =
               adapter->properties(op, getPlanNode(op->planNodeId()), ctx);
         }
@@ -345,13 +347,15 @@ void registerCudf() {
     output_mr_ = mr_;
   }
 
+  // Row mode: the row translator claims inner/no-filter joins; the cudf
+  // translator (registered after it) takes every other join type so they
+  // run on the GPU instead of the CPU (see findRunnableAdapter).
   if (CudfConfig::getInstance().benchmarkRowWiseGather) {
     exec::Operator::registerOperator(
         std::make_unique<RowHashJoinBridgeTranslator>());
-  } else {
-    exec::Operator::registerOperator(
-        std::make_unique<CudfHashJoinBridgeTranslator>());
   }
+  exec::Operator::registerOperator(
+      std::make_unique<CudfHashJoinBridgeTranslator>());
   CudfDriverAdapter cda{CudfConfig::getInstance().allowCpuFallback};
   exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
   exec::DriverFactory::registerAdapter(cudfAdapter);

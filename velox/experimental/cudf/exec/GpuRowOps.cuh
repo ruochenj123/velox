@@ -149,3 +149,43 @@ void rowsToColumns(
     int32_t row_width,
     cudaStream_t stream);
 
+// ============================================================================
+// Out-of-line strings (2026-08-21) -- see GpuFixedRowStore.h for the slot
+// format. All functions are stream-ordered; the two *Layout/*Offsets helpers
+// synchronize the stream to return the heap total.
+// ============================================================================
+
+/// cudf strings column (offsets + chars) -> 16B pointer slots in a row
+/// buffer. Out-of-line slots point into d_chars directly (zero copy); the
+/// caller keeps the chars buffer alive.
+void stringsToSlots(
+    const void* d_offsets,
+    bool offsets_are_int64,
+    const uint8_t* d_chars,
+    int32_t num_rows,
+    uint8_t* d_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    cudaStream_t stream);
+
+/// One string field -> exclusive-scanned int64 offsets (num_rows + 1); returns
+/// total chars. Synchronizes.
+int64_t stringFieldOffsets(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t* d_offsets64,
+    cudaStream_t stream);
+
+/// Materialize one string field: writes int32 offsets (num_rows + 1) and the
+/// chars, from inline slots or the heap.
+void stringFieldToChars(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int64_t* d_offsets64,
+    int32_t* d_offsets32,
+    uint8_t* d_out_chars,
+    cudaStream_t stream);

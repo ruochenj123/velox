@@ -1,7 +1,7 @@
 /*
  * GpuRowOps.cu
  *
- * CUDA kernels for fixed-stride row store operations (no-strings variant).
+ * CUDA kernels for fixed-stride row store operations (fixed-width + 16B string slots).
  * - extract_keys_kernel:         extract key column from row buffer
  * - gather_rows_vectorized:      vectorized row gather (uint4 loads/stores)
  * - columns_to_rows_kernel:      transpose columnar data to row layout
@@ -11,6 +11,7 @@
  */
 
 #include "GpuRowOps.cuh"
+#include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
 // ============================================================================
@@ -252,6 +253,21 @@ __device__ __forceinline__ void copy_field(
     const uint8_t* __restrict__ src,
     uint8_t* __restrict__ dst,
     int32_t width) {
+  if (width == 16) {
+    if (((reinterpret_cast<uintptr_t>(src) |
+          reinterpret_cast<uintptr_t>(dst)) & 15) == 0) {
+      *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+      return;
+    }
+    if (((reinterpret_cast<uintptr_t>(src) |
+          reinterpret_cast<uintptr_t>(dst)) & 7) == 0) {
+      reinterpret_cast<uint64_t*>(dst)[0] =
+          reinterpret_cast<const uint64_t*>(src)[0];
+      reinterpret_cast<uint64_t*>(dst)[1] =
+          reinterpret_cast<const uint64_t*>(src)[1];
+      return;
+    }
+  }
   if (width == 8) {
     if (((reinterpret_cast<uintptr_t>(src) |
           reinterpret_cast<uintptr_t>(dst)) & 7) == 0) {
@@ -606,3 +622,155 @@ void rowsToColumns(
   cudaFreeAsync(d_cols, stream);
 }
 
+
+// ============================================================================
+// Out-of-line strings (2026-08-21). Slot format: GpuFixedRowStore.h.
+// ============================================================================
+
+__device__ __forceinline__ uint32_t slot_len(const uint8_t* slot) {
+  uint32_t v;
+  memcpy(&v, slot, 4);
+  return v;
+}
+__device__ __forceinline__ const uint8_t* slot_ptr(const uint8_t* slot) {
+  uint64_t v;
+  memcpy(&v, slot + 8, 8);
+  return reinterpret_cast<const uint8_t*>(v);
+}
+
+// cudf strings column -> pointer slots. offsets may be int32 or int64
+// (cudf >= 24.x large strings). Out-of-line slots point straight into the
+// column's chars buffer -- no copy; the caller keeps the buffer alive.
+template <typename OffsetT>
+__global__ void strings_to_slots_kernel(
+    const OffsetT* __restrict__ offsets,
+    const uint8_t* __restrict__ chars,
+    int32_t num_rows,
+    uint8_t* __restrict__ rows,
+    int32_t row_width,
+    int32_t field_offset) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  const int64_t b = (int64_t)offsets[row];
+  const int64_t e = (int64_t)offsets[row + 1];
+  const uint32_t len = (uint32_t)(e - b);
+  uint8_t* slot = rows + (int64_t)row * row_width + field_offset;
+  uint8_t tmp[kRowStrSlotBytes];
+  memcpy(tmp, &len, 4);
+  if (len <= kRowStrInlineMax) {
+    for (uint32_t i = 0; i < kRowStrInlineMax; i++) {
+      tmp[4 + i] = i < len ? chars[b + i] : 0;
+    }
+  } else {
+    for (int i = 0; i < 4; i++) {
+      tmp[4 + i] = chars[b + i];
+    }
+    const uint64_t ptr = (uint64_t)(chars + b);
+    memcpy(tmp + 8, &ptr, 8);
+  }
+  memcpy(slot, tmp, kRowStrSlotBytes);
+}
+
+void stringsToSlots(
+    const void* d_offsets,
+    bool offsets_are_int64,
+    const uint8_t* d_chars,
+    int32_t num_rows,
+    uint8_t* d_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    cudaStream_t stream) {
+  if (num_rows == 0) return;
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  if (offsets_are_int64) {
+    strings_to_slots_kernel<int64_t><<<grid, block, 0, stream>>>(
+        static_cast<const int64_t*>(d_offsets), d_chars,
+        num_rows, d_rows, row_width, field_offset);
+  } else {
+    strings_to_slots_kernel<int32_t><<<grid, block, 0, stream>>>(
+        static_cast<const int32_t*>(d_offsets), d_chars,
+        num_rows, d_rows, row_width, field_offset);
+  }
+}
+
+// Exclusive scan in place over num_rows + 1 int64 entries; returns the total
+// (synchronizes the stream).
+static int64_t exclusive_scan_total(
+    int64_t* d_vals, int32_t n_plus_1, cudaStream_t stream) {
+  void* tmp = nullptr;
+  size_t tmpBytes = 0;
+  cub::DeviceScan::ExclusiveSum(tmp, tmpBytes, d_vals, d_vals, n_plus_1, stream);
+  cudaMallocAsync(&tmp, tmpBytes, stream);
+  cub::DeviceScan::ExclusiveSum(tmp, tmpBytes, d_vals, d_vals, n_plus_1, stream);
+  cudaFreeAsync(tmp, stream);
+  int64_t total = 0;
+  cudaMemcpyAsync(&total, d_vals + (n_plus_1 - 1), sizeof(int64_t),
+      cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+  return total;
+}
+
+// Slots of one string field -> cudf strings column pieces: lengths (num_rows
+// + 1, exclusive-scanned by the host helper into int32 offsets) then chars.
+__global__ void string_field_lengths_kernel(
+    const uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t* __restrict__ out) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row > num_rows) return;
+  out[row] = row == num_rows
+      ? 0
+      : (int64_t)slot_len(rows + (int64_t)row * row_width + field_offset);
+}
+
+__global__ void string_field_to_chars_kernel(
+    const uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int64_t* __restrict__ offsets64,
+    int32_t* __restrict__ offsets32,
+    uint8_t* __restrict__ out_chars) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row > num_rows) return;
+  offsets32[row] = (int32_t)offsets64[row];
+  if (row == num_rows) return;
+  const uint8_t* slot = rows + (int64_t)row * row_width + field_offset;
+  const uint32_t len = slot_len(slot);
+  const uint8_t* src = len <= kRowStrInlineMax ? slot + 4 : slot_ptr(slot);
+  uint8_t* dst = out_chars + offsets64[row];
+  for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
+}
+
+int64_t stringFieldOffsets(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t* d_offsets64,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_rows + 1 + block - 1) / block;
+  string_field_lengths_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, field_offset, d_offsets64);
+  return exclusive_scan_total(d_offsets64, num_rows + 1, stream);
+}
+
+void stringFieldToChars(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int64_t* d_offsets64,
+    int32_t* d_offsets32,
+    uint8_t* d_out_chars,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_rows + 1 + block - 1) / block;
+  string_field_to_chars_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, field_offset, d_offsets64,
+      d_offsets32, d_out_chars);
+}

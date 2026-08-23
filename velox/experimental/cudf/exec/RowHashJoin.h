@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
 #include "velox/experimental/cudf/exec/GpuRowHashTable.cuh"
+#include "velox/experimental/cudf/exec/GpuRowOps.cuh"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -104,6 +105,10 @@ class RowHashJoinBridge : public exec::JoinBridge {
     // batches without a sidecar contribute zeroed (all-valid) bytes.
     rmm::device_buffer nullBuffer;
     int32_t nullStride{0};
+    // Owners of buffers referenced by the build rows' out-of-line string
+    // pointer slots (2026-08-23): input row stores / the concatenated cudf
+    // table. Kept for the bridge's lifetime.
+    std::vector<std::shared_ptr<void>> stringKeepAlive;
   };
 
   void setBuildData(std::shared_ptr<BuildData> data);
@@ -255,6 +260,15 @@ class RowHashJoinProbe : public CudfOperatorBase {
   // Output null sidecar for the current batch (rows = numMatches) and the
   // output stride; allocated only when an input store carries nulls.
   rmm::device_buffer outputNullBuffer_;
+  // ---- Out-of-line strings (pointer slots, 2026-08-23) ----
+  bool outputHasStrings_ = false;   // any string field in the join output
+  bool probeInputHasStringRefs_ = false; // transposed CudfVector had strings
+  // Inputs of the CURRENT batch, retained so the emitted output vector can
+  // keep the buffers its string slots point into.
+  std::shared_ptr<RowStoreVector> lastProbeInput_;
+  RowVectorPtr lastProbeCudfInput_;
+  rmm::device_buffer outputRowBaseBuffer_; // int64[numMatches+1] (col output)
+  void attachStringKeepAlives(std::shared_ptr<RowStoreVector>& out);
   int32_t outputNullStride_ = 0;
 
   // Pre-allocated device buffers (reused per batch)

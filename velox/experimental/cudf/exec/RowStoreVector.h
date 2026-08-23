@@ -86,6 +86,42 @@ class RowStoreVector : public RowVector {
     return store;
   }
 
+  // ---- Out-of-line strings (pointer slots, 2026-08-23; format in
+  // GpuFixedRowStore.h)
+  //
+  // Out-of-line slots hold ABSOLUTE device pointers into whatever buffer
+  // already holds the bytes (the pack's uploaded heap tail of rowBuffer_, a
+  // cudf strings column's chars, an upstream RowStoreVector's buffer).
+  // Whoever writes such slots must register the referenced owner here so it
+  // outlives this vector. hasStringRefs() == true means slots may point
+  // outside rowBuffer_ (or into its tail) -- consumers that copy rows
+  // elsewhere must propagate the keep-alive list.
+  void addStringKeepAlive(std::shared_ptr<void> owner) {
+    if (owner != nullptr) {
+      stringKeepAlive_.push_back(std::move(owner));
+    }
+    hasStringRefs_ = true;
+  }
+  void addStringKeepAlives(const std::vector<std::shared_ptr<void>>& owners) {
+    for (const auto& o : owners) {
+      stringKeepAlive_.push_back(o);
+    }
+    hasStringRefs_ = true;
+  }
+  const std::vector<std::shared_ptr<void>>& stringKeepAlive() const {
+    return stringKeepAlive_;
+  }
+  /// True if any string field may hold an out-of-line pointer.
+  bool hasStringRefs() const {
+    return hasStringRefs_;
+  }
+  /// Mark that this store's own rowBuffer_ tail is a referenced heap (pack
+  /// path): no external owner, but rows copied out of this vector still
+  /// reference it, so consumers must keep THIS vector (or rowBuffer_) alive.
+  void setSelfStringHeap() {
+    hasStringRefs_ = true;
+  }
+
   /// Null sidecar (bit set = NULL) present in the tail of the row buffer.
   /// 0 = null-free store. See GpuFixedRowStore::null_bytes.
   void setNullSidecar(int32_t nullStride) { nullStride_ = nullStride; }
@@ -156,6 +192,10 @@ class RowStoreVector : public RowVector {
   // Null sidecar stride in bytes per row (0 = none). Appended per the
   // partial-rebuild note above.
   int32_t nullStride_ = 0;
+  // Owners of buffers referenced by out-of-line string slots (see
+  // addStringKeepAlive). Appended per the partial-rebuild note above.
+  std::vector<std::shared_ptr<void>> stringKeepAlive_;
+  bool hasStringRefs_ = false;
 
   rmm::device_buffer rowBuffer_; // GPU row data
   // GPU FieldDesc array. Shared: all batches from one producer point at the
