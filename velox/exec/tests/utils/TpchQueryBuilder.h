@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #pragma once
+#include <unordered_set>
+#include <unordered_map>
 
 #include "velox/dwio/common/Options.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -74,6 +76,22 @@ class TpchQueryBuilder {
   /// Get the query plan for a given TPC-H query number.
   /// @param queryId TPC-H query number
   TpchPlan getQueryPlan(int queryId) const;
+
+  ~TpchQueryBuilder();
+
+  /// Resident-table mode (2026-08-22): every TableScan of a query plan is
+  /// served from process-resident, pre-decoded RowVector batches (see
+  /// ResidentTables.h). Scan filters are kept as FilterNodes (filtersAsNode)
+  /// so the CPU-side filtering stays in the timed region; only the Parquet
+  /// decode leaves it. Batches are loaded once per (table, columns) per
+  /// process, by running the real scan; numDrivers sizes that preload.
+  void setResidentTables(bool resident, int32_t numDrivers) {
+    resident_ = resident;
+    residentDrivers_ = numDrivers;
+    if (resident) {
+      filtersAsNode_ = true;
+    }
+  }
 
   /// Returns a plan for select max(c1), max(c2), .. from lineitem where partkey
   /// between
@@ -151,6 +169,39 @@ class TpchQueryBuilder {
   }
 
   std::unordered_map<std::string, TpchTableMetadata> tableMetadata_;
+
+  // ---- String-encoded datasets (2026-08-22 "ideal string handling" study).
+  // If <dataPath>/codes.json exists, the string columns that cross joins /
+  // group-bys are INTEGER codes in the files (dense rank over the sorted
+  // distinct values, so code order == string order) and the original text
+  // is kept as trailing <col>_str columns. The helpers below make every
+  // query build correctly against both the plain and the encoded dataset.
+  std::unordered_map<std::string, std::unordered_map<std::string, int32_t>>
+      encCodes_;
+  bool encoded_{false};
+  bool encodedCol(const std::string& col) const {
+    // Every encoded column has a _str twin in the files; only the small
+    // dictionaries are in codes.json.
+    return encoded_ && (encCodes_.count(col) > 0 || encStrTwins_.count(col) > 0);
+  }
+  /// Literal for `col = 'value'`: the code when encoded, else the quoted text.
+  std::string encLit(const std::string& col, const std::string& value) const;
+  /// `col IN (...)` predicate.
+  std::string encIn(
+      const std::string& col,
+      const std::vector<std::string>& values) const;
+  /// `col LIKE 'prefix%'` -> code range when encoded.
+  std::string encLikePrefix(const std::string& col, const std::string& prefix)
+      const;
+  /// `col LIKE '%suffix'` -> IN-list of matching codes when encoded.
+  std::string encLikeSuffix(const std::string& col, const std::string& suffix)
+      const;
+  /// Name of the text twin for scan-side text predicates on an encoded
+  /// column (col itself when not encoded).
+  std::string strCol(const std::string& col) const {
+    return encodedCol(col) ? col + "_str" : col;
+  }
+  std::unordered_set<std::string> encStrTwins_; // columns with a _str twin
   const dwio::common::FileFormat format_;
   static const std::unordered_map<std::string, std::vector<std::string>>
       kTables_;
@@ -170,7 +221,16 @@ class TpchQueryBuilder {
   static constexpr const char* kTableWide = "wide";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
-  const bool filtersAsNode_;
+  bool filtersAsNode_;
+  bool resident_{false};
+  int32_t residentDrivers_{24};
+  // (table|columns) -> batches, shared across queries of one process.
+  mutable std::unordered_map<
+      std::string,
+      std::shared_ptr<const std::vector<RowVectorPtr>>>
+      residentCache_;
+  TpchPlan buildQueryPlan(int queryId) const;
+  void makeResident(TpchPlan& plan) const;
 };
 
 } // namespace facebook::velox::exec::test

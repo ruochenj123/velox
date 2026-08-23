@@ -15,6 +15,9 @@
  */
 
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
+#include <unordered_set>
+#include <map>
+#include <functional>
 #include <iostream>
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -24,6 +27,14 @@ using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::dwio::common;
 
+DECLARE_int32(num_drivers);
+DEFINE_bool(
+    resident_tables,
+    false,
+    "Serve every TableScan from process-resident, pre-decoded RowVector "
+    "batches (loaded once per process by running the real scan; filters "
+    "stay as CPU FilterNodes). Removes Parquet decode from the timed "
+    "region for every arm. See ResidentTables.h.");
 DEFINE_string(
     data_path,
     "",
@@ -120,6 +131,7 @@ void TpchBenchmark::initQueryBuilder() {
   }
   queryBuilder_ =
       std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
+  queryBuilder_->setResidentTables(FLAGS_resident_tables, FLAGS_num_drivers);
   queryBuilder_->initialize(FLAGS_data_path);
 }
 
@@ -212,6 +224,59 @@ void TpchBenchmark::runMain(
     out << printPlanWithStats(
                *queryPlan.plan, stats, FLAGS_include_custom_stats)
         << std::endl;
+    // Operators registered under synthetic plan-node ids (e.g. the cudf
+    // "<id>-from-velox" / "<id>-to-velox" conversion operators) are not in
+    // the plan tree and printPlanWithStats drops them. Print them here,
+    // aggregated per (planNodeId, operatorType) across drivers.
+    {
+      std::unordered_set<std::string> planIds;
+      std::function<void(const core::PlanNode&)> collect =
+          [&](const core::PlanNode& n) {
+            planIds.insert(n.id());
+            for (const auto& src : n.sources()) {
+              collect(*src);
+            }
+          };
+      collect(*queryPlan.plan);
+      std::map<std::string, exec::OperatorStats> extra;
+      for (const auto& pipeline : stats.pipelineStats) {
+        for (const auto& op : pipeline.operatorStats) {
+          if (planIds.count(op.planNodeId)) {
+            continue;
+          }
+          const auto key = op.planNodeId + " " + op.operatorType;
+          auto it = extra.find(key);
+          if (it == extra.end()) {
+            extra.emplace(key, op);
+          } else {
+            it->second.add(op);
+          }
+        }
+      }
+      for (const auto& [key, op] : extra) {
+        out << "-- [extra] " << key << ": Input: " << op.inputPositions
+            << " rows (" << succinctBytes(op.inputBytes) << ", "
+            << op.inputVectors << " batches), Output: " << op.outputPositions
+            << " rows (" << succinctBytes(op.outputBytes)
+            << "), Cpu time: "
+            << succinctNanos(
+                   op.addInputTiming.cpuNanos + op.getOutputTiming.cpuNanos +
+                   op.finishTiming.cpuNanos + op.isBlockedTiming.cpuNanos)
+            << ", Wall time: "
+            << succinctNanos(
+                   op.addInputTiming.wallNanos + op.getOutputTiming.wallNanos +
+                   op.finishTiming.wallNanos + op.isBlockedTiming.wallNanos)
+            << ", Blocked wall time: " << succinctNanos(op.blockedWallNanos)
+            << ", drivers: " << op.numDrivers << std::endl;
+        if (FLAGS_include_custom_stats) {
+          for (const auto& [name, st] : op.runtimeStats) {
+            out << "      " << name << "  sum: " << st.sum
+                << ", count: " << st.count << ", min: " << st.min
+                << ", max: " << st.max << std::endl;
+          }
+        }
+      }
+    }
   }
 }
 

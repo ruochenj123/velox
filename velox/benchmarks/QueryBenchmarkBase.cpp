@@ -15,6 +15,7 @@
  */
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
+#include <algorithm>
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
@@ -69,6 +70,14 @@ DEFINE_int32(
     "GB of process memory for cache and query.. if "
     "non-0, uses mmap to allocator and in-process data cache.");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
+DEFINE_int32(
+    warmup,
+    0,
+    "Repeats discarded before the median (same protocol as the join "
+    "microbenchmark: all repeats run in ONE process, so pinned slots, "
+    "device pool, kernel modules and the file cache are warm after the "
+    "first). Per-repeat times are printed; 'Median execution time' is "
+    "over repeats >= warmup.");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
 DEFINE_string(
     test_flags_file,
@@ -313,6 +322,7 @@ QueryBenchmarkBase::run(
     const TpchPlan& tpchPlan,
     const std::unordered_map<std::string, std::string>& queryConfigs) {
   int32_t repeat = 0;
+  std::vector<double> repeatMs;
   try {
     for (;;) {
       CursorParameters params;
@@ -361,7 +371,27 @@ QueryBenchmarkBase::run(
       // different times and cannot be summed into a query-level number.
       std::cout << "Query peak memory bytes: "
                 << result.first->task()->pool()->peakBytes() << std::endl;
+      {
+        const auto stats = result.first->task()->taskStats();
+        const double ms = static_cast<double>(
+            stats.executionEndTimeMs - stats.executionStartTimeMs);
+        repeatMs.push_back(ms);
+        std::cout << "Repeat " << repeat << " execution time: " << ms
+                  << " ms" << (repeat < FLAGS_warmup ? " (warmup)" : "")
+                  << std::endl;
+      }
       if (++repeat >= FLAGS_num_repeats) {
+        std::vector<double> warm(
+            repeatMs.begin() +
+                std::min<size_t>(FLAGS_warmup, repeatMs.size() - 1),
+            repeatMs.end());
+        std::sort(warm.begin(), warm.end());
+        const double median = warm.size() % 2
+            ? warm[warm.size() / 2]
+            : (warm[warm.size() / 2 - 1] + warm[warm.size() / 2]) / 2;
+        std::cout << "Median execution time: " << median << " ms (over "
+                  << warm.size() << " warm repeats, min " << warm.front()
+                  << " ms, max " << warm.back() << " ms)" << std::endl;
         return result;
       }
     }

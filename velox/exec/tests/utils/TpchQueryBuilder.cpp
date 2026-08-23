@@ -14,14 +14,26 @@
  * limitations under the License.
  */
 #include "velox/exec/tests/utils/TpchQueryBuilder.h"
+#include "velox/connectors/hive/TableHandle.h"
+#include "velox/exec/Cursor.h"
+#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/exec/tests/utils/ResidentTables.h"
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/dwio/common/ReaderFactory.h"
 #include "velox/tpch/gen/TpchGen.h"
 
+#include <folly/json.h>
+
 #include <algorithm>
+#include <iostream>
+#include <atomic>
 #include <fstream>
+#include <thread>
+#include <limits>
+#include <sstream>
 #include <gflags/gflags.h>
 
 DECLARE_int32(s_selectivity_pct);
@@ -105,6 +117,17 @@ void TpchQueryBuilder::readFileSchema(
       [](std::string a, std::string b) { return std::make_pair(a, b); });
   auto columnNames = columns;
   auto types = fileType->children();
+  // Trailing extra file columns (e.g. the <col>_str twins of an encoded
+  // dataset) are exposed under their own names so queries can select them.
+  for (size_t i = columns.size(); i < fileColumnNames.size(); i++) {
+    columnNames.push_back(fileColumnNames[i]);
+    fileColumnNamesMap[fileColumnNames[i]] = fileColumnNames[i];
+    if (fileColumnNames[i].size() > 4 &&
+        fileColumnNames[i].substr(fileColumnNames[i].size() - 4) == "_str") {
+      encStrTwins_.insert(
+          fileColumnNames[i].substr(0, fileColumnNames[i].size() - 4));
+    }
+  }
   types.resize(columnNames.size());
   tableMetadata_[tableName].type =
       std::make_shared<RowType>(std::move(columnNames), std::move(types));
@@ -112,6 +135,24 @@ void TpchQueryBuilder::readFileSchema(
 }
 
 void TpchQueryBuilder::initialize(const std::string& dataPath) {
+  // Encoded dataset? (see encCodes_ in the header)
+  {
+    std::ifstream codes(dataPath + "/codes.json");
+    if (codes.good()) {
+      std::stringstream buf;
+      buf << codes.rdbuf();
+      auto json = folly::parseJson(buf.str());
+      for (const auto& [col, dict] : json.items()) {
+        for (const auto& [text, code] : dict.items()) {
+          encCodes_[col.asString()][text.asString()] =
+              static_cast<int32_t>(code.asInt());
+        }
+      }
+      encoded_ = true;
+      LOG(INFO) << "TpchQueryBuilder: string-encoded dataset, "
+                << encCodes_.size() << " dictionaries";
+    }
+  }
   for (const auto& [tableName, columns] : kTables_) {
     const fs::path tablePath{dataPath + "/" + tableName};
     std::error_code error;
@@ -144,11 +185,217 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
   }
 }
 
+std::string TpchQueryBuilder::encLit(
+    const std::string& col,
+    const std::string& value) const {
+  if (!encodedCol(col)) {
+    return "'" + value + "'";
+  }
+  const auto& d = encCodes_.at(col);
+  auto it = d.find(value);
+  if (it == d.end()) {
+    // e.g. TPC-H Q19's literal 'AIR REG' (data has 'REG AIR'): a text
+    // predicate that matches nothing must keep matching nothing.
+    LOG(WARNING) << "no code for " << col << "='" << value << "'";
+    return "-1";
+  }
+  return std::to_string(it->second);
+}
+
+std::string TpchQueryBuilder::encIn(
+    const std::string& col,
+    const std::vector<std::string>& values) const {
+  std::string out = col + " IN (";
+  for (size_t i = 0; i < values.size(); i++) {
+    out += (i ? ", " : "") + encLit(col, values[i]);
+  }
+  return out + ")";
+}
+
+std::string TpchQueryBuilder::encLikePrefix(
+    const std::string& col,
+    const std::string& prefix) const {
+  if (!encodedCol(col)) {
+    return col + " LIKE '" + prefix + "%'";
+  }
+  int32_t lo = std::numeric_limits<int32_t>::max(), hi = -1;
+  for (const auto& [text, code] : encCodes_.at(col)) {
+    if (text.compare(0, prefix.size(), prefix) == 0) {
+      lo = std::min(lo, code);
+      hi = std::max(hi, code);
+    }
+  }
+  VELOX_CHECK(hi >= 0, "no code matches {} LIKE '{}%'", col, prefix);
+  return "(" + col + " BETWEEN " + std::to_string(lo) + " AND " +
+      std::to_string(hi) + ")";
+}
+
+std::string TpchQueryBuilder::encLikeSuffix(
+    const std::string& col,
+    const std::string& suffix) const {
+  if (!encodedCol(col)) {
+    return col + " LIKE '%" + suffix + "'";
+  }
+  // OR-chain rather than IN (...): remaining filters are parsed without a
+  // memory pool and an IN-list would be a complex (array) literal.
+  std::string out = "(";
+  bool first = true;
+  for (const auto& [text, code] : encCodes_.at(col)) {
+    if (text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      out += (first ? "" : " OR ") + col + " = " + std::to_string(code);
+      first = false;
+    }
+  }
+  VELOX_CHECK(!first, "no code matches {} LIKE '%{}'", col, suffix);
+  return out + ")";
+}
+
 const std::vector<std::string>& TpchQueryBuilder::getTableNames() {
   return kTableNames_;
 }
 
+TpchQueryBuilder::~TpchQueryBuilder() {
+  // The process-wide registry must release the resident batches while the
+  // pool that owns their buffers (pool_) is still alive.
+  ResidentTableRegistry::instance().clear();
+  residentCache_.clear();
+  unregisterResidentTablesAdapter();
+}
+
 TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
+  auto plan = buildQueryPlan(queryId);
+  if (resident_) {
+    makeResident(plan);
+  }
+  return plan;
+}
+
+namespace {
+void collectScans(
+    const core::PlanNodePtr& node,
+    std::vector<std::shared_ptr<const core::TableScanNode>>& out) {
+  if (auto scan = std::dynamic_pointer_cast<const core::TableScanNode>(node)) {
+    out.push_back(scan);
+  }
+  for (const auto& src : node->sources()) {
+    collectScans(src, out);
+  }
+}
+} // namespace
+
+void TpchQueryBuilder::makeResident(TpchPlan& plan) const {
+  registerResidentTablesAdapter();
+  std::vector<std::shared_ptr<const core::TableScanNode>> scans;
+  collectScans(plan.plan, scans);
+  for (const auto& scan : scans) {
+    auto hive = std::dynamic_pointer_cast<const connector::hive::HiveTableHandle>(
+        scan->tableHandle());
+    VELOX_CHECK_NOT_NULL(hive);
+    const auto& table = hive->tableName();
+    const auto& outType = scan->outputType();
+    std::string key = table;
+    for (const auto& n : outType->names()) {
+      key += "|" + n;
+    }
+    auto it = residentCache_.find(key);
+    std::cerr << "[resident] table " << table << " cols=" << outType->size()
+              << (it == residentCache_.end() ? " loading..." : " cached")
+              << std::endl;
+    if (it == residentCache_.end()) {
+      // Run the real (unfiltered) scan once and retain its batches.
+      auto start = std::chrono::steady_clock::now();
+      // The round-robin local partition after the scan forces lazy
+      // vectors to be loaded inside the (parallel) scan drivers rather than
+      // serially on this thread.
+      core::PlanNodeId scanId;
+      // Distinct id space (1M+): the ResidentTables adapter matches scans by
+      // plan node id, and the preload's own scan must never collide with a
+      // query scan id already registered.
+      auto preloadIds = std::make_shared<core::PlanNodeIdGenerator>(1000000);
+      auto scanPlan = PlanBuilder(preloadIds, pool_.get())
+                          .tableScan(table, outType, getFileColumnNames(table))
+                          .capturePlanNodeId(scanId)
+                          .localPartitionRoundRobin()
+                          .planNode();
+      CursorParameters params;
+      params.planNode = scanPlan;
+      params.maxDrivers = residentDrivers_;
+      // The preload is a plain CPU scan: keep GPU operator replacement (the
+      // cudf driver adapter) out of it, or the localPartition becomes a GPU
+      // round trip.
+      params.queryConfigs["cudf.enabled"] = "false";
+      auto cursor = TaskCursor::create(params);
+      auto* task = cursor->task().get();
+      for (const auto& path : getTableFilePaths(table)) {
+        for (auto& split : HiveConnectorTestBase::makeHiveConnectorSplits(
+                 path, residentDrivers_ * 4, format_)) {
+          task->addSplit(scanId, exec::Split(std::move(split)));
+        }
+      }
+      task->noMoreSplits(scanId);
+      cursor->start();
+      std::vector<RowVectorPtr> produced;
+      while (cursor->moveNext()) {
+        auto v = cursor->current();
+        std::vector<VectorPtr> children(v->childrenSize());
+        for (size_t c = 0; c < children.size(); c++) {
+          children[c] = BaseVector::loadedVectorShared(v->childAt(c));
+        }
+        produced.push_back(std::make_shared<RowVector>(
+            v->pool(), v->type(), nullptr, v->size(), std::move(children)));
+      }
+      waitForTaskCompletion(task);
+      // Deep FLAT copy into OUR pool, in parallel (batches are independent):
+      // the task's pools die with the cursor; transferOrCopyTo leaves
+      // reader-owned buffer views behind and testingCopyPreserveEncodings
+      // shares string buffers / drops the pool for dictionary bases.
+      // BaseVector::copy allocates every buffer in the target pool.
+      auto batches =
+          std::make_shared<std::vector<RowVectorPtr>>(produced.size());
+      {
+        const size_t nThreads = std::max<int32_t>(1, residentDrivers_);
+        std::vector<std::thread> workers;
+        std::atomic<size_t> nextIdx{0};
+        for (size_t t = 0; t < nThreads; t++) {
+          workers.emplace_back([&]() {
+            for (size_t i = nextIdx++; i < produced.size(); i = nextIdx++) {
+              const auto& src = produced[i];
+              auto row = std::static_pointer_cast<RowVector>(
+                  BaseVector::create(src->type(), src->size(), pool_.get()));
+              row->copy(src.get(), 0, 0, src->size());
+              (*batches)[i] = std::move(row);
+            }
+          });
+        }
+        for (auto& w : workers) {
+          w.join();
+        }
+      }
+      int64_t rows = 0;
+      for (const auto& b : *batches) {
+        rows += b->size();
+      }
+      produced.clear();
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+      std::cerr << "[resident] loaded " << table << ": " << rows
+                << " rows, " << batches->size() << " batches, " << ms
+                << " ms" << std::endl;
+      LOG(INFO) << "Resident table " << table << " (" << outType->size()
+                << " cols): " << rows << " rows in " << batches->size()
+                << " batches, " << ms << " ms";
+      it = residentCache_.emplace(key, std::move(batches)).first;
+    }
+    ResidentTableRegistry::instance().set(scan->id(), it->second);
+  }
+  std::cerr << "[resident] all tables ready" << std::endl;
+  // No splits: the scans are served from memory.
+  plan.dataFiles.clear();
+}
+
+TpchPlan TpchQueryBuilder::buildQueryPlan(int queryId) const {
   switch (queryId) {
     case 1:
       return getQ1Plan();
@@ -377,7 +624,7 @@ TpchPlan TpchQueryBuilder::getQ2Plan() const {
                       partSelectedRowType,
                       partFileColumns,
                       {},
-                      "p_type like '%BRASS'")
+                      encLikeSuffix("p_type", "BRASS"))
                   .captureScanNodeId(partScanId)
                   .filter("p_size = 15")
                   .planNode();
@@ -831,7 +1078,7 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
   auto nationSelectedRowType = getRowType(kNation, nationColumns);
   const auto& nationFileColumns = getFileColumnNames(kNation);
 
-  const std::string nationFilter = "n_name IN ('FRANCE', 'GERMANY')";
+  const std::string nationFilter = encIn("n_name", {"FRANCE", "GERMANY"});
   auto shipDateFilter = formatDateFilter(
       "l_shipdate", lineitemSelectedRowType, "'1995-01-01'", "'1996-12-31'");
 
@@ -923,8 +1170,10 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
               {"l_orderkey"},
               {"o_orderkey"},
               ordersJoinCustomer,
-              "(((cust_nation = 'FRANCE') AND (supp_nation = 'GERMANY')) OR "
-              "((cust_nation = 'GERMANY') AND (supp_nation = 'FRANCE')))",
+              "(((cust_nation = " + encLit("n_name", "FRANCE") +
+                  ") AND (supp_nation = " + encLit("n_name", "GERMANY") +
+                  ")) OR ((cust_nation = " + encLit("n_name", "GERMANY") +
+                  ") AND (supp_nation = " + encLit("n_name", "FRANCE") + ")))",
               {"supp_nation",
                "cust_nation",
                "l_extendedprice",
@@ -1023,7 +1272,7 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
                       kPart,
                       partSelectedRowType,
                       partFileColumns,
-                      {"p_type = 'ECONOMY ANODIZED STEEL'"})
+                      {"p_type = " + encLit("p_type", "ECONOMY ANODIZED STEEL")})
                   .captureScanNodeId(partScanNodeId)
                   .planNode();
 
@@ -1116,7 +1365,8 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
                "o_orderdate"})
           .project(
               {"volume",
-               "(CASE WHEN n_name = 'BRAZIL' THEN volume ELSE 0.0 END) as brazil_volume",
+               "(CASE WHEN n_name = " + encLit("n_name", "BRAZIL") +
+                   " THEN volume ELSE 0.0 END) as brazil_volume",
                "year(o_orderdate) AS o_year"})
           .partialAggregation(
               {"o_year"},
@@ -1303,7 +1553,8 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
   const auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
   const auto& ordersFileColumns = getFileColumnNames(kOrders);
 
-  const auto lineitemReturnFlagFilter = "l_returnflag = 'R'";
+  const auto lineitemReturnFlagFilter =
+      "l_returnflag = " + encLit("l_returnflag", "R");
   const auto orderDate = "o_orderdate";
   auto orderDateFilter = formatDateFilter(
       orderDate, ordersSelectedRowType, "'1993-10-01'", "'1993-12-31'");
@@ -1428,7 +1679,8 @@ TpchPlan TpchQueryBuilder::getQ11Plan() const {
   const auto& nationFileColumns = getFileColumnNames(kNation);
 
   // Filter for nation name.
-  const std::string nationNameFilter = "n_name = 'GERMANY'";
+  const std::string nationNameFilter =
+      "n_name = " + encLit("n_name", "GERMANY");
 
   // Plan node ID generator.
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -1570,7 +1822,7 @@ TpchPlan TpchQueryBuilder::getQ12Plan() const {
                           lineitemSelectedRowType,
                           lineitemFileColumns,
                           {receiptDateFilter,
-                           "l_shipmode IN ('MAIL', 'SHIP')",
+                           encIn("l_shipmode", {"MAIL", "SHIP"}),
                            shipDateFilter,
                            commitDateFilter},
                           "l_commitdate < l_receiptdate")
@@ -1591,8 +1843,12 @@ TpchPlan TpchQueryBuilder::getQ12Plan() const {
               {"l_shipmode", "o_orderpriority"})
           .project(
               {"l_shipmode",
-               "(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count_partial",
-               "(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count_partial"})
+               "(CASE WHEN o_orderpriority = " + encLit("o_orderpriority", "1-URGENT") +
+                   " OR o_orderpriority = " + encLit("o_orderpriority", "2-HIGH") +
+                   " THEN 1 ELSE 0 END) AS high_line_count_partial",
+               "(CASE WHEN o_orderpriority <> " + encLit("o_orderpriority", "1-URGENT") +
+                   " AND o_orderpriority <> " + encLit("o_orderpriority", "2-HIGH") +
+                   " THEN 1 ELSE 0 END) AS low_line_count_partial"})
           .partialAggregation(
               {"l_shipmode"},
               {"sum(high_line_count_partial) as high_line_count",
@@ -1709,7 +1965,8 @@ TpchPlan TpchQueryBuilder::getQ14Plan() const {
               "",
               {"part_revenue", "p_type"})
           .project(
-              {"(CASE WHEN (p_type LIKE 'PROMO%') THEN part_revenue ELSE 0.0 END) as filter_revenue",
+              {"(CASE WHEN " + encLikePrefix("p_type", "PROMO") +
+                   " THEN part_revenue ELSE 0.0 END) as filter_revenue",
                "part_revenue"})
           .partialAggregation(
               {},
@@ -1817,7 +2074,8 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
 TpchPlan TpchQueryBuilder::getQ16Plan() const {
   std::vector<std::string> partColumns = {
       "p_brand", "p_type", "p_size", "p_partkey"};
-  std::vector<std::string> supplierColumns = {"s_suppkey", "s_comment"};
+  std::vector<std::string> supplierColumns = {
+      "s_suppkey", strCol("s_comment")};
   std::vector<std::string> partsuppColumns = {"ps_partkey", "ps_suppkey"};
 
   const auto partSelectedRowType = getRowType(kPart, partColumns);
@@ -1839,11 +2097,11 @@ TpchPlan TpchQueryBuilder::getQ16Plan() const {
                       partSelectedRowType,
                       partFileColumns,
                       {"p_size in (49, 14, 23, 45, 19, 3, 36, 9)"},
-                      "p_type NOT LIKE 'MEDIUM POLISHED%'")
+                      "NOT " + encLikePrefix("p_type", "MEDIUM POLISHED"))
                   .captureScanNodeId(partScanNodeId)
                   // Neq is unsupported as a tableScan subfield filter for
                   // Parquet source.
-                  .filter("p_brand <> 'Brand#45'")
+                  .filter("p_brand <> " + encLit("p_brand", "Brand#45"))
                   .planNode();
 
   auto supplier = PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1853,7 +2111,8 @@ TpchPlan TpchQueryBuilder::getQ16Plan() const {
                           supplierSelectedRowType,
                           supplierFileColumns,
                           {},
-                          "s_comment LIKE '%Customer%Complaints%'")
+                          strCol("s_comment") +
+                              " LIKE '%Customer%Complaints%'")
                       .captureScanNodeId(supplierScanNodeId)
                       .planNode();
 
@@ -1924,7 +2183,8 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
                       kPart,
                       partRowType,
                       partFileColumns,
-                      {"p_brand = 'Brand#23'", "p_container = 'MED BOX'"})
+                      {"p_brand = " + encLit("p_brand", "Brand#23"),
+                       "p_container = " + encLit("p_container", "MED BOX")})
                   .captureScanNodeId(partScanId)
                   .planNode();
 
@@ -2080,20 +2340,20 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
   core::PlanNodeId lineitemScanNodeId;
   core::PlanNodeId partScanNodeId;
 
-  const std::string shipModeFilter = "l_shipmode IN ('AIR', 'AIR REG')";
+  const std::string shipModeFilter = encIn("l_shipmode", {"AIR", "AIR REG"});
   const std::string shipInstructFilter =
       "(l_shipinstruct = 'DELIVER IN PERSON')";
   const std::string joinFilterExpr =
-      "     ((p_brand = 'Brand#12')"
+      "     ((p_brand = " + encLit("p_brand", "Brand#12") + ")"
       "     AND (l_quantity between 1.0 and 11.0)"
-      "     AND (p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))"
+      "     AND (" + encIn("p_container", {"SM CASE", "SM BOX", "SM PACK", "SM PKG"}) + ")"
       "     AND (p_size BETWEEN 1 AND 5))"
-      " OR  ((p_brand ='Brand#23')"
-      "     AND (p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))"
+      " OR  ((p_brand = " + encLit("p_brand", "Brand#23") + ")"
+      "     AND (" + encIn("p_container", {"MED BAG", "MED BOX", "MED PKG", "MED PACK"}) + ")"
       "     AND (l_quantity between 10.0 and 20.0)"
       "     AND (p_size BETWEEN 1 AND 10))"
-      " OR  ((p_brand = 'Brand#34')"
-      "     AND (p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))"
+      " OR  ((p_brand = " + encLit("p_brand", "Brand#34") + ")"
+      "     AND (" + encIn("p_container", {"LG CASE", "LG BOX", "LG PACK", "LG PKG"}) + ")"
       "     AND (l_quantity between 20.0 and 30.0)"
       "     AND (p_size BETWEEN 1 AND 15))";
 
@@ -2196,7 +2456,7 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
                         kNation,
                         nationSelectedRowType,
                         nationFileColumns,
-                        {"n_name = 'CANADA'"})
+                        {"n_name = " + encLit("n_name", "CANADA")})
                     .captureScanNodeId(nationScanId)
                     .planNode();
 
@@ -2325,7 +2585,7 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
                         kNation,
                         nationRowType,
                         nationFileColumns,
-                        {"n_name = 'SAUDI ARABIA'"})
+                        {"n_name = " + encLit("n_name", "SAUDI ARABIA")})
                     .captureScanNodeId(nationScanNodeId)
                     .planNode();
 
@@ -2420,9 +2680,12 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
 
 TpchPlan TpchQueryBuilder::getQ22Plan() const {
   std::vector<std::string> ordersColumns = {"o_custkey"};
-  std::vector<std::string> customerColumns = {"c_acctbal", "c_phone"};
+  // Encoded dataset: c_phone is a code; the country code is computed from
+  // the text twin right after the scan (CPU side) as an INTEGER, so only a
+  // fixed-width value crosses the boundary.
+  std::vector<std::string> customerColumns = {"c_acctbal", strCol("c_phone")};
   std::vector<std::string> customerColumnsWithKey = {
-      "c_custkey", "c_acctbal", "c_phone"};
+      "c_custkey", "c_acctbal", strCol("c_phone")};
 
   const auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
   const auto& ordersFileColumns = getFileColumnNames(kOrders);
@@ -2432,8 +2695,8 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
       getRowType(kCustomer, customerColumnsWithKey);
   const auto& customerFileColumnsWithKey = getFileColumnNames(kCustomer);
 
-  const std::string phoneFilter =
-      "substr(c_phone, 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')";
+  const std::string phoneFilter = "substr(" + strCol("c_phone") +
+      ", 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')";
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId customerScanNodeId;
@@ -2462,7 +2725,7 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
           .finalAggregation()
           .planNode();
 
-  auto plan =
+  auto customerScan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
@@ -2471,7 +2734,15 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
               customerFileColumnsWithKey,
               {},
               phoneFilter)
-          .captureScanNodeId(customerScanNodeIdWithKey)
+          .captureScanNodeId(customerScanNodeIdWithKey);
+  if (encodedCol("c_phone")) {
+    customerScan.project(
+        {"c_custkey",
+         "c_acctbal",
+         "cast(substr(c_phone_str, 1, 2) as integer) AS c_phone"});
+  }
+  auto plan =
+      customerScan
           .nestedLoopJoin(
               customerAvgAccountBalance,
               {"c_acctbal", "avg_acctbal", "c_custkey", "c_phone"})
@@ -2484,7 +2755,11 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
               {"c_acctbal", "c_phone"},
               core::JoinType::kAnti,
               false /*nullAware*/)
-          .project({"substr(c_phone, 1, 2) AS country_code", "c_acctbal"})
+          .project(
+              {encodedCol("c_phone")
+                   ? "c_phone AS country_code"
+                   : "substr(c_phone, 1, 2) AS country_code",
+               "c_acctbal"})
           .partialAggregation(
               {"country_code"},
               {"count(0) AS numcust", "sum(c_acctbal) AS totacctbal"})
