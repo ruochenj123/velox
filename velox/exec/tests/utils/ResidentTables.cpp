@@ -1,5 +1,7 @@
 #include "velox/exec/tests/utils/ResidentTables.h"
 
+#include <iostream>
+
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 
@@ -79,6 +81,11 @@ void registerResidentTablesAdapter() {
           if (batches == nullptr) {
             continue;
           }
+          std::cerr << "[resident] driver " << driver.driverCtx()->driverId
+                    << " pipeline " << driver.driverCtx()->pipelineId
+                    << ": scan node " << scan->planNodeId() << " -> "
+                    << batches->size() << " batches, numDrivers "
+                    << factory.numDrivers << std::endl;
           core::PlanNodePtr scanNode;
           for (const auto& node : factory.planNodes) {
             if (node->id() == scan->planNodeId()) {
