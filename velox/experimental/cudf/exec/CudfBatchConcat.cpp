@@ -145,7 +145,6 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
   if (anyStringRefs) {
     for (const auto& v : rowBuffer_) {
       if (v->hasStringRefs()) {
-        keepAlive.push_back(v);
         for (const auto& o : v->stringKeepAlive()) {
           keepAlive.push_back(o);
         }

@@ -115,12 +115,7 @@ class RowStoreVector : public RowVector {
   bool hasStringRefs() const {
     return hasStringRefs_;
   }
-  /// Mark that this store's own rowBuffer_ tail is a referenced heap (pack
-  /// path): no external owner, but rows copied out of this vector still
-  /// reference it, so consumers must keep THIS vector (or rowBuffer_) alive.
-  void setSelfStringHeap() {
-    hasStringRefs_ = true;
-  }
+
 
   /// Null sidecar (bit set = NULL) present in the tail of the row buffer.
   /// 0 = null-free store. See GpuFixedRowStore::null_bytes.

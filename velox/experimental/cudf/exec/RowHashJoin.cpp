@@ -695,10 +695,10 @@ void RowHashJoinBuild::doNoMoreInput() {
             static_cast<uint8_t*>(rowBuffer.data()) + offset,
             rsv->gpuRowData(), chunkBytes,
             cudaMemcpyDeviceToDevice, stream.value());
-        // Pointer slots (2026-08-23): copied rows may reference the input's
-        // heap tail / upstream buffers -- retain them for the build's life.
+        // Pointer slots (2026-08-23): copied rows may reference upstream
+        // heap buffers -- retain them (only the small chars buffers, never
+        // whole row stores) for the build's life.
         if (rsv->hasStringRefs()) {
-          buildStringKeepAlive.push_back(rsv);
           for (const auto& o : rsv->stringKeepAlive()) {
             buildStringKeepAlive.push_back(o);
           }
@@ -1553,10 +1553,10 @@ void RowHashJoinProbe::attachStringKeepAlives(std::shared_ptr<RowStoreVector>& o
   }
   if (lastProbeInput_ != nullptr) {
     if (lastProbeInput_->hasStringRefs()) {
-      out->addStringKeepAlive(lastProbeInput_);
       out->addStringKeepAlives(lastProbeInput_->stringKeepAlive());
     }
   } else if (lastProbeCudfInput_ != nullptr && probeInputHasStringRefs_) {
+    // Transposed CudfVector probe: slots point into its chars buffers.
     out->addStringKeepAlive(lastProbeCudfInput_);
   }
   out->addStringKeepAlives(buildData_->stringKeepAlive);

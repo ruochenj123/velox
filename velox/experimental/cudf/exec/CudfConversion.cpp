@@ -847,14 +847,20 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   ensurePinnedSlotCapacity(slot, totalBytes);
 
   // ---- Pack: ONE CPU pass, fused with the (former) merge ----
-  // Row mode allocates the DEVICE buffer up front: out-of-line string slots
-  // store absolute device pointers into the uploaded heap tail, so the
-  // device base must be known while packing (pointer slots, 2026-08-23).
+  // Row mode allocates the DEVICE buffers up front: out-of-line string
+  // slots store absolute device pointers, so the bases must be known while
+  // packing (pointer slots, 2026-08-23). The chars heap is a SEPARATE
+  // shared buffer: downstream outputs retain only it (megabytes of long
+  // strings), never the full row buffer.
   rmm::device_buffer gpuRowBuf;
+  std::shared_ptr<rmm::device_buffer> heapBuf;
   uint8_t* devHeapBase = nullptr;
   if (rowMode) {
-    gpuRowBuf = rmm::device_buffer(totalBytes, stream);
-    devHeapBase = static_cast<uint8_t*>(gpuRowBuf.data()) + heapOffset;
+    gpuRowBuf = rmm::device_buffer(totalBytes - heapBytes, stream);
+    if (heapBytes > 0) {
+      heapBuf = std::make_shared<rmm::device_buffer>(heapBytes, stream);
+      devHeapBase = static_cast<uint8_t*>(heapBuf->data());
+    }
   }
   uint8_t* const base = slot.host;
   if (rowMode) {
@@ -984,9 +990,17 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     VELOX_CUDA_CHECK(cudaMemcpyAsync(
         gpuRowBuf.data(),
         slot.host,
-        totalBytes,
+        totalBytes - heapBytes,
         cudaMemcpyHostToDevice,
         stream.value()));
+    if (heapBytes > 0) {
+      VELOX_CUDA_CHECK(cudaMemcpyAsync(
+          heapBuf->data(),
+          slot.host + heapOffset,
+          heapBytes,
+          cudaMemcpyHostToDevice,
+          stream.value()));
+    }
     if (!syncMode) {
       VELOX_CUDA_CHECK(cudaEventRecord(slot.done, stream.value()));
     }
@@ -1008,8 +1022,9 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       rowStoreResult->setNullSidecar(nullStride);
     }
     if (heapBytes > 0) {
-      // Out-of-line slots point into this vector's own uploaded heap tail.
-      rowStoreResult->setSelfStringHeap();
+      // Out-of-line slots point into the shared heap buffer; consumers
+      // retain just it (small), never the row buffer.
+      rowStoreResult->addStringKeepAlive(heapBuf);
     }
     if (boundary) {
       // ---- Host retention: the payload never crosses the boundary. ----
