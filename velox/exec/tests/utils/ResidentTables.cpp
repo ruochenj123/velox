@@ -103,9 +103,15 @@ void registerResidentTablesAdapter() {
               factory.numDrivers));
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
         }
-        return true;
+        // MUST return false: Velox stops at the FIRST adapter that returns
+        // true (LocalPlanner: `if (adapter.adapt(...)) break;`), and the
+        // cudf adapter (which returns true) still has to run after us.
+        return false;
       }};
-  DriverFactory::registerAdapter(adapter);
+  // Register at the FRONT for the same reason: if the cudf adapter runs
+  // first, its `return true` would prevent this one from ever running and
+  // the split-less TableScans would wait forever.
+  DriverFactory::adapters.insert(DriverFactory::adapters.begin(), adapter);
 }
 
 void unregisterResidentTablesAdapter() {
