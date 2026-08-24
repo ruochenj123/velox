@@ -414,9 +414,15 @@ void RowOrderBy::sortRows() {
     keyMasks.push_back(std::move(mask));
   }
 
+  cudaEvent_t evSortBegin, evSortEnd, evGatherEnd;
+  cudaEventCreate(&evSortBegin);
+  cudaEventCreate(&evSortEnd);
+  cudaEventCreate(&evGatherEnd);
+  cudaEventRecord(evSortBegin, stream_.value());
   const auto tp0 = std::chrono::steady_clock::now();
   auto perm = cudf::sorted_order(
       cudf::table_view(keyViews), orders_, nullOrders_, stream_, get_output_mr());
+  cudaEventRecord(evSortEnd, stream_.value());
   const int32_t* permData = perm->view().data<int32_t>();
 
   // One gather of whole rows by the permutation (slots copied verbatim;
@@ -437,6 +443,7 @@ void RowOrderBy::sortRows() {
         stream_.value());
     sortedNulls_ = std::move(gatheredNulls);
   }
+  cudaEventRecord(evGatherEnd, stream_.value());
   // While the device sorts and gathers, COALESCE the retained host batches
   // into contiguous per-store columns (the CPU hybrid sort's trick,
   // overlapped here with the GPU sort): the final permutation gather then
@@ -452,6 +459,28 @@ void RowOrderBy::sortRows() {
               .count(),
           RuntimeCounter::Unit::kNanos));
   stream_.synchronize();
+  {
+    float msSort = 0, msGather = 0;
+    cudaEventElapsedTime(&msSort, evSortBegin, evSortEnd);
+    cudaEventElapsedTime(&msGather, evSortEnd, evGatherEnd);
+    addRuntimeStat(
+        "rowSortKeysDevNanos",
+        RuntimeCounter(
+            static_cast<int64_t>(msSort * 1e6), RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "rowSortGatherDevNanos",
+        RuntimeCounter(
+            static_cast<int64_t>(msGather * 1e6),
+            RuntimeCounter::Unit::kNanos));
+    addRuntimeStat(
+        "rowSortGatherDevBytes",
+        RuntimeCounter(
+            static_cast<int64_t>(totalRows_) * rowWidth_,
+            RuntimeCounter::Unit::kBytes));
+    cudaEventDestroy(evSortBegin);
+    cudaEventDestroy(evSortEnd);
+    cudaEventDestroy(evGatherEnd);
+  }
   sorted_ = std::move(gathered);
   addRuntimeStat(
       "rowSortNanos",
@@ -696,7 +725,18 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     }
     hostCharsReady_ = true;
   }
+  const auto tpD2H = std::chrono::steady_clock::now();
   stream_.synchronize();
+  addRuntimeStat(
+      "rowSortD2HWaitNanos",
+      RuntimeCounter(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - tpD2H)
+              .count(),
+          RuntimeCounter::Unit::kNanos));
+  addRuntimeStat(
+      "rowSortD2HBytes",
+      RuntimeCounter(static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
   std::swap(hostRows_, hostRowsCur_); // hostRowsCur_ = this chunk
   // Prefetch the NEXT chunk into the (now free) other buffer; the next
   // call's synchronize() waits for it.
@@ -725,12 +765,21 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     for (int32_t r = 0; r < n; r++) {
       std::memcpy(&gids[r], rows + static_cast<int64_t>(r) * rowWidth_ + idOff, 8);
     }
+    const auto tpHG = std::chrono::steady_clock::now();
     auto cols = gatherDeferred(gids, n);
+    addRuntimeStat(
+        "rowSortHostGatherNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpHG)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
     for (size_t k = 0; k < deferredCols_.size(); k++) {
       children[deferredCols_[k]] = std::move(cols[k]);
     }
   }
 
+  const auto tpExtract = std::chrono::steady_clock::now();
   // ---- GPU-gathered columns: TWO parallel passes over row ranges for ALL
   // columns at once (thread teams are per chunk, not per column). Pass 1:
   // fixed-width strided copies + per-range out-of-line byte totals of every
@@ -844,6 +893,13 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
       }
     }
   }
+  addRuntimeStat(
+      "rowSortHostExtractNanos",
+      RuntimeCounter(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - tpExtract)
+              .count(),
+          RuntimeCounter::Unit::kNanos));
   addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
   return std::make_shared<RowVector>(
       pool(), outputType_, nullptr, n, std::move(children));
@@ -875,7 +931,15 @@ RowVectorPtr RowOrderBy::emitColumnarChunk(int64_t begin, int32_t n) {
         gids.data(), idsDev_.data(), bytes, cudaMemcpyDeviceToHost,
         stream_.value());
     stream_.synchronize();
+    const auto tpHG = std::chrono::steady_clock::now();
     auto cols = gatherDeferred(gids, n);
+    addRuntimeStat(
+        "rowSortHostGatherNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpHG)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
     std::vector<std::string> names;
     std::vector<TypePtr> types;
     for (auto outIdx : deferredCols_) {
