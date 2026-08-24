@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/cudf/exec/RowStoreVector.h"
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/HashPartitionFunction.h"
@@ -182,6 +183,28 @@ void CudfLocalPartition::enqueuePartition(
 void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   flushVectorPool();
   recordOutputStats(input);
+  // Row-wise sort (branch row-sort, 2026-08-24): a GATHER (single consumer
+  // queue) passes RowStoreVector batches through untouched, so a
+  // downstream RowOrderBy receives rows straight from the pack / row joins
+  // without a columnar round trip. Only the gather shape is supported: the
+  // row layout has no cudf partitioning primitive.
+  if (auto rowStore = std::dynamic_pointer_cast<RowStoreVector>(input)) {
+    VELOX_CHECK_EQ(
+        numPartitions_,
+        1,
+        "RowStoreVector through CudfLocalPartition requires a gather");
+    if (rowStore->size() == 0) {
+      return;
+    }
+    ContinueFuture future;
+    auto blockingReason =
+        queues_[0]->enqueue(rowStore, rowStore->size(), &future);
+    if (blockingReason != exec::BlockingReason::kNotBlocked) {
+      blockingReasons_.push_back(blockingReason);
+      futures_.push_back(std::move(future));
+    }
+    return;
+  }
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
   auto stream = cudfVector->stream();

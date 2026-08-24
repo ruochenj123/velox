@@ -233,3 +233,17 @@ void stringFieldToChars(
     int32_t* d_offsets32,
     uint8_t* d_out_chars,
     cudaStream_t stream);
+
+// ============================================================================
+// Row-wise sort support (2026-08-24, branch row-sort)
+// ============================================================================
+/// Add `delta` to the int64 field at `field_offset` of rows [0, num_rows).
+/// Used when row batches carrying per-batch __rowid provenance are
+/// concatenated: the rowid becomes global (batch base + local id).
+void addInt64Field(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t delta,
+    cudaStream_t stream);

@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/DeferralPlan.h"
 #include "velox/experimental/cudf/exec/DeferralStats.h"
+#include "velox/experimental/cudf/exec/RowOrderBy.h"
 #include "velox/experimental/cudf/exec/DedicatedStream.h"
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
@@ -472,6 +473,22 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
         emitRowStore_ = 1;
       }
     }
+    // Row-sort consumer (branch row-sort, 2026-08-24): a RowOrderBy directly
+    // after this pack, or a GATHER CudfLocalPartition whose plan parent is
+    // an OrderByNode that runs as RowOrderBy (rows pass through the gather
+    // untouched). Either way the pack emits RowStoreVector.
+    std::shared_ptr<const core::OrderByNode> sortNode;
+    if (rowWiseMode && next != nullptr) {
+      const auto& planRoot = operatorCtx_->task()->planFragment().planNode;
+      if (auto* sort = dynamic_cast<RowOrderBy*>(next)) {
+        sortNode = sort->orderByNode();
+      } else if (rowSortConsumesGather(next, planRoot)) {
+        sortNode = orderByBehindGather(planRoot, next->planNodeId());
+      }
+      if (sortNode != nullptr) {
+        emitRowStore_ = 1;
+      }
+    }
     // ---- Boundary-hybrid resolution (keys-only pack) ----
     // Ask the downstream join operator which columns are join keys: only
     // those cross the boundary; everything else is retained host-side and
@@ -507,6 +524,21 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
           boundaryKeyNames_.push_back(key->name());
         }
         adjJoin = build->joinNode();
+      } else if (sortNode != nullptr) {
+        // Row sort: the SORT KEYS are the crossing set (the sort hashes
+        // nothing, but it orders on them); the sort node is the chain
+        // endpoint. Pruning keeps exactly the sort's output columns.
+        boundaryKeyNames_ = RowOrderBy::sortKeyNames(*sortNode);
+        joinOutputNames_ = sortNode->outputType()->names();
+        const auto& cfg = CudfConfig::getInstance();
+        if (!boundaryKeyNames_.empty() && cfg.benchmarkBoundaryHybrid) {
+          deferralEligible_ = true;
+          boundaryMode_ = cfg.benchmarkDeferralAdaptive ? 0 : 1;
+        }
+        const auto& planRoot = operatorCtx_->task()->planFragment().planNode;
+        const auto chain = collectChainKeyNames(planRoot, sortNode->id());
+        laterKeyNames_ = chain.later;
+        endpointJoinId_ = chain.endpointJoinId;
       }
       if (adjJoin != nullptr) {
         joinOutputNames_ = adjJoin->outputType()->names();

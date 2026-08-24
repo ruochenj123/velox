@@ -13,6 +13,7 @@
 #include "velox/experimental/cudf/exec/GpuRowOps.cuh"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/RowStoreVector.h"
+#include "velox/experimental/cudf/exec/RowOrderBy.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -1516,8 +1517,15 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       // Find self, then inspect the next operator in the pipeline.
       for (size_t i = 0; i + 1 < ops.size(); i++) {
         if (ops[i] == this) {
-          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
-            emitColumnar_ = 0; // next op is a row-join -> keep row layout
+          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr ||
+              dynamic_cast<RowOrderBy*>(ops[i + 1]) != nullptr ||
+              rowSortConsumesGather(
+                  ops[i + 1],
+                  operatorCtx_->task()->planFragment().planNode)) {
+            // next op is a row-join or a row SORT (directly, or behind a
+            // gather LocalPartition that passes rows through) -> keep the
+            // row layout; the sort is then the chain endpoint.
+            emitColumnar_ = 0;
           } else if (dynamic_cast<RowHashJoinBuild*>(ops[i + 1]) != nullptr) {
             // Our output is the BUILD side of a later join (bushy plan).
             // The build takes ONE layout for all its inputs, so we hand
@@ -2658,4 +2666,24 @@ exec::OperatorSupplier RowHashJoinBridgeTranslator::toOperatorSupplier(
   return nullptr;
 }
 
+} // namespace facebook::velox::cudf_velox
+
+// ============================================================================
+// Public wrappers (branch row-sort, 2026-08-24): RowOrderBy's CudfVector
+// input path reuses the join's columnar->row transpose and layout helpers,
+// which live in this file's anonymous namespace.
+// ============================================================================
+namespace facebook::velox::cudf_velox {
+std::pair<std::vector<FieldDesc>, int32_t> rowLayoutFromCudfTable(
+    const cudf::table_view& table) {
+  return computeRowLayoutFromTable(table);
+}
+rmm::device_buffer transposeCudfTableToRows(
+    const cudf::table_view& table,
+    const std::vector<FieldDesc>& fields,
+    int32_t rowWidth,
+    uint8_t* d_row_buffer,
+    cudaStream_t stream) {
+  return transposeToRows(table, fields, rowWidth, d_row_buffer, stream);
+}
 } // namespace facebook::velox::cudf_velox

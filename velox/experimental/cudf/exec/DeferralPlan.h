@@ -72,6 +72,14 @@ inline void appendKeys(
     out.push_back(k->name());
   }
 }
+
+inline void appendSortKeys(
+    const std::shared_ptr<const core::OrderByNode>& sort,
+    std::vector<std::string>& out) {
+  for (const auto& k : sort->sortingKeys()) {
+    out.push_back(k->name());
+  }
+}
 } // namespace deferral_detail
 
 /// Collect adjacent + later join keys for `joinNodeId` under `root`.
@@ -82,6 +90,15 @@ inline ChainKeyNames collectChainKeyNames(
   ChainKeyNames out;
   std::vector<core::PlanNodePtr> path; // root ... joinNode
   if (!deferral_detail::findPath(root, joinNodeId, path) || path.empty()) {
+    return out;
+  }
+  // Branch row-sort (2026-08-24): the adjacent consumer may be an
+  // OrderByNode (pack -> row sort). Its sort keys are the crossing set and
+  // the sort itself is the endpoint (a sort's consumer is never a row op).
+  if (auto sortAdj =
+          std::dynamic_pointer_cast<const core::OrderByNode>(path.back())) {
+    deferral_detail::appendSortKeys(sortAdj, out.adjacent);
+    out.endpointJoinId = sortAdj->id();
     return out;
   }
   auto adjacent =
@@ -95,7 +112,25 @@ inline ChainKeyNames collectChainKeyNames(
   // the first BUILD-side edge (a build accumulates -- it is a
   // materialization point, so the chain's rows stop there and the
   // ancestor's keys need not cross as row fields).
+  // Row-sort extension: a GATHER LocalPartition passes rows through
+  // (RowStoreVector through CudfLocalPartition), and an OrderByNode
+  // consumes rows and TERMINATES the chain (its sort keys must cross).
   for (int32_t i = static_cast<int32_t>(path.size()) - 2; i >= 0; i--) {
+    if (auto lp = std::dynamic_pointer_cast<const core::LocalPartitionNode>(
+            path[i])) {
+      if (dynamic_cast<const core::GatherPartitionFunctionSpec*>(
+              &lp->partitionFunctionSpec()) == nullptr) {
+        break;
+      }
+      continue; // gather: rows flow through unchanged
+    }
+    if (auto sort =
+            std::dynamic_pointer_cast<const core::OrderByNode>(path[i])) {
+      deferral_detail::appendSortKeys(sort, out.later);
+      out.endpointJoinId = sort->id();
+      out.chainLength++;
+      break;
+    }
     auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(path[i]);
     if (join == nullptr || join->sources().empty() ||
         join->sources()[0].get() != path[i + 1].get()) {
@@ -106,6 +141,28 @@ inline ChainKeyNames collectChainKeyNames(
     out.chainLength++;
   }
   return out;
+}
+
+/// Branch row-sort: if `localPartitionNodeId` names a GATHER LocalPartition
+/// whose plan parent is an OrderByNode, return that OrderByNode (the row
+/// sort that will consume the gathered rows); else nullptr.
+inline std::shared_ptr<const core::OrderByNode> orderByBehindGather(
+    const core::PlanNodePtr& root,
+    const std::string& localPartitionNodeId) {
+  std::vector<core::PlanNodePtr> path;
+  if (!deferral_detail::findPath(root, localPartitionNodeId, path) ||
+      path.size() < 2) {
+    return nullptr;
+  }
+  auto lp = std::dynamic_pointer_cast<const core::LocalPartitionNode>(
+      path.back());
+  if (lp == nullptr ||
+      dynamic_cast<const core::GatherPartitionFunctionSpec*>(
+          &lp->partitionFunctionSpec()) == nullptr) {
+    return nullptr;
+  }
+  return std::dynamic_pointer_cast<const core::OrderByNode>(
+      path[path.size() - 2]);
 }
 
 } // namespace facebook::velox::cudf_velox

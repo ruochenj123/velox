@@ -162,6 +162,10 @@ struct CudfConfig {
   /// transposed to fixed-stride rows, gathered via warp-collaborative copy,
   /// then the result is discarded (skip_output semantics apply).
   bool benchmarkRowWiseGather{false};
+  /// Row-wise GPU sort (branch row-sort, 2026-08-24): replace OrderBy with
+  /// RowOrderBy, which sorts fixed-stride rows (keys extracted, one row
+  /// gather by the permutation) and supports crossing-set (deferred) input.
+  bool benchmarkRowSort{false};
 
   /// [Benchmark] When true AND benchmarkRowWiseGather is true, CudfFromVelox
   /// does CPU col-to-row conversion and outputs RowStoreVector.

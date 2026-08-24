@@ -915,3 +915,35 @@ void stringFieldToChars(
       d_rows, num_rows, row_width, field_offset, d_heap, d_offsets64,
       d_offsets32, d_out_chars);
 }
+
+// ============================================================================
+// Row-wise sort support (2026-08-24, branch row-sort)
+// ============================================================================
+__global__ void add_int64_field_kernel(
+    uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t delta) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  uint8_t* p = rows + (int64_t)row * row_width + field_offset;
+  int64_t v;
+  memcpy(&v, p, 8);
+  v += delta;
+  memcpy(p, &v, 8);
+}
+
+void addInt64Field(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    int64_t delta,
+    cudaStream_t stream) {
+  if (num_rows == 0 || delta == 0) return;
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  add_int64_field_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, field_offset, delta);
+}

@@ -83,6 +83,8 @@ DEFINE_bool(boundary_hybrid, false,
     "Boundary-hybrid: only join keys cross the boundary; payloads stay "
     "host-resident and are gathered for survivors. Implies --row_wise "
     "--cpu_col_to_row.");
+DEFINE_bool(row_sort, false,
+            "Row-wise GPU sort: OrderBy nodes run as RowOrderBy.");
 DEFINE_bool(row_table, false,
     "Row-native chained matcher (RowNativeHashTable) instead of "
     "cudf::hash_join inside the row-wise join operators.");
@@ -167,6 +169,7 @@ void CudfTpchBenchmark::initialize() {
   cfg.benchmarkCpuColToRow = FLAGS_cpu_col_to_row;
   cfg.benchmarkBoundaryHybrid = FLAGS_boundary_hybrid;
   cfg.benchmarkRowTable = FLAGS_row_table;
+  cfg.benchmarkRowSort = FLAGS_row_sort;
   cfg.benchmarkRowTablePackKeys = FLAGS_row_table_pack_keys;
   cfg.benchmarkKeepProjectOnCpu = FLAGS_keep_project_on_cpu;
   cfg.benchmarkDeferralAdaptive = FLAGS_deferral_adaptive;

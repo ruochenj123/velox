@@ -144,6 +144,8 @@ class TpchQueryBuilder {
   TpchPlan getJoinLSPlan() const;     // Q29: lineitem ⋈ supplier
   TpchPlan getJoinOCPlan() const;     // Q30: orders ⋈ customer
   TpchPlan getCaseAPlan() const;      // Q32: single join -> CPU output (no agg)
+  TpchPlan getSortScanPlan() const;   // Q44: scan -> gather -> ORDER BY -> CPU
+  TpchPlan getSortJoinPlan() const;   // Q45: join -> gather -> ORDER BY -> CPU
 
   // Hybrid single-operator benchmarks (synthetic tables R/S; see Bolt).
   TpchPlan getQ31Plan() const;  // S JOIN R -> Sort (2-way, 16 output cols)

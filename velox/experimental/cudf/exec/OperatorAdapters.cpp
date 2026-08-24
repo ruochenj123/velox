@@ -27,6 +27,7 @@
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
+#include "velox/experimental/cudf/exec/RowOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -690,6 +691,48 @@ class OrderByAdapter : public OperatorAdapter {
   }
 };
 
+/// RowOrderByAdapter - Replaces OrderBy with RowOrderBy (row-wise GPU sort,
+/// branch row-sort 2026-08-24). Registered ahead of OrderByAdapter when
+/// benchmarkRowSort is on; accepts RowStoreVector (row joins / row pack)
+/// and CudfVector (transposed) input.
+class RowOrderByAdapter : public OperatorAdapter {
+ public:
+  RowOrderByAdapter() : OperatorAdapter("RowOrderBy") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::OrderBy*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto orderByPlanNode =
+        std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<RowOrderBy>(operatorId, ctx, orderByPlanNode));
+    return result;
+  }
+};
+
 /// TopNAdapter - Replaces with CudfTopN
 class TopNAdapter : public OperatorAdapter {
  public:
@@ -1123,6 +1166,9 @@ void registerAllOperatorAdapters() {
   }
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
+  if (CudfConfig::getInstance().benchmarkRowSort) {
+    registry.registerAdapter(std::make_unique<RowOrderByAdapter>());
+  }
   registry.registerAdapter(std::make_unique<OrderByAdapter>());
   registry.registerAdapter(std::make_unique<TopNAdapter>());
   registry.registerAdapter(std::make_unique<LimitAdapter>());
