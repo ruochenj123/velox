@@ -422,15 +422,11 @@ void CudfFromVelox::ensurePinnedSlotCapacity(
   std::memset(slot.host, 0, slot.capacity);
 }
 
-RowVectorPtr CudfFromVelox::tryPinnedPack(
-    const std::vector<RowVectorPtr>& selectedInputs,
-    vector_size_t totalRows) {
-  if (!CudfConfig::getInstance().benchmarkCpuColToRow || totalRows == 0 ||
-      pinnedPackState_ < 0 || selectedInputs.empty()) {
-    return nullptr;
-  }
-  const bool rowWiseMode = CudfConfig::getInstance().benchmarkRowWiseGather;
-
+// One-time (per operator instance) row-path resolution: who consumes our
+// output (row store vs columnar), boundary mode, transfer discipline. See
+// the section docs inside. Split out of tryPinnedPack in the 2026-08-24
+// reconstruction; logic unchanged.
+void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
   // Decide ONCE, from the downstream neighbor: (a) whether it can take a
   // RowStoreVector, and (b) the transfer discipline (kPinnedPackSync docs in
   // the header). Auto rule: a probe consumer has a per-batch barrier anyway
@@ -521,25 +517,17 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         "fromVeloxPackSyncMode",
         RuntimeCounter(static_cast<int64_t>(pinnedPackSyncMode_)));
   }
-  const bool rowMode = rowWiseMode && emitRowStore_ == 1;
-  if (rowWiseMode && !rowMode) {
-    // Row mode requested but downstream only takes CudfVector: leave the
-    // standard path (from_arrow + GPU transpose downstream) intact.
-    return nullptr;
-  }
-  // Boundary-hybrid is only meaningful on the row path straight into a
-  // RowHashJoinBuild/Probe (resolved above).
-  const bool boundary = boundaryMode_ == 1 && rowMode;
+}
 
+// One-time layout computation (boundary keys-only | pruned subset | full),
+// from the INPUT's actual row type. Split out of tryPinnedPack in the
+// 2026-08-24 reconstruction; logic unchanged. Returns false on a schema
+// that the pinned pack cannot represent (caller falls back).
+bool CudfFromVelox::computeLayoutOnce(
+    const RowTypePtr& inRowType,
+    bool rowMode,
+    bool boundary) {
   // ---- One-time layout: offsets/widths + cudf dtypes ----
-  // NOTE: derive the layout from the INPUT's actual row type, not
-  // outputType_ -- the two can disagree (e.g. the build-side scan batch
-  // carries fewer children than the operator's declared output type).
-  auto inRowType =
-      std::dynamic_pointer_cast<const RowType>(selectedInputs[0]->type());
-  if (inRowType == nullptr) {
-    return nullptr;
-  }
   const int numCols = static_cast<int>(inRowType->size());
   if (!rowLayoutReady_ && boundary) {
     // ---- Keys-only layout: pack exactly the join-key columns, in join-key
@@ -624,21 +612,21 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
           // col-major pinned path has no heap and keeps falling back.
           if (!rowMode) {
             pinnedPackState_ = -1;
-            return nullptr;
+            return false;
           }
           fd.byte_width = kRowStrSlotBytes;
           fd.kind = kFieldString;
           break;
         default:
           pinnedPackState_ = -1;
-          return nullptr;
+          return false;
       }
       cudf::data_type dtype;
       try {
         dtype = veloxToCudfDataType(type);
       } catch (const std::exception&) {
         pinnedPackState_ = -1;
-        return nullptr;
+        return false;
       }
       if (fd.kind == kFieldString) {
         // 8-align the slot so the 16B copy fast path and the u64 offset
@@ -648,7 +636,7 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         hasStringFields_ = true;
       } else if (cudf::size_of(dtype) != fd.byte_width) {
         pinnedPackState_ = -1; // width mismatch (e.g. decimals)
-        return nullptr;
+        return false;
       }
       fields.push_back(fd);
       dtypes.push_back(dtype);
@@ -661,8 +649,27 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     rowLayoutReady_ = true;
   }
 
-  auto tpPackStart = std::chrono::steady_clock::now();
+  return pinnedPackState_ >= 0;
+}
 
+// Load/validate the children of every selected input into positional
+// (batch, channel) slots: srcs = raw value pointers, keepAlive pins the
+// loaded vectors, rawNulls collects nullable FLAT payload channels (row
+// mode). Returns false when a batch cannot be packed (per-batch fallback);
+// boundary mode hard-fails instead where a fallback would corrupt results.
+// Split out of tryPinnedPack in the 2026-08-24 reconstruction; logic
+// unchanged.
+bool CudfFromVelox::loadChildren(
+    const std::vector<RowVectorPtr>& selectedInputs,
+    const RowTypePtr& inRowType,
+    bool rowMode,
+    bool boundary,
+    PackBatch& pb) {
+  const int numCols = static_cast<int>(inRowType->size());
+  auto& keepAlive = pb.keepAlive;
+  auto& srcs = pb.srcs;
+  auto& rawNullsPtrs = pb.rawNullsPtrs;
+  bool& anyNulls = pb.anyNulls;
   // ---- Load children; require flat, null-free, materialized ----
   // Loading a lazy child materializes the scan column -- work the merge path
   // did anyway. keepAlive pins loaded vectors for the duration of the pack.
@@ -670,14 +677,11 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   // block below rebuilds each batch from these slots, so every (b, c) must
   // land at its own index (a dense push_back breaks the moment any channel
   // is skipped).
-  std::vector<VectorPtr> keepAlive(selectedInputs.size() * numCols);
-  std::vector<const uint8_t*> srcs(selectedInputs.size() * numCols);
+
   // Null sidecar (2026-08-17): nullable FLAT children are packable in row
   // mode -- their validity rides in a per-row sidecar appended after the row
   // region. Boundary (keys-only) and col-major modes keep the old refusal.
-  std::vector<const uint64_t*> rawNullsPtrs(
-      selectedInputs.size() * numCols, nullptr);
-  bool anyNulls = false;
+
   const bool allowNulls = rowMode && !boundary;
   // Resolve join-key channels once (names came from the adjacent join op).
   if (!keyChannelsResolved_ && rowMode) {
@@ -766,7 +770,7 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
             "boundary-hybrid: join key column {} is non-flat or nullable; "
             "the keys-only pinned pack cannot handle it",
             c);
-        return nullptr; // per-batch fallback; schema itself may be fine
+        return false; // per-batch fallback; schema itself may be fine
       }
       srcs[b * numCols + c] =
           static_cast<const uint8_t*>(child->valuesAsVoid());
@@ -774,80 +778,27 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     }
   }
 
-  // ---- Stream ----
-  auto stream = cudfGlobalStreamPool().get_stream();
-  if (rowMode) {
-    // All RowStoreVectors from this operator MUST share one stream (see
-    // rowStream_ docs in the header). DEDICATED, not pooled: see
-    // DedicatedStream.h for the stall this avoids.
-    if (!rowStream_.has_value()) {
-      rowStream_ = acquireDedicatedStream();
-    }
-    stream = rowStream_.value();
-  }
+  return true;
+}
 
-  // ---- Acquire a pinned slot (ping-ponged; event-guarded reuse) ----
-  const int32_t nullStride = (numCols + 7) / 8;
-  const int64_t nullRegionBytes =
-      (rowMode && anyNulls) ? static_cast<int64_t>(totalRows) * nullStride : 0;
-  // Out-of-line string heap (2026-08-21): rides after the sidecar so one
-  // H2D carries rows + nulls + chars. Sized by a pre-pass over the
-  // StringViews (lengths only; no byte traffic).
-  int64_t heapBytes = 0;
-  if (rowMode && !boundary && hasStringFields_) {
-    for (size_t b = 0; b < selectedInputs.size(); b++) {
-      const int64_t n = selectedInputs[b]->size();
-      for (int c = 0; c < numCols; c++) {
-        if (rowFields_[c].kind != kFieldString) {
-          continue;
-        }
-        const auto* sv =
-            reinterpret_cast<const StringView*>(srcs[b * numCols + c]);
-        const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
-        for (int64_t r = 0; r < n; r++) {
-          if (nulls != nullptr && velox::bits::isBitNull(nulls, r)) {
-            continue;
-          }
-          if (sv[r].size() > kRowStrInlineMax) {
-            heapBytes += sv[r].size();
-          }
-        }
-      }
-    }
-  }
-  const int64_t heapOffset = rowMode
-      ? static_cast<int64_t>(totalRows) * rowWidth_ + nullRegionBytes
-      : 0;
-  const int64_t totalBytes = (rowMode
-      ? static_cast<int64_t>(totalRows) * rowWidth_
-      : dataWidth_ * static_cast<int64_t>(totalRows)) + nullRegionBytes +
-      heapBytes;
-  if (pinnedSlots_[0] == nullptr) {
-    // totalBytes of the first batch is the size hint: probe-side operators
-    // draw big recycled slots, build-side operators draw small ones.
-    pinnedSlots_[0] = PinnedPackSlotPool::instance().acquire(totalBytes);
-    pinnedSlots_[1] = PinnedPackSlotPool::instance().acquire(totalBytes);
-  }
-  auto& slot = *pinnedSlots_[pinnedSlot_];
-  pinnedSlot_ ^= 1;
-  const bool syncMode = pinnedPackSyncMode_ == 1;
-  if (syncMode) {
-    // Sync discipline: the per-batch stream.synchronize() at ship time
-    // guarantees the previous copy out of this slot completed before we
-    // returned it downstream — no event guard needed to repack.
-  } else if (slot.done == nullptr) {
-    VELOX_CUDA_CHECK(
-        cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
-  } else {
-    // Wait until this slot's previous copy (if any) has completed -- with
-    // two ping-ponged slots that copy finished a whole batch ago, so this
-    // returns instantly. A never-recorded event also synchronizes instantly.
-    VELOX_CUDA_CHECK(cudaEventSynchronize(slot.done));
-  }
-  ensurePinnedSlotCapacity(slot, totalBytes);
-
+// The CPU pack itself: one pass over (batch, channel) into the pinned
+// slot -- row-major (with null sidecar + string heap tail) or col-major.
+// Split out of tryPinnedPack in the 2026-08-24 reconstruction; logic
+// unchanged.
+void CudfFromVelox::packIntoSlot(
+    const std::vector<RowVectorPtr>& selectedInputs,
+    vector_size_t totalRows,
+    bool rowMode,
+    bool boundary,
+    const PackBatch& pb,
+    uint8_t* const base) {
+  const int numCols = pb.numCols;
+  const auto& srcs = pb.srcs;
+  const auto& rawNullsPtrs = pb.rawNullsPtrs;
+  const bool anyNulls = pb.anyNulls;
+  const int32_t nullStride = pb.nullStride;
+  const int64_t heapOffset = pb.heapOffset;
   // ---- Pack: ONE CPU pass, fused with the (former) merge ----
-  uint8_t* const base = slot.host;
   if (rowMode) {
     const int32_t rowWidth = rowWidth_;
     // Boundary mode packs only the key channels (rowFields_ was computed
@@ -960,6 +911,127 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     }
   }
 
+}
+
+RowVectorPtr CudfFromVelox::tryPinnedPack(
+    const std::vector<RowVectorPtr>& selectedInputs,
+    vector_size_t totalRows) {
+  if (!CudfConfig::getInstance().benchmarkCpuColToRow || totalRows == 0 ||
+      pinnedPackState_ < 0 || selectedInputs.empty()) {
+    return nullptr;
+  }
+  const bool rowWiseMode = CudfConfig::getInstance().benchmarkRowWiseGather;
+
+  resolveRowPathOnce(rowWiseMode);
+  const bool rowMode = rowWiseMode && emitRowStore_ == 1;
+  if (rowWiseMode && !rowMode) {
+    // Row mode requested but downstream only takes CudfVector: leave the
+    // standard path (from_arrow + GPU transpose downstream) intact.
+    return nullptr;
+  }
+  // Boundary-hybrid is only meaningful on the row path straight into a
+  // RowHashJoinBuild/Probe (resolved above).
+  const bool boundary = boundaryMode_ == 1 && rowMode;
+
+  // NOTE: layout derives from the INPUT's actual row type, not outputType_
+  // -- the two can disagree (e.g. the build-side scan batch carries fewer
+  // children than the operator's declared output type).
+  auto inRowType =
+      std::dynamic_pointer_cast<const RowType>(selectedInputs[0]->type());
+  if (inRowType == nullptr) {
+    return nullptr;
+  }
+  const int numCols = static_cast<int>(inRowType->size());
+  if (!computeLayoutOnce(inRowType, rowMode, boundary)) {
+    return nullptr;
+  }
+  auto tpPackStart = std::chrono::steady_clock::now();
+
+  PackBatch pb;
+  pb.numCols = numCols;
+  pb.keepAlive.resize(selectedInputs.size() * numCols);
+  pb.srcs.resize(selectedInputs.size() * numCols);
+  pb.rawNullsPtrs.assign(selectedInputs.size() * numCols, nullptr);
+  if (!loadChildren(selectedInputs, inRowType, rowMode, boundary, pb)) {
+    return nullptr;
+  }
+  const bool anyNulls = pb.anyNulls;
+  // ---- Stream ----
+  auto stream = cudfGlobalStreamPool().get_stream();
+  if (rowMode) {
+    // All RowStoreVectors from this operator MUST share one stream (see
+    // rowStream_ docs in the header). DEDICATED, not pooled: see
+    // DedicatedStream.h for the stall this avoids.
+    if (!rowStream_.has_value()) {
+      rowStream_ = acquireDedicatedStream();
+    }
+    stream = rowStream_.value();
+  }
+
+  // ---- Acquire a pinned slot (ping-ponged; event-guarded reuse) ----
+  const int32_t nullStride = (numCols + 7) / 8;
+  const int64_t nullRegionBytes =
+      (rowMode && anyNulls) ? static_cast<int64_t>(totalRows) * nullStride : 0;
+  // Out-of-line string heap (2026-08-21): rides after the sidecar so one
+  // H2D carries rows + nulls + chars. Sized by a pre-pass over the
+  // StringViews (lengths only; no byte traffic).
+  int64_t heapBytes = 0;
+  if (rowMode && !boundary && hasStringFields_) {
+    for (size_t b = 0; b < selectedInputs.size(); b++) {
+      const int64_t n = selectedInputs[b]->size();
+      for (int c = 0; c < numCols; c++) {
+        if (rowFields_[c].kind != kFieldString) {
+          continue;
+        }
+        const auto* sv =
+            reinterpret_cast<const StringView*>(pb.srcs[b * numCols + c]);
+        const uint64_t* nulls = pb.rawNullsPtrs[b * numCols + c];
+        for (int64_t r = 0; r < n; r++) {
+          if (nulls != nullptr && velox::bits::isBitNull(nulls, r)) {
+            continue;
+          }
+          if (sv[r].size() > kRowStrInlineMax) {
+            heapBytes += sv[r].size();
+          }
+        }
+      }
+    }
+  }
+  const int64_t heapOffset = rowMode
+      ? static_cast<int64_t>(totalRows) * rowWidth_ + nullRegionBytes
+      : 0;
+  const int64_t totalBytes = (rowMode
+      ? static_cast<int64_t>(totalRows) * rowWidth_
+      : dataWidth_ * static_cast<int64_t>(totalRows)) + nullRegionBytes +
+      heapBytes;
+  if (pinnedSlots_[0] == nullptr) {
+    // totalBytes of the first batch is the size hint: probe-side operators
+    // draw big recycled slots, build-side operators draw small ones.
+    pinnedSlots_[0] = PinnedPackSlotPool::instance().acquire(totalBytes);
+    pinnedSlots_[1] = PinnedPackSlotPool::instance().acquire(totalBytes);
+  }
+  auto& slot = *pinnedSlots_[pinnedSlot_];
+  pinnedSlot_ ^= 1;
+  const bool syncMode = pinnedPackSyncMode_ == 1;
+  if (syncMode) {
+    // Sync discipline: the per-batch stream.synchronize() at ship time
+    // guarantees the previous copy out of this slot completed before we
+    // returned it downstream — no event guard needed to repack.
+  } else if (slot.done == nullptr) {
+    VELOX_CUDA_CHECK(
+        cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+  } else {
+    // Wait until this slot's previous copy (if any) has completed -- with
+    // two ping-ponged slots that copy finished a whole batch ago, so this
+    // returns instantly. A never-recorded event also synchronizes instantly.
+    VELOX_CUDA_CHECK(cudaEventSynchronize(slot.done));
+  }
+  ensurePinnedSlotCapacity(slot, totalBytes);
+
+  pb.nullStride = nullStride;
+  pb.heapOffset = heapOffset;
+  packIntoSlot(selectedInputs, totalRows, rowMode, boundary, pb, slot.host);
+  uint8_t* const base = slot.host;
   auto tpPacked = std::chrono::steady_clock::now();
 
   // ---- Ship: pinned-source cudaMemcpyAsync = microsecond enqueue ----
@@ -1015,7 +1087,7 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       for (size_t b = 0; b < selectedInputs.size(); b++) {
         std::vector<VectorPtr> children(numCols);
         for (int c = 0; c < numCols; c++) {
-          children[c] = keepAlive[b * numCols + c];
+          children[c] = pb.keepAlive[b * numCols + c];
         }
         retained.push_back(std::make_shared<RowVector>(
             pool,

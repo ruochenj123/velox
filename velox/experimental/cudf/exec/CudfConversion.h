@@ -91,6 +91,36 @@ class CudfFromVelox : public CudfOperatorBase {
   // Returns nullptr when the path does not apply (flag off, unsupported
   // schema, non-flat/nullable children) — caller falls through to the
   // standard merge + from_arrow path.
+  // 2026-08-24 reconstruction: tryPinnedPack split into named steps.
+  // Per-batch pack state threaded between the steps (positionally indexed
+  // [batch * numCols + channel]; see loadChildren docs).
+  struct PackBatch {
+    int32_t numCols{0};
+    std::vector<VectorPtr> keepAlive;
+    std::vector<const uint8_t*> srcs;
+    std::vector<const uint64_t*> rawNullsPtrs;
+    bool anyNulls{false};
+    int32_t nullStride{0};
+    int64_t heapOffset{0};
+  };
+  void resolveRowPathOnce(bool rowWiseMode);
+  bool computeLayoutOnce(
+      const RowTypePtr& inRowType,
+      bool rowMode,
+      bool boundary);
+  bool loadChildren(
+      const std::vector<RowVectorPtr>& selectedInputs,
+      const RowTypePtr& inRowType,
+      bool rowMode,
+      bool boundary,
+      PackBatch& pb);
+  void packIntoSlot(
+      const std::vector<RowVectorPtr>& selectedInputs,
+      vector_size_t totalRows,
+      bool rowMode,
+      bool boundary,
+      const PackBatch& pb,
+      uint8_t* const base);
   RowVectorPtr tryPinnedPack(
       const std::vector<RowVectorPtr>& selectedInputs,
       vector_size_t totalRows);
