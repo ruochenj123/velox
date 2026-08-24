@@ -107,6 +107,10 @@ class RowOrderBy : public CudfOperatorBase {
   int32_t rowIdField_ = -1;
   std::vector<std::shared_ptr<BoundaryHostStore>> stores_;
   std::vector<int64_t> storeBases_; // global rowid base per store
+  // Coalesced per-store columns of the deferred output columns
+  // [store][deferred col], built while the device sorts.
+  std::vector<std::vector<VectorPtr>> storeCols_;
+  void coalesceStores();
   rmm::device_buffer fieldsBuffer_; // FieldDesc[] on device
 
   // ---- sorted data ----

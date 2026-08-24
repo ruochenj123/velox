@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <numeric>
 #include <thread>
 
 namespace facebook::velox::cudf_velox {
@@ -42,8 +43,7 @@ int32_t padTo8(int32_t n) {
 // contiguous row ranges (no shared mutation: disjoint destination bytes).
 constexpr int kMaxEmitThreads = 24;
 template <typename F>
-void parallelRows(int64_t n, F&& body) {
-  const int64_t kMinPerThread = 1 << 15;
+void parallelRows(int64_t n, F&& body, int64_t kMinPerThread = 1 << 15) {
   int threads = static_cast<int>(std::min<int64_t>(
       std::thread::hardware_concurrency(), kMaxEmitThreads));
   threads = static_cast<int>(
@@ -437,6 +437,20 @@ void RowOrderBy::sortRows() {
         stream_.value());
     sortedNulls_ = std::move(gatheredNulls);
   }
+  // While the device sorts and gathers, COALESCE the retained host batches
+  // into contiguous per-store columns (the CPU hybrid sort's trick,
+  // overlapped here with the GPU sort): the final permutation gather then
+  // does one plain indexed read per cell instead of a per-batch scattered
+  // extraction.
+  const auto tpCoalesce = std::chrono::steady_clock::now();
+  coalesceStores();
+  addRuntimeStat(
+      "rowSortCoalesceNanos",
+      RuntimeCounter(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - tpCoalesce)
+              .count(),
+          RuntimeCounter::Unit::kNanos));
   stream_.synchronize();
   sorted_ = std::move(gathered);
   addRuntimeStat(
@@ -497,8 +511,8 @@ void RowOrderBy::doNoMoreInput() {
   } else {
     transposeCudfInputs();
   }
+  resolveOutputOnce(); // deferred columns are needed by the coalesce
   sortRows();
-  resolveOutputOnce();
   // Chain endpoint (batch-level adaptive deferral): a sort never reduces,
   // so EVERY input row survives to the exit and the deferred payload would
   // have to be gathered host-side for all of them -- deferral only pays
@@ -507,74 +521,142 @@ void RowOrderBy::doNoMoreInput() {
   DeferralStats::instance().recordSurvived(orderByNode_->id(), totalRows_);
 }
 
-std::vector<VectorPtr> RowOrderBy::gatherDeferred(
-    const std::vector<int64_t>& gids,
-    int32_t n) {
+// Per-store contiguous columns of every deferred output column, in store
+// (= global rowid) order. Each store is extracted once, sequentially, by
+// its own thread; the store's batches are released as soon as its columns
+// are coalesced (peak host memory ~ +1 store).
+void RowOrderBy::coalesceStores() {
   const size_t S = stores_.size();
   const size_t D = deferredCols_.size();
+  storeCols_.assign(S, {});
+  if (S == 0 || D == 0) {
+    return;
+  }
   std::vector<int32_t> childIdx(D);
   for (size_t d = 0; d < D; d++) {
     childIdx[d] = static_cast<int32_t>(stores_[0]->rowType()->getChildIdx(
         outputType_->nameOf(deferredCols_[d])));
   }
-  // Per thread: regroup its row range by store, gather each store's rows
-  // (HybridContainer extraction is read-only, thread-safe) into a
-  // thread-local range vector; then assemble the ranges serially.
-  std::vector<std::vector<VectorPtr>> partial(kMaxEmitThreads);
-  std::vector<std::pair<int64_t, int64_t>> spans(kMaxEmitThreads, {0, 0});
-  parallelRows(n, [&](int64_t b, int64_t e, int t) {
-    const auto m = static_cast<int32_t>(e - b);
-    spans[t] = {b, e};
-    std::vector<std::vector<int32_t>> local(S), pos(S);
+  parallelRows(
+      static_cast<int64_t>(S),
+      [&](int64_t b, int64_t e, int /*t*/) {
+        std::vector<exec::HybridRowId> rowIds;
+        std::vector<const char*> sentinels;
+        std::vector<int32_t> seq;
+        for (int64_t k = b; k < e; k++) {
+          const auto m = static_cast<int32_t>(stores_[k]->totalRows());
+          seq.resize(m);
+          std::iota(seq.begin(), seq.end(), 0);
+          stores_[k]->idsForGlobalRows(seq.data(), m, rowIds);
+          auto& cols = storeCols_[k];
+          cols.resize(D);
+          for (size_t d = 0; d < D; d++) {
+            auto vec = BaseVector::create(
+                outputType_->childAt(deferredCols_[d]), m, pool());
+            stores_[k]->gather(childIdx[d], rowIds, vec, sentinels);
+            cols[d] = std::move(vec);
+          }
+          stores_[k].reset(); // free the retained batches
+        }
+      },
+      /*kMinPerThread=*/1);
+}
+
+std::vector<VectorPtr> RowOrderBy::gatherDeferred(
+    const std::vector<int64_t>& gids,
+    int32_t n) {
+  const size_t S = storeCols_.size();
+  const size_t D = deferredCols_.size();
+  // global id -> (store, local) once for all columns.
+  std::vector<int32_t> storeOf(n), localOf(n);
+  parallelRows(n, [&](int64_t b, int64_t e, int /*t*/) {
     for (int64_t i = b; i < e; i++) {
       const auto it =
           std::upper_bound(storeBases_.begin(), storeBases_.end(), gids[i]);
-      const size_t k = static_cast<size_t>(it - storeBases_.begin() - 1);
-      local[k].push_back(static_cast<int32_t>(gids[i] - storeBases_[k]));
-      pos[k].push_back(static_cast<int32_t>(i - b));
-    }
-    std::vector<exec::HybridRowId> rowIds;
-    std::vector<const char*> sentinels;
-    auto& out = partial[t];
-    out.resize(D);
-    for (size_t d = 0; d < D; d++) {
-      const auto& type = outputType_->childAt(deferredCols_[d]);
-      auto res = BaseVector::create(type, m, pool());
-      for (size_t k = 0; k < S; k++) {
-        const auto mk = static_cast<int32_t>(local[k].size());
-        if (mk == 0) {
-          continue;
-        }
-        stores_[k]->idsForGlobalRows(local[k].data(), mk, rowIds);
-        if (mk == m) {
-          stores_[k]->gather(childIdx[d], rowIds, res, sentinels);
-          break; // whole range from one store, already in order
-        }
-        auto tmp = BaseVector::create(type, mk, pool());
-        stores_[k]->gather(childIdx[d], rowIds, tmp, sentinels);
-        std::vector<BaseVector::CopyRange> ranges(mk);
-        for (int32_t j = 0; j < mk; j++) {
-          ranges[j] = {j, pos[k][j], 1};
-        }
-        res->copyRanges(tmp.get(), ranges);
-      }
-      out[d] = std::move(res);
+      const auto k = static_cast<int32_t>(it - storeBases_.begin() - 1);
+      storeOf[i] = k;
+      localOf[i] = static_cast<int32_t>(gids[i] - storeBases_[k]);
     }
   });
   std::vector<VectorPtr> out(D);
   for (size_t d = 0; d < D; d++) {
-    out[d] =
-        BaseVector::create(outputType_->childAt(deferredCols_[d]), n, pool());
-    for (int t = 0; t < kMaxEmitThreads; t++) {
-      if (partial[t].empty() || spans[t].second <= spans[t].first) {
-        continue;
-      }
-      BaseVector::CopyRange r{
-          0,
-          static_cast<vector_size_t>(spans[t].first),
-          static_cast<vector_size_t>(spans[t].second - spans[t].first)};
-      out[d]->copyRanges(partial[t][d].get(), folly::Range(&r, 1));
+    const auto& type = outputType_->childAt(deferredCols_[d]);
+    auto res = BaseVector::create(type, n, pool());
+    bool anyNulls = false;
+    for (size_t k = 0; k < S; k++) {
+      anyNulls = anyNulls || storeCols_[k][d]->mayHaveNulls();
     }
+    if (type->kind() == TypeKind::VARCHAR || type->kind() == TypeKind::VARBINARY) {
+      // Views from the per-store columns; bytes copied into ONE shared
+      // buffer (per-range totals first), set without copying.
+      std::vector<const StringView*> src(S);
+      for (size_t k = 0; k < S; k++) {
+        src[k] = storeCols_[k][d]->template asFlatVector<StringView>()->rawValues();
+      }
+      auto* fv = res->template asFlatVector<StringView>();
+      std::vector<int64_t> rangeBytes(kMaxEmitThreads, 0);
+      parallelRows(n, [&](int64_t b, int64_t e, int t) {
+        int64_t bytes = 0;
+        for (int64_t i = b; i < e; i++) {
+          const auto& v = src[storeOf[i]][localOf[i]];
+          if (!v.isInline()) {
+            bytes += v.size();
+          }
+        }
+        rangeBytes[t] = bytes;
+      });
+      int64_t total = 0;
+      std::vector<int64_t> rangeBase(kMaxEmitThreads, 0);
+      for (int t = 0; t < kMaxEmitThreads; t++) {
+        rangeBase[t] = total;
+        total += rangeBytes[t];
+      }
+      char* base = nullptr;
+      if (total > 0) {
+        auto buf = AlignedBuffer::allocate<char>(total, pool());
+        base = buf->asMutable<char>();
+        fv->setStringBuffers({buf});
+      }
+      parallelRows(n, [&](int64_t b, int64_t e, int t) {
+        int64_t cursor = rangeBase[t];
+        for (int64_t i = b; i < e; i++) {
+          const auto& v = src[storeOf[i]][localOf[i]];
+          if (v.isInline()) {
+            fv->setNoCopy(static_cast<vector_size_t>(i), v);
+          } else {
+            char* dst = base + cursor;
+            std::memcpy(dst, v.data(), v.size());
+            fv->setNoCopy(static_cast<vector_size_t>(i), StringView(dst, v.size()));
+            cursor += v.size();
+          }
+        }
+      });
+    } else {
+      VELOX_CHECK(
+          type->kind() != TypeKind::BOOLEAN,
+          "RowOrderBy: BOOLEAN deferred payload not supported");
+      const int32_t w = static_cast<int32_t>(type->cppSizeInBytes());
+      std::vector<const uint8_t*> src(S);
+      for (size_t k = 0; k < S; k++) {
+        src[k] = static_cast<const uint8_t*>(storeCols_[k][d]->valuesAsVoid());
+      }
+      auto* dst = static_cast<uint8_t*>(const_cast<void*>(res->valuesAsVoid()));
+      VELOX_CHECK_NOT_NULL(dst);
+      parallelRows(n, [&](int64_t b, int64_t e, int /*t*/) {
+        for (int64_t i = b; i < e; i++) {
+          std::memcpy(
+              dst + i * w, src[storeOf[i]] + static_cast<int64_t>(localOf[i]) * w, w);
+        }
+      });
+    }
+    if (anyNulls) {
+      for (int32_t i = 0; i < n; i++) {
+        if (storeCols_[storeOf[i]][d]->isNullAt(localOf[i])) {
+          res->setNull(i, true);
+        }
+      }
+    }
+    out[d] = std::move(res);
   }
   addRuntimeStat(
       "rowSortDeferredRows", RuntimeCounter(static_cast<int64_t>(n) * D));
@@ -910,6 +992,7 @@ void RowOrderBy::doClose() {
   rowInputs_.clear();
   cudfInputs_.clear();
   stores_.clear();
+  storeCols_.clear();
   sorted_ = rmm::device_buffer{};
   sortedNulls_ = rmm::device_buffer{};
   heap_ = rmm::device_buffer{};
