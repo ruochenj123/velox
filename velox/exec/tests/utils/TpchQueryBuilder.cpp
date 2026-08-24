@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "velox/exec/tests/utils/TpchQueryBuilder.h"
+
+#include <unordered_set>
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/exec/Cursor.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
@@ -105,21 +107,36 @@ void TpchQueryBuilder::readFileSchema(
           ->createReader(std::move(input), readerOptions);
   const auto fileType = reader->rowType();
   const auto fileColumnNames = fileType->names();
+  // A NARROWER file than the table's declared schema (e.g. the 2-key
+  // 'widesort' dataset against the 16-key 'wide' declaration): the file's
+  // columns must be a by-name subset of the declaration, and are then
+  // mapped by name in FILE order (positional mapping would misalign).
+  std::vector<std::string> columnsUsed = columns;
+  if (fileColumnNames.size() < columns.size()) {
+    std::unordered_set<std::string> declared(columns.begin(), columns.end());
+    for (const auto& n : fileColumnNames) {
+      VELOX_CHECK(
+          declared.count(n) > 0,
+          "file column '{}' not in the declared schema (narrower file)",
+          n);
+    }
+    columnsUsed = fileColumnNames;
+  }
   // There can be extra columns in the file towards the end.
-  VELOX_CHECK_GE(fileColumnNames.size(), columns.size());
+  VELOX_CHECK_GE(fileColumnNames.size(), columnsUsed.size());
   std::unordered_map<std::string, std::string> fileColumnNamesMap(
-      columns.size());
+      columnsUsed.size());
   std::transform(
-      columns.begin(),
-      columns.end(),
+      columnsUsed.begin(),
+      columnsUsed.end(),
       fileColumnNames.begin(),
       std::inserter(fileColumnNamesMap, fileColumnNamesMap.begin()),
       [](std::string a, std::string b) { return std::make_pair(a, b); });
-  auto columnNames = columns;
+  auto columnNames = columnsUsed;
   auto types = fileType->children();
   // Trailing extra file columns (e.g. the <col>_str twins of an encoded
   // dataset) are exposed under their own names so queries can select them.
-  for (size_t i = columns.size(); i < fileColumnNames.size(); i++) {
+  for (size_t i = columnsUsed.size(); i < fileColumnNames.size(); i++) {
     columnNames.push_back(fileColumnNames[i]);
     fileColumnNamesMap[fileColumnNames[i]] = fileColumnNames[i];
     if (fileColumnNames[i].size() > 4 &&
