@@ -97,11 +97,11 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
   }
 
   // Null sidecar: if ANY input carries one, the merged store carries one
-  // (inputs without contribute zeroed = all-valid bytes). Strings (pointer
-  // slots, 2026-08-23): slots stay valid across the copy; the merged store
-  // just retains the inputs whose buffers they reference.
+  // (inputs without contribute zeroed = all-valid bytes). Strings: one
+  // merged heap; each chunk's out-of-line offsets are rebased by its heap
+  // base. Layout: rows, sidecar, chars.
   int32_t nullStride = 0;
-  bool anyStringRefs = false;
+  int64_t totalChars = 0;
   for (const auto& v : rowBuffer_) {
     if (v->nullStride() > 0) {
       VELOX_CHECK(
@@ -109,18 +109,38 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
           "CudfBatchConcat: row store null strides disagree");
       nullStride = v->nullStride();
     }
-    anyStringRefs = anyStringRefs || v->hasStringRefs();
+    totalChars += v->charsBytes();
   }
   const int64_t rowBytes = static_cast<int64_t>(totalRows) * rowWidth;
   const int64_t nullBytes = static_cast<int64_t>(totalRows) * nullStride;
-  rmm::device_buffer merged(rowBytes + nullBytes, stream);
+  rmm::device_buffer merged(rowBytes + nullBytes + totalChars, stream);
   auto* dst = static_cast<uint8_t*>(merged.data());
   auto* nullDst = dst + rowBytes;
+  auto* charsDst = nullDst + nullBytes;
+  rmm::device_buffer strOffsDev;
+  int32_t numStr = 0;
+  if (totalChars > 0) {
+    auto strOffs = first->stringFieldOffsets();
+    numStr = static_cast<int32_t>(strOffs.size());
+    strOffsDev = rmm::device_buffer(
+        strOffs.data(), strOffs.size() * sizeof(int32_t), stream);
+  }
+  int64_t charsOff = 0;
   for (const auto& v : rowBuffer_) {
     const int64_t bytes = v->gpuRowBytes();
     if (bytes > 0) {
       cudaMemcpyAsync(
           dst, v->gpuRowData(), bytes, cudaMemcpyDeviceToDevice, stream.value());
+      if (v->charsBytes() > 0) {
+        cudaMemcpyAsync(
+            charsDst + charsOff, v->charsData(), v->charsBytes(),
+            cudaMemcpyDeviceToDevice, stream.value());
+        rebaseStringOffsets(
+            dst, v->size(), rowWidth,
+            static_cast<const int32_t*>(strOffsDev.data()), numStr,
+            charsOff, stream.value());
+        charsOff += v->charsBytes();
+      }
       dst += bytes;
     }
     if (nullStride > 0 && v->size() > 0) {
@@ -140,17 +160,6 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
       fields.data(), fields.size() * sizeof(FieldDesc), stream);
   auto fieldsHost = fields;
 
-  // Collect keep-alives BEFORE releasing the inputs.
-  std::vector<std::shared_ptr<void>> keepAlive;
-  if (anyStringRefs) {
-    for (const auto& v : rowBuffer_) {
-      if (v->hasStringRefs()) {
-        for (const auto& o : v->stringKeepAlive()) {
-          keepAlive.push_back(o);
-        }
-      }
-    }
-  }
   rowBuffer_.clear();
   currentNumRows_ = 0;
 
@@ -168,8 +177,8 @@ RowVectorPtr CudfBatchConcat::concatRowStore() {
   if (nullStride > 0) {
     out->setNullSidecar(nullStride);
   }
-  if (anyStringRefs) {
-    out->addStringKeepAlives(keepAlive);
+  if (totalChars > 0) {
+    out->setCharsInTail(rowBytes + nullBytes, totalChars);
   }
   return out;
 }

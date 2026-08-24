@@ -120,12 +120,10 @@ void checkTransposeInputNullFree(
 
 /// Transpose a cudf::table_view (already on GPU) into a row buffer on GPU.
 /// Returns the row buffer as rmm::device_buffer.
-/// String columns become pointer slots aimed straight at each column's
-/// chars buffer (zero copy) -- the CALLER must keep the source table alive
-/// for as long as any consumer may dereference the produced rows. Fixed
-/// columns go through columnsToRows. Returns true if any string column
-/// produced out-of-line pointers.
-bool transposeToRows(
+/// Returns the out-of-line string heap (empty when the table has no string
+/// columns). String columns' chars are concatenated into one heap and their
+/// slots written by stringsToSlots; fixed columns go through columnsToRows.
+rmm::device_buffer transposeToRows(
     const cudf::table_view& table,
     const std::vector<FieldDesc>& fields,
     int32_t rowWidth,
@@ -133,7 +131,7 @@ bool transposeToRows(
     cudaStream_t stream) {
   int32_t numRows = table.num_rows();
   int32_t numCols = table.num_columns();
-  if (numRows == 0 || numCols == 0) return false;
+  if (numRows == 0 || numCols == 0) return rmm::device_buffer{};
   checkTransposeInputNullFree(table, "transposeToRows");
 
   // Fixed-width columns: pointer + FieldDesc subset.
@@ -154,29 +152,59 @@ bool transposeToRows(
         rowWidth, d_row_buffer, stream);
   }
   if (strCols.empty()) {
-    return false;
+    return rmm::device_buffer{};
   }
   rmm::cuda_stream_view sv(stream);
+  int64_t total = 0;
+  std::vector<int64_t> bases(strCols.size());
+  for (size_t k = 0; k < strCols.size(); k++) {
+    cudf::strings_column_view scv(table.column(strCols[k]));
+    bases[k] = total;
+    total += scv.chars_size(sv);
+  }
+  rmm::device_buffer heap(total, sv);
   for (size_t k = 0; k < strCols.size(); k++) {
     const auto col = table.column(strCols[k]);
     cudf::strings_column_view scv(col);
     auto offsets = scv.offsets();
     const bool off64 = offsets.type().id() == cudf::type_id::INT64;
     // offsets() is the UNSLICED child; offsets are absolute into the chars
-    // buffer, so skip col.offset() entries and let the kernel add chars.
+    // buffer, so for a sliced column skip col.offset() entries and subtract
+    // the first offset when relocating bytes into the combined heap.
     const uint8_t* offBase = static_cast<const uint8_t*>(offsets.head()) +
         static_cast<int64_t>(col.offset()) * (off64 ? 8 : 4);
+    int64_t firstOff = 0;
+    if (col.offset() != 0) {
+      if (off64) {
+        cudaMemcpyAsync(&firstOff, offBase, 8, cudaMemcpyDeviceToHost, stream);
+      } else {
+        int32_t f32 = 0;
+        cudaMemcpyAsync(&f32, offBase, 4, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        firstOff = f32;
+      }
+      cudaStreamSynchronize(stream);
+    }
+    const int64_t bytes = scv.chars_size(sv);
+    const uint8_t* chars =
+        reinterpret_cast<const uint8_t*>(scv.chars_begin(sv));
+    if (bytes > 0) {
+      cudaMemcpyAsync(
+          static_cast<uint8_t*>(heap.data()) + bases[k],
+          chars + firstOff, bytes, cudaMemcpyDeviceToDevice, stream);
+    }
     stringsToSlots(
         offBase,
         off64,
-        reinterpret_cast<const uint8_t*>(scv.chars_begin(sv)),
+        chars,
+        bases[k] - firstOff,
         numRows,
         d_row_buffer,
         rowWidth,
         fields[strCols[k]].offset,
         stream);
   }
-  return true;
+  return heap;
 }
 
 /// Map cudf type to byte width.
@@ -479,7 +507,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   rmm::device_buffer fieldsBuffer;
   // Null sidecar for the combined build store (2026-08-17 null support).
   rmm::device_buffer buildNullBuffer;
-  std::vector<std::shared_ptr<void>> buildStringKeepAlive; // pointer slots
+  rmm::device_buffer buildCharsBuffer; // out-of-line string heap
   int32_t buildNullStride = 0;
   std::vector<rmm::device_buffer> keyBuffers;
   std::shared_ptr<cudf::hash_join> hashJoin;
@@ -629,6 +657,25 @@ void RowHashJoinBuild::doNoMoreInput() {
     rowWidth = firstRowStore->rowWidth();
     fields = firstRowStore->hostFields();
 
+    // Out-of-line strings: the combined store gets ONE heap; each chunk's
+    // heap is appended and its slots rebased by the chunk's heap base.
+    int64_t totalCharsBuild = 0;
+    for (auto& inp : inputs_) {
+      if (auto r = std::dynamic_pointer_cast<RowStoreVector>(inp)) {
+        totalCharsBuild += r->charsBytes();
+      }
+    }
+    rmm::device_buffer strFieldOffsetsDev;
+    int32_t numStrFields = 0;
+    if (totalCharsBuild > 0) {
+      buildCharsBuffer = rmm::device_buffer(totalCharsBuild, stream);
+      auto strOffs = firstRowStore->stringFieldOffsets();
+      numStrFields = static_cast<int32_t>(strOffs.size());
+      strFieldOffsetsDev = rmm::device_buffer(
+          strOffs.data(), strOffs.size() * sizeof(int32_t), stream);
+    }
+    int64_t charsOffset = 0;
+
     // CROSS-STREAM ORDERING (2026-08-21 fix): each input row store was
     // filled by an H2D copy on ITS PRODUCER'S stream (CudfFromVelox's
     // per-operator row stream, async mode on the build side). The D2D
@@ -695,13 +742,17 @@ void RowHashJoinBuild::doNoMoreInput() {
             static_cast<uint8_t*>(rowBuffer.data()) + offset,
             rsv->gpuRowData(), chunkBytes,
             cudaMemcpyDeviceToDevice, stream.value());
-        // Pointer slots (2026-08-23): copied rows may reference upstream
-        // heap buffers -- retain them (only the small chars buffers, never
-        // whole row stores) for the build's life.
-        if (rsv->hasStringRefs()) {
-          for (const auto& o : rsv->stringKeepAlive()) {
-            buildStringKeepAlive.push_back(o);
-          }
+        if (rsv->charsBytes() > 0) {
+          cudaMemcpyAsync(
+              static_cast<uint8_t*>(buildCharsBuffer.data()) + charsOffset,
+              rsv->charsData(), rsv->charsBytes(),
+              cudaMemcpyDeviceToDevice, stream.value());
+          rebaseStringOffsets(
+              static_cast<uint8_t*>(rowBuffer.data()) + offset,
+              rsv->size(), rowWidth,
+              static_cast<const int32_t*>(strFieldOffsetsDev.data()),
+              numStrFields, charsOffset, stream.value());
+          charsOffset += rsv->charsBytes();
         }
         offset += chunkBytes;
       }
@@ -853,13 +904,9 @@ void RowHashJoinBuild::doNoMoreInput() {
       int64_t rowBytes = numRows * rowWidth;
       rowBuffer = rmm::device_buffer(rowBytes, stream);
 
-      if (transposeToRows(
-              buildView, fields, rowWidth,
-              static_cast<uint8_t*>(rowBuffer.data()), stream.value())) {
-        // Slots point into the concatenated table's chars buffers.
-        buildStringKeepAlive.push_back(
-            std::shared_ptr<void>(std::move(concatenated)));
-      }
+      buildCharsBuffer = transposeToRows(
+          buildView, fields, rowWidth,
+          static_cast<uint8_t*>(rowBuffer.data()), stream.value());
       stamp(2);
 
       fieldsBuffer = rmm::device_buffer(
@@ -937,6 +984,10 @@ void RowHashJoinBuild::doNoMoreInput() {
         static_cast<const uint8_t*>(buildNullBuffer.data());
     gpuStore.null_stride = buildNullStride;
   }
+  if (buildCharsBuffer.size() > 0) {
+    gpuStore.chars = static_cast<const uint8_t*>(buildCharsBuffer.data());
+    gpuStore.chars_bytes = static_cast<int64_t>(buildCharsBuffer.size());
+  }
   stream.synchronize();
 
   // Push to bridge
@@ -951,7 +1002,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.hostFields = std::move(fields);
   bd.nullBuffer = std::move(buildNullBuffer);
   bd.nullStride = buildNullStride;
-  bd.stringKeepAlive = std::move(buildStringKeepAlive);
+  bd.charsBuffer = std::move(buildCharsBuffer);
   // Boundary-hybrid: hand the probe the host payload store; gpuRowStore then
   // holds keys only and is used solely for hash-table construction above.
   bd.boundaryHybrid = boundaryBuild;
@@ -1153,12 +1204,14 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     probeGpuStore.num_rows = probeRows;
     probeGpuStore.num_fields = probeFields_.size();
     probeGpuStore.fields = static_cast<const FieldDesc*>(probeFieldsBuffer_.data());
+    if (rowStoreInput->charsBytes() > 0) {
+      probeGpuStore.chars = rowStoreInput->charsData();
+      probeGpuStore.chars_bytes = rowStoreInput->charsBytes();
+    }
 
     addRuntimeStat(
         "probeTransposeSkipped",
         RuntimeCounter(static_cast<int64_t>(probeRows)));
-    lastProbeInput_ = rowStoreInput;
-    lastProbeCudfInput_.reset();
   } else {
     // ---- Path B: CudfVector (transpose all columns to rows, extract key) ----
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
@@ -1194,7 +1247,7 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     }
 
     // Transpose ALL columns (including key) to rows
-    probeInputHasStringRefs_ = transposeToRows(
+    probeCharsBuffer_ = transposeToRows(
         probeView, probeFields_, probeRowWidth_,
         static_cast<uint8_t*>(probeRowBuffer_.data()), stream.value());
 
@@ -1217,8 +1270,12 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     probeGpuStore.num_rows = probeRows;
     probeGpuStore.num_fields = probeFields_.size();
     probeGpuStore.fields = static_cast<const FieldDesc*>(probeFieldsBuffer_.data());
-    lastProbeCudfInput_ = cudfInput;
-    lastProbeInput_.reset();
+    if (probeCharsBuffer_.size() > 0) {
+      probeGpuStore.chars =
+          static_cast<const uint8_t*>(probeCharsBuffer_.data());
+      probeGpuStore.chars_bytes =
+          static_cast<int64_t>(probeCharsBuffer_.size());
+    }
   }
 
   // ---- Compute output row layout (once) ----
@@ -1266,13 +1323,27 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       ofd.byte_width = byteWidth;
       ofd.kind = kind;
       outputFields_.push_back(ofd);
-      // Pointer slots (2026-08-23): string slots are copied verbatim by the
-      // gather and stay valid -- no compaction pass; the output only needs
-      // the source buffers kept alive.
-      outputHasStrings_ = outputHasStrings_ || kind == kFieldString;
+      if (kind == kFieldString) {
+        // Slots are copied verbatim by the gather; compactStrings then
+        // relocates their bytes from the side's heap (0 = probe, 1 =
+        // build) into the output heap.
+        outputStringFields_.push_back(
+            {dstOffset, leftIdx.has_value() ? 0 : 1});
+      }
       dstOffset += byteWidth;
     }
     outputRowWidth_ = (dstOffset + 7) & ~7;
+    if (!outputStringFields_.empty()) {
+      outputStringFieldsBuffer_ = rmm::device_buffer(
+          outputStringFields_.data(),
+          outputStringFields_.size() * sizeof(StringGatherField), stream);
+      std::vector<int32_t> strOffs;
+      for (const auto& f : outputStringFields_) {
+        strOffs.push_back(f.dst_offset);
+      }
+      outputStrOffsetsBuffer_ = rmm::device_buffer(
+          strOffs.data(), strOffs.size() * sizeof(int32_t), stream);
+    }
 
     // Upload field mappings to GPU (constant across all batches)
     if (!probeGatherMappings_.empty()) {
@@ -1387,6 +1458,41 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         outNullBytes,
         outputNullStride_);
 
+    // ---- Out-of-line string compaction ----
+    // Size pass + scan gives each output row its heap base (one sync for
+    // the total), then one kernel copies the bytes and rewrites offsets.
+    outputCharsBuffer_ = rmm::device_buffer{};
+    if (!outputStringFields_.empty() &&
+        (probeGpuStore.chars_bytes > 0 || bd.gpuRowStore.chars_bytes > 0)) {
+      const size_t baseBytes =
+          (static_cast<size_t>(numMatches) + 1) * sizeof(int64_t);
+      if (baseBytes > outputRowBaseBuffer_.size()) {
+        outputRowBaseBuffer_ = rmm::device_buffer(baseBytes, stream);
+      }
+      const int64_t heapBytes = stringHeapLayout(
+          static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+          numMatches,
+          outputRowWidth_,
+          static_cast<const int32_t*>(outputStrOffsetsBuffer_.data()),
+          static_cast<int32_t>(outputStringFields_.size()),
+          static_cast<int64_t*>(outputRowBaseBuffer_.data()),
+          stream.value());
+      if (heapBytes > 0) {
+        outputCharsBuffer_ = rmm::device_buffer(heapBytes, stream);
+        compactStrings(
+            static_cast<uint8_t*>(probeGatherBuffer_.data()),
+            numMatches,
+            outputRowWidth_,
+            static_cast<const StringGatherField*>(
+                outputStringFieldsBuffer_.data()),
+            static_cast<int32_t>(outputStringFields_.size()),
+            probeGpuStore.chars,
+            bd.gpuRowStore.chars,
+            static_cast<const int64_t*>(outputRowBaseBuffer_.data()),
+            static_cast<uint8_t*>(outputCharsBuffer_.data()),
+            stream.value());
+      }
+    }
   }
 
   if (timeGather) {
@@ -1540,26 +1646,11 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   if (outputNullStride_ > 0) {
     out->setNullSidecar(outputNullStride_);
   }
-  attachStringKeepAlives(out);
+  if (outputCharsBuffer_.size() > 0) {
+    out->setCharsBuffer(std::move(outputCharsBuffer_));
+    outputCharsBuffer_ = rmm::device_buffer{};
+  }
   return out;
-}
-
-// Pointer slots (2026-08-23): a gathered output's string slots point into
-// the probe input's heap / upstream buffers and the build's retained
-// sources. Retain them on the output vector.
-void RowHashJoinProbe::attachStringKeepAlives(std::shared_ptr<RowStoreVector>& out) {
-  if (!outputHasStrings_) {
-    return;
-  }
-  if (lastProbeInput_ != nullptr) {
-    if (lastProbeInput_->hasStringRefs()) {
-      out->addStringKeepAlives(lastProbeInput_->stringKeepAlive());
-    }
-  } else if (lastProbeCudfInput_ != nullptr && probeInputHasStringRefs_) {
-    // Transposed CudfVector probe: slots point into its chars buffers.
-    out->addStringKeepAlive(lastProbeCudfInput_);
-  }
-  out->addStringKeepAlives(buildData_->stringKeepAlive);
 }
 
 // ============================================================================
@@ -1659,6 +1750,7 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
           numMatches,
           outputRowWidth_,
           outputFields_[i].offset,
+          static_cast<const uint8_t*>(outputCharsBuffer_.data()),
           static_cast<const int64_t*>(outputRowBaseBuffer_.data()),
           offsetsCol->mutable_view().data<int32_t>(),
           static_cast<uint8_t*>(chars.data()),
@@ -1680,6 +1772,7 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
   }
 
   auto table = std::make_unique<cudf::table>(std::move(columns));
+  outputCharsBuffer_ = rmm::device_buffer{};
 
   // Gather buffer is consumed by the per-column copies above; force realloc.
   gatherCapacity_ = 0;

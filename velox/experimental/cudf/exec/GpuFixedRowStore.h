@@ -25,18 +25,19 @@ struct FieldDesc {
 };
 
 // ============================================================================
-// Out-of-line strings (2026-08-21; pointer slots 2026-08-23)
+// Out-of-line strings (2026-08-21; EAGER-COMPACTION design)
 //
 // A string field occupies a 16-byte slot mirroring Velox's StringView:
-//   len <= 12 : [u32 len][12 bytes of data]              (inline)
-//   len  > 12 : [u32 len][4-byte prefix][u64 device ptr]  (out of line)
-// The pointer is an ABSOLUTE device address of the string's bytes, wherever
-// they already live (the pack's uploaded heap region, a cudf strings
-// column's chars buffer, another store's buffer). Slots therefore stay valid
-// across gather/concat/build with NO compaction or offset rebase; each
-// RowStoreVector instead keeps the referenced buffers alive (stringKeepAlive).
-// Bytes are copied only at materialization (strings column / CPU exit).
-// Inline slots are byte-identical to a FlatVector<StringView> element.
+//   len <= 12 : [u32 len][12 bytes of data]             (inline)
+//   len  > 12 : [u32 len][4-byte prefix][u64 heap off]  (out of line)
+// The heap is a per-store byte region (GpuFixedRowStore::chars); offsets are
+// relative to it. Join gathers COMPACT survivors' bytes into a fresh heap
+// (stringHeapLayout + compactStrings); appending stores (concat, build
+// accumulate) rebase offsets (rebaseStringOffsets). A pointer-slot variant
+// (no compaction, keep-alive lists) was measured ~5% slower at SF100 warm
+// (sequential compacted heaps read faster downstream) and reverted --
+// see REVIEW-ROUND5.md. Inline slots are byte-identical to a
+// FlatVector<StringView> element, so the CPU pack is a 16B memcpy.
 // ============================================================================
 constexpr int32_t kRowStrSlotBytes = 16;
 constexpr uint32_t kRowStrInlineMax = 12;
@@ -72,4 +73,8 @@ struct GpuFixedRowStore {
   // struct end for partial-rebuild ABI safety (see REVIEW-GUIDE).
   const uint8_t* null_bytes = nullptr;
   int32_t null_stride = 0;
+  // Out-of-line string heap (2026-08-21). nullptr when no string field is
+  // out of line. Appended at the end for ABI safety, as above.
+  const uint8_t* chars = nullptr;
+  int64_t chars_bytes = 0;
 };

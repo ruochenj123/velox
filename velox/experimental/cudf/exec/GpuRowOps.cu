@@ -632,19 +632,58 @@ __device__ __forceinline__ uint32_t slot_len(const uint8_t* slot) {
   memcpy(&v, slot, 4);
   return v;
 }
-__device__ __forceinline__ const uint8_t* slot_ptr(const uint8_t* slot) {
+__device__ __forceinline__ uint64_t slot_off(const uint8_t* slot) {
   uint64_t v;
   memcpy(&v, slot + 8, 8);
-  return reinterpret_cast<const uint8_t*>(v);
+  return v;
+}
+__device__ __forceinline__ void slot_set_off(uint8_t* slot, uint64_t off) {
+  memcpy(slot + 8, &off, 8);
 }
 
-// cudf strings column -> pointer slots. offsets may be int32 or int64
-// (cudf >= 24.x large strings). Out-of-line slots point straight into the
-// column's chars buffer -- no copy; the caller keeps the buffer alive.
+// Add `delta` to every out-of-line offset of the given string fields, for
+// rows [0, num_rows) of `rows`. Used when heaps are appended (concat/build).
+__global__ void rebase_string_offsets_kernel(
+    uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* __restrict__ str_field_offsets,
+    int32_t num_str_fields,
+    int64_t delta) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  uint8_t* r = rows + (int64_t)row * row_width;
+  for (int f = 0; f < num_str_fields; f++) {
+    uint8_t* slot = r + str_field_offsets[f];
+    if (slot_len(slot) > kRowStrInlineMax) {
+      slot_set_off(slot, slot_off(slot) + (uint64_t)delta);
+    }
+  }
+}
+
+void rebaseStringOffsets(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    int64_t delta,
+    cudaStream_t stream) {
+  if (num_rows == 0 || num_str_fields == 0 || delta == 0) return;
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  rebase_string_offsets_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, d_str_field_offsets, num_str_fields, delta);
+}
+
+// cudf strings column -> slots. offsets may be int32 or int64 (cudf >= 24.x
+// large strings). chars_delta = where this column's chars were copied in the
+// combined heap MINUS the column's first absolute offset.
 template <typename OffsetT>
 __global__ void strings_to_slots_kernel(
     const OffsetT* __restrict__ offsets,
     const uint8_t* __restrict__ chars,
+    int64_t chars_delta,
     int32_t num_rows,
     uint8_t* __restrict__ rows,
     int32_t row_width,
@@ -665,8 +704,8 @@ __global__ void strings_to_slots_kernel(
     for (int i = 0; i < 4; i++) {
       tmp[4 + i] = chars[b + i];
     }
-    const uint64_t ptr = (uint64_t)(chars + b);
-    memcpy(tmp + 8, &ptr, 8);
+    const uint64_t off = (uint64_t)(b + chars_delta);
+    memcpy(tmp + 8, &off, 8);
   }
   memcpy(slot, tmp, kRowStrSlotBytes);
 }
@@ -675,6 +714,7 @@ void stringsToSlots(
     const void* d_offsets,
     bool offsets_are_int64,
     const uint8_t* d_chars,
+    int64_t chars_delta,
     int32_t num_rows,
     uint8_t* d_rows,
     int32_t row_width,
@@ -685,13 +725,38 @@ void stringsToSlots(
   int grid = (num_rows + block - 1) / block;
   if (offsets_are_int64) {
     strings_to_slots_kernel<int64_t><<<grid, block, 0, stream>>>(
-        static_cast<const int64_t*>(d_offsets), d_chars,
+        static_cast<const int64_t*>(d_offsets), d_chars, chars_delta,
         num_rows, d_rows, row_width, field_offset);
   } else {
     strings_to_slots_kernel<int32_t><<<grid, block, 0, stream>>>(
-        static_cast<const int32_t*>(d_offsets), d_chars,
+        static_cast<const int32_t*>(d_offsets), d_chars, chars_delta,
         num_rows, d_rows, row_width, field_offset);
   }
+}
+
+// Per-row out-of-line byte count over a set of string fields (sizes the
+// compaction heap). Output has num_rows + 1 entries; the extra is 0 so an
+// exclusive scan yields the total in the last slot.
+__global__ void string_out_of_line_bytes_kernel(
+    const uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* __restrict__ str_field_offsets,
+    int32_t num_str_fields,
+    int64_t* __restrict__ out_bytes) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row > num_rows) return;
+  if (row == num_rows) {
+    out_bytes[row] = 0;
+    return;
+  }
+  const uint8_t* r = rows + (int64_t)row * row_width;
+  int64_t sum = 0;
+  for (int f = 0; f < num_str_fields; f++) {
+    const uint32_t len = slot_len(r + str_field_offsets[f]);
+    if (len > kRowStrInlineMax) sum += len;
+  }
+  out_bytes[row] = sum;
 }
 
 // Exclusive scan in place over num_rows + 1 int64 entries; returns the total
@@ -731,6 +796,7 @@ __global__ void string_field_to_chars_kernel(
     int32_t num_rows,
     int32_t row_width,
     int32_t field_offset,
+    const uint8_t* __restrict__ heap,
     const int64_t* __restrict__ offsets64,
     int32_t* __restrict__ offsets32,
     uint8_t* __restrict__ out_chars) {
@@ -740,9 +806,83 @@ __global__ void string_field_to_chars_kernel(
   if (row == num_rows) return;
   const uint8_t* slot = rows + (int64_t)row * row_width + field_offset;
   const uint32_t len = slot_len(slot);
-  const uint8_t* src = len <= kRowStrInlineMax ? slot + 4 : slot_ptr(slot);
+  const uint8_t* src = len <= kRowStrInlineMax ? slot + 4 : heap + slot_off(slot);
   uint8_t* dst = out_chars + offsets64[row];
   for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
+}
+
+int64_t stringHeapLayout(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    int64_t* d_row_base,
+    cudaStream_t stream) {
+  if (num_str_fields == 0) return 0;
+  int block = 256;
+  int grid = (num_rows + 1 + block - 1) / block;
+  string_out_of_line_bytes_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, d_str_field_offsets, num_str_fields,
+      d_row_base);
+  return exclusive_scan_total(d_row_base, num_rows + 1, stream);
+}
+
+// Compaction: for each output row, copy the out-of-line bytes of every
+// string field from its source heap (per field: probe or build) into the
+// fresh heap at row_base[row], rewriting the slot offset. Slots were copied
+// verbatim by the fixed gather; inline slots need nothing.
+__global__ void compact_strings_kernel(
+    uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const StringGatherField* __restrict__ fields,
+    int32_t num_fields,
+    const uint8_t* __restrict__ heap0,
+    const uint8_t* __restrict__ heap1,
+    const int64_t* __restrict__ row_base,
+    uint8_t* __restrict__ out_chars) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  uint8_t* r = rows + (int64_t)row * row_width;
+  int64_t cursor = row_base[row];
+  for (int f = 0; f < num_fields; f++) {
+    uint8_t* slot = r + fields[f].dst_offset;
+    const uint32_t len = slot_len(slot);
+    if (len <= kRowStrInlineMax) continue;
+    const uint8_t* src =
+        (fields[f].heap == 0 ? heap0 : heap1) + slot_off(slot);
+    uint8_t* dst = out_chars + cursor;
+    uint32_t i = 0;
+    if ((((uintptr_t)src | (uintptr_t)dst) & 7) == 0) {
+      for (; i + 8 <= len; i += 8) {
+        *reinterpret_cast<uint64_t*>(dst + i) =
+            *reinterpret_cast<const uint64_t*>(src + i);
+      }
+    }
+    for (; i < len; i++) dst[i] = src[i];
+    slot_set_off(slot, (uint64_t)cursor);
+    cursor += len;
+  }
+}
+
+void compactStrings(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const StringGatherField* d_fields,
+    int32_t num_fields,
+    const uint8_t* d_heap0,
+    const uint8_t* d_heap1,
+    const int64_t* d_row_base,
+    uint8_t* d_out_chars,
+    cudaStream_t stream) {
+  if (num_rows == 0 || num_fields == 0) return;
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  compact_strings_kernel<<<grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, d_fields, num_fields, d_heap0, d_heap1,
+      d_row_base, d_out_chars);
 }
 
 int64_t stringFieldOffsets(
@@ -764,6 +904,7 @@ void stringFieldToChars(
     int32_t num_rows,
     int32_t row_width,
     int32_t field_offset,
+    const uint8_t* d_heap,
     const int64_t* d_offsets64,
     int32_t* d_offsets32,
     uint8_t* d_out_chars,
@@ -771,6 +912,6 @@ void stringFieldToChars(
   int block = 256;
   int grid = (num_rows + 1 + block - 1) / block;
   string_field_to_chars_kernel<<<grid, block, 0, stream>>>(
-      d_rows, num_rows, row_width, field_offset, d_offsets64,
+      d_rows, num_rows, row_width, field_offset, d_heap, d_offsets64,
       d_offsets32, d_out_chars);
 }

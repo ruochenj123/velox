@@ -105,10 +105,9 @@ class RowHashJoinBridge : public exec::JoinBridge {
     // batches without a sidecar contribute zeroed (all-valid) bytes.
     rmm::device_buffer nullBuffer;
     int32_t nullStride{0};
-    // Owners of buffers referenced by the build rows' out-of-line string
-    // pointer slots (2026-08-23): input row stores / the concatenated cudf
-    // table. Kept for the bridge's lifetime.
-    std::vector<std::shared_ptr<void>> stringKeepAlive;
+    // Out-of-line string heap of the build rows; gpuRowStore.chars points
+    // into it.
+    rmm::device_buffer charsBuffer;
   };
 
   void setBuildData(std::shared_ptr<BuildData> data);
@@ -260,15 +259,13 @@ class RowHashJoinProbe : public CudfOperatorBase {
   // Output null sidecar for the current batch (rows = numMatches) and the
   // output stride; allocated only when an input store carries nulls.
   rmm::device_buffer outputNullBuffer_;
-  // ---- Out-of-line strings (pointer slots, 2026-08-23) ----
-  bool outputHasStrings_ = false;   // any string field in the join output
-  bool probeInputHasStringRefs_ = false; // transposed CudfVector had strings
-  // Inputs of the CURRENT batch, retained so the emitted output vector can
-  // keep the buffers its string slots point into.
-  std::shared_ptr<RowStoreVector> lastProbeInput_;
-  RowVectorPtr lastProbeCudfInput_;
-  rmm::device_buffer outputRowBaseBuffer_; // int64[numMatches+1] (col output)
-  void attachStringKeepAlives(std::shared_ptr<RowStoreVector>& out);
+  // ---- Out-of-line strings (eager compaction) ----
+  rmm::device_buffer probeCharsBuffer_;   // heap of a transposed CudfVector probe
+  std::vector<StringGatherField> outputStringFields_; // string fields in output
+  rmm::device_buffer outputStringFieldsBuffer_;       // device copy
+  rmm::device_buffer outputStrOffsetsBuffer_;         // int32 slot offsets
+  rmm::device_buffer outputRowBaseBuffer_;            // int64[numMatches+1]
+  rmm::device_buffer outputCharsBuffer_;              // compacted heap
   int32_t outputNullStride_ = 0;
 
   // Pre-allocated device buffers (reused per batch)

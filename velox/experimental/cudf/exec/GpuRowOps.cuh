@@ -155,17 +155,60 @@ void rowsToColumns(
 // synchronize the stream to return the heap total.
 // ============================================================================
 
-/// cudf strings column (offsets + chars) -> 16B pointer slots in a row
-/// buffer. Out-of-line slots point into d_chars directly (zero copy); the
-/// caller keeps the chars buffer alive.
+/// One string field of a gathered output row and which source heap it came
+/// from (0 = probe, 1 = build).
+struct StringGatherField {
+  int32_t dst_offset;
+  int32_t heap;
+};
+
+/// Add delta to every out-of-line offset of the listed string fields.
+void rebaseStringOffsets(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    int64_t delta,
+    cudaStream_t stream);
+
+/// cudf strings column (offsets + chars) -> 16B slots in a row buffer; the
+/// column's chars are assumed copied into the combined heap such that
+/// slot offset = absolute column offset + chars_delta.
 void stringsToSlots(
     const void* d_offsets,
     bool offsets_are_int64,
     const uint8_t* d_chars,
+    int64_t chars_delta,
     int32_t num_rows,
     uint8_t* d_rows,
     int32_t row_width,
     int32_t field_offset,
+    cudaStream_t stream);
+
+/// Per-row heap base for compaction (d_row_base has num_rows + 1 entries);
+/// returns the total heap bytes needed. Synchronizes.
+int64_t stringHeapLayout(
+    const uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    int64_t* d_row_base,
+    cudaStream_t stream);
+
+/// Copy out-of-line bytes of the listed fields into d_out_chars and rewrite
+/// the slots' offsets (run after the fixed gather copied slots verbatim).
+void compactStrings(
+    uint8_t* d_rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const StringGatherField* d_fields,
+    int32_t num_fields,
+    const uint8_t* d_heap0,
+    const uint8_t* d_heap1,
+    const int64_t* d_row_base,
+    uint8_t* d_out_chars,
     cudaStream_t stream);
 
 /// One string field -> exclusive-scanned int64 offsets (num_rows + 1); returns
@@ -185,6 +228,7 @@ void stringFieldToChars(
     int32_t num_rows,
     int32_t row_width,
     int32_t field_offset,
+    const uint8_t* d_heap,
     const int64_t* d_offsets64,
     int32_t* d_offsets32,
     uint8_t* d_out_chars,

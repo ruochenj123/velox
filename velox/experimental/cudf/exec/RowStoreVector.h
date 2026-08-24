@@ -76,6 +76,10 @@ class RowStoreVector : public RowVector {
     store.num_rows = size();
     store.num_fields = hostFields_.size();
     store.fields = static_cast<const FieldDesc*>(fieldsBuffer_->data());
+    if (charsBytes_ > 0) {
+      store.chars = charsData();
+      store.chars_bytes = charsBytes_;
+    }
     if (nullStride_ > 0) {
       // Sidecar rides in the tail of rowBuffer_ (rows region, then
       // num_rows * nullStride_ null bytes) -- one H2D covers both.
@@ -86,34 +90,39 @@ class RowStoreVector : public RowVector {
     return store;
   }
 
-  // ---- Out-of-line strings (pointer slots, 2026-08-23; format in
-  // GpuFixedRowStore.h)
+  // ---- Out-of-line strings (2026-08-21; slot format in GpuFixedRowStore.h)
   //
-  // Out-of-line slots hold ABSOLUTE device pointers into whatever buffer
-  // already holds the bytes (the pack's uploaded heap tail of rowBuffer_, a
-  // cudf strings column's chars, an upstream RowStoreVector's buffer).
-  // Whoever writes such slots must register the referenced owner here so it
-  // outlives this vector. hasStringRefs() == true means slots may point
-  // outside rowBuffer_ (or into its tail) -- consumers that copy rows
-  // elsewhere must propagate the keep-alive list.
-  void addStringKeepAlive(std::shared_ptr<void> owner) {
-    if (owner != nullptr) {
-      stringKeepAlive_.push_back(std::move(owner));
+  // The heap either rides in the tail of rowBuffer_ (pack path: rows, null
+  // sidecar, then chars -- one H2D) or is a separate buffer (gather/concat
+  // outputs). charsBytes_ == 0 means no field is out of line (all strings
+  // inline or no strings at all).
+  void setCharsInTail(int64_t byteOffset, int64_t bytes) {
+    charsTailOffset_ = byteOffset;
+    charsBytes_ = bytes;
+  }
+  void setCharsBuffer(rmm::device_buffer chars) {
+    charsBytes_ = static_cast<int64_t>(chars.size());
+    charsBuffer_ = std::move(chars);
+    charsTailOffset_ = -1;
+  }
+  const uint8_t* charsData() const {
+    if (charsBytes_ == 0) {
+      return nullptr;
     }
-    hasStringRefs_ = true;
+    return charsTailOffset_ >= 0
+        ? static_cast<const uint8_t*>(rowBuffer_.data()) + charsTailOffset_
+        : static_cast<const uint8_t*>(charsBuffer_.data());
   }
-  void addStringKeepAlives(const std::vector<std::shared_ptr<void>>& owners) {
-    for (const auto& o : owners) {
-      stringKeepAlive_.push_back(o);
+  int64_t charsBytes() const { return charsBytes_; }
+  /// Byte offsets (within a row) of the string fields, in field order.
+  std::vector<int32_t> stringFieldOffsets() const {
+    std::vector<int32_t> out;
+    for (const auto& f : hostFields_) {
+      if (f.kind == kFieldString) {
+        out.push_back(f.offset);
+      }
     }
-    hasStringRefs_ = true;
-  }
-  const std::vector<std::shared_ptr<void>>& stringKeepAlive() const {
-    return stringKeepAlive_;
-  }
-  /// True if any string field may hold an out-of-line pointer.
-  bool hasStringRefs() const {
-    return hasStringRefs_;
+    return out;
   }
 
 
@@ -187,10 +196,11 @@ class RowStoreVector : public RowVector {
   // Null sidecar stride in bytes per row (0 = none). Appended per the
   // partial-rebuild note above.
   int32_t nullStride_ = 0;
-  // Owners of buffers referenced by out-of-line string slots (see
-  // addStringKeepAlive). Appended per the partial-rebuild note above.
-  std::vector<std::shared_ptr<void>> stringKeepAlive_;
-  bool hasStringRefs_ = false;
+  // String heap (see setCharsInTail/setCharsBuffer). Appended per the
+  // partial-rebuild note above.
+  int64_t charsTailOffset_ = -1;
+  int64_t charsBytes_ = 0;
+  rmm::device_buffer charsBuffer_;
 
   rmm::device_buffer rowBuffer_; // GPU row data
   // GPU FieldDesc array. Shared: all batches from one producer point at the

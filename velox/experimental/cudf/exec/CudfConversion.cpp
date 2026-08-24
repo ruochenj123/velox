@@ -847,21 +847,6 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   ensurePinnedSlotCapacity(slot, totalBytes);
 
   // ---- Pack: ONE CPU pass, fused with the (former) merge ----
-  // Row mode allocates the DEVICE buffers up front: out-of-line string
-  // slots store absolute device pointers, so the bases must be known while
-  // packing (pointer slots, 2026-08-23). The chars heap is a SEPARATE
-  // shared buffer: downstream outputs retain only it (megabytes of long
-  // strings), never the full row buffer.
-  rmm::device_buffer gpuRowBuf;
-  std::shared_ptr<rmm::device_buffer> heapBuf;
-  uint8_t* devHeapBase = nullptr;
-  if (rowMode) {
-    gpuRowBuf = rmm::device_buffer(totalBytes - heapBytes, stream);
-    if (heapBytes > 0) {
-      heapBuf = std::make_shared<rmm::device_buffer>(heapBytes, stream);
-      devHeapBase = static_cast<uint8_t*>(heapBuf->data());
-    }
-  }
   uint8_t* const base = slot.host;
   if (rowMode) {
     const int32_t rowWidth = rowWidth_;
@@ -899,9 +884,8 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
               const uint32_t len = v.size();
               std::memcpy(d, &len, 4);
               std::memcpy(d + 4, v.data(), 4);
-              const uint64_t ptr =
-                  reinterpret_cast<uint64_t>(devHeapBase + heapCursor);
-              std::memcpy(d + 8, &ptr, 8);
+              const uint64_t hoff = static_cast<uint64_t>(heapCursor);
+              std::memcpy(d + 8, &hoff, 8);
               std::memcpy(heapBase + heapCursor, v.data(), len);
               heapCursor += len;
             }
@@ -987,20 +971,13 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
           rowFields_.data(), rowFields_.size() * sizeof(FieldDesc), stream);
       stream.synchronize(); // one-time, first batch only
     }
+    rmm::device_buffer gpuRowBuf(totalBytes, stream);
     VELOX_CUDA_CHECK(cudaMemcpyAsync(
         gpuRowBuf.data(),
         slot.host,
-        totalBytes - heapBytes,
+        totalBytes,
         cudaMemcpyHostToDevice,
         stream.value()));
-    if (heapBytes > 0) {
-      VELOX_CUDA_CHECK(cudaMemcpyAsync(
-          heapBuf->data(),
-          slot.host + heapOffset,
-          heapBytes,
-          cudaMemcpyHostToDevice,
-          stream.value()));
-    }
     if (!syncMode) {
       VELOX_CUDA_CHECK(cudaEventRecord(slot.done, stream.value()));
     }
@@ -1022,9 +999,9 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       rowStoreResult->setNullSidecar(nullStride);
     }
     if (heapBytes > 0) {
-      // Out-of-line slots point into the shared heap buffer; consumers
-      // retain just it (small), never the row buffer.
-      rowStoreResult->addStringKeepAlive(heapBuf);
+      // The single H2D above carried rows + sidecar + chars; record where
+      // the heap tail starts so consumers can address it.
+      rowStoreResult->setCharsInTail(heapOffset, heapBytes);
     }
     if (boundary) {
       // ---- Host retention: the payload never crosses the boundary. ----
