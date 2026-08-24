@@ -87,6 +87,12 @@ DEFINE_int32(
     "Q40 sort bench: number of sort keys (1..4, low-cardinality first).");
 
 DEFINE_bool(
+    synth_join_flip,
+    false,
+    "Q31: FLIP the sides -- probe R (keys + payloads, thinned by "
+    "--s_selectivity_pct), build S (keys only). Same output cardinality "
+    "(S holds every R row_id twice), payload now on the PROBE side.");
+DEFINE_bool(
     synth_sort_gather,
     false,
     "Q40/Q31 sort benches: insert a gather LocalPartition before the ORDER BY "

@@ -43,6 +43,7 @@ DECLARE_int32(synth_payload_cols);
 DECLARE_int32(synth_sort_keys);
 DECLARE_bool(synth_join_sort);
 DECLARE_bool(synth_sort_gather);
+DECLARE_bool(synth_join_flip);
 DECLARE_int32(synth_join_keys);
 DECLARE_int32(synth_wide_payload_cols);
 DECLARE_int32(synth_wide_sort_keys);
@@ -3601,21 +3602,48 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
   static const std::vector<std::string> kProbeKeys = {
       "s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"};
   PlanBuilder sBuilder(planNodeIdGenerator, pool_.get());
-  sBuilder.filtersAsNode(filtersAsNode_)
-      .tableScan(kTableS, sSelectedRowType, sFileColumns, {})
-      .captureScanNodeId(sPlanNodeId);
-  if (FLAGS_s_selectivity_pct < 100) {
-    sBuilder.filter(
-        fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  if (FLAGS_synth_join_flip) {
+    // FLIPPED: probe = R (keys + payloads), thinned by the same
+    // row_id % 10 predicate; build = S (keys only, renamed s_*). Output =
+    // R's columns, so the payload now rides on the PROBE side.
+    auto sBuild = PlanBuilder(planNodeIdGenerator, pool_.get())
+                      .filtersAsNode(filtersAsNode_)
+                      .tableScan(kTableS, sSelectedRowType, sFileColumns, {})
+                      .captureScanNodeId(sPlanNodeId)
+                      .project({kProbeRenames.begin(),
+                                kProbeRenames.begin() + numJoinKeys})
+                      .planNode();
+    sBuilder.filtersAsNode(filtersAsNode_)
+        .tableScan(kTableR, rSelectedRowType, rFileColumns, {})
+        .captureScanNodeId(rPlanNodeId);
+    if (FLAGS_s_selectivity_pct < 100) {
+      sBuilder.filter(
+          fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
+    }
+    sBuilder.hashJoin(
+        {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
+        {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
+        sBuild,
+        "",
+        rColumns);
+  } else {
+    sBuilder.filtersAsNode(filtersAsNode_)
+        .tableScan(kTableS, sSelectedRowType, sFileColumns, {})
+        .captureScanNodeId(sPlanNodeId);
+    if (FLAGS_s_selectivity_pct < 100) {
+      sBuilder.filter(
+          fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
+    }
+    sBuilder
+        .project(
+            {kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys})
+        .hashJoin(
+            {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
+            {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
+            r,
+            "", // no filter
+            rColumns); // output: 4 key cols + selected payloads
   }
-  sBuilder
-      .project({kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys})
-      .hashJoin(
-          {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
-          {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
-          r,
-          "", // no filter
-          rColumns); // output: 4 key cols + selected payloads
   if (FLAGS_synth_join_sort) {
     if (FLAGS_synth_sort_gather) {
       sBuilder.localPartition(std::vector<std::string>{});
@@ -3626,7 +3654,8 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
 
   TpchPlan context;
   context.planName = fmt::format(
-      "q31_p{}_sel{}_j{}{}",
+      "q31{}_p{}_sel{}_j{}{}",
+      FLAGS_synth_join_flip ? "flip" : "",
       numPayloads,
       FLAGS_s_selectivity_pct,
       numJoinKeys,
