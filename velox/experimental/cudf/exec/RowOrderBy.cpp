@@ -185,6 +185,7 @@ void RowOrderBy::concatenateRowInputs() {
   }
   int64_t rowsSoFar = 0;
   int64_t heapSoFar = 0;
+  int64_t idSpaceSoFar = 0; // global rowid base of the NEXT new store
   uint8_t* rowsBase = static_cast<uint8_t*>(sorted_.data());
   for (auto& v : rowInputs_) {
     const int64_t n = v->size();
@@ -228,16 +229,28 @@ void RowOrderBy::concatenateRowInputs() {
       }
     }
     if (rowIdField_ >= 0) {
-      // Per-batch provenance: make the rowid global (store base + local).
+      // Per-batch provenance: make the rowid global = store base + local.
+      // The base advances by the STORE's own row count (the pack batch it
+      // retains), NOT by this input batch's size: after a join the batch
+      // holds only the matches, while its rowids index the whole store.
+      auto store = v->provenanceStore();
+      VELOX_CHECK_NOT_NULL(store);
+      int64_t base;
+      if (!stores_.empty() && stores_.back() == store) {
+        base = storeBases_.back(); // several batches of one store
+      } else {
+        base = idSpaceSoFar;
+        stores_.push_back(store);
+        storeBases_.push_back(base);
+        idSpaceSoFar += store->totalRows();
+      }
       addInt64Field(
           dst,
           static_cast<int32_t>(n),
           rowWidth_,
           fields_[rowIdField_].offset,
-          rowsSoFar,
+          base,
           stream_.value());
-      stores_.push_back(v->provenanceStore());
-      storeBases_.push_back(rowsSoFar);
     }
     rowsSoFar += n;
   }

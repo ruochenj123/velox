@@ -3370,14 +3370,16 @@ TpchPlan TpchQueryBuilder::getSortScanPlan() const {
 // probe spine, orders build filtered to o_orderdate >= '1998-01-01' (~11%
 // of orders), sorted by (o_orderdate, l_orderkey). Exercises the row join
 // chain feeding a row sort through a gather, with deferral end-to-end.
-// SELECT o_orderdate, l_orderkey, l_extendedprice, l_discount, l_quantity,
-//        l_returnflag, l_shipmode
+// SELECT o_orderdate, l_orderkey, l_linenumber, l_extendedprice,
+//        l_discount, l_quantity, l_returnflag, l_shipmode
 // FROM lineitem, orders WHERE l_orderkey = o_orderkey
 //   AND o_orderdate >= DATE '1998-01-01'
-// ORDER BY o_orderdate, l_orderkey
+// ORDER BY o_orderdate, l_orderkey, l_linenumber   (unique key: the
+// ordered result comparison needs a total order)
 TpchPlan TpchQueryBuilder::getSortJoinPlan() const {
   std::vector<std::string> lineitemColumns = {
       "l_orderkey",
+      "l_linenumber",
       "l_extendedprice",
       "l_discount",
       "l_quantity",
@@ -3422,13 +3424,14 @@ TpchPlan TpchQueryBuilder::getSortJoinPlan() const {
                       "",
                       {"o_orderdate",
                        "l_orderkey",
+                       "l_linenumber",
                        "l_extendedprice",
                        "l_discount",
                        "l_quantity",
                        "l_returnflag",
                        "l_shipmode"})
                   .localPartition(std::vector<std::string>{})
-                  .orderBy({"o_orderdate", "l_orderkey"}, false)
+                  .orderBy({"o_orderdate", "l_orderkey", "l_linenumber"}, false)
                   .planNode();
 
   TpchPlan context;
