@@ -42,6 +42,7 @@ DECLARE_int32(s_selectivity_pct);
 DECLARE_int32(synth_payload_cols);
 DECLARE_int32(synth_sort_keys);
 DECLARE_bool(synth_join_sort);
+DECLARE_bool(synth_sort_gather);
 DECLARE_int32(synth_join_keys);
 DECLARE_int32(synth_wide_payload_cols);
 DECLARE_int32(synth_wide_sort_keys);
@@ -3616,6 +3617,9 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
           "", // no filter
           rColumns); // output: 4 key cols + selected payloads
   if (FLAGS_synth_join_sort) {
+    if (FLAGS_synth_sort_gather) {
+      sBuilder.localPartition(std::vector<std::string>{});
+    }
     sBuilder.orderBy(kJoinKeys, false);
   }
   auto plan = sBuilder.planNode();
@@ -3671,12 +3675,14 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
 
   core::PlanNodeId lineitemPlanNodeId;
 
-  auto plan = PlanBuilder(pool_.get())
-                  .filtersAsNode(filtersAsNode_)
-                  .tableScan(kLineitem, selectedRowType, fileColumnNames, {})
-                  .captureScanNodeId(lineitemPlanNodeId)
-                  .orderBy(sortKeys, false)
-                  .planNode();
+  PlanBuilder q40(pool_.get());
+  q40.filtersAsNode(filtersAsNode_)
+      .tableScan(kLineitem, selectedRowType, fileColumnNames, {})
+      .captureScanNodeId(lineitemPlanNodeId);
+  if (FLAGS_synth_sort_gather) {
+    q40.localPartition(std::vector<std::string>{});
+  }
+  auto plan = q40.orderBy(sortKeys, false).planNode();
 
   TpchPlan context;
   context.planName = fmt::format("q40_k{}_p{}", numKeys, numPayloads);

@@ -87,6 +87,12 @@ DEFINE_int32(
     "Q40 sort bench: number of sort keys (1..4, low-cardinality first).");
 
 DEFINE_bool(
+    synth_sort_gather,
+    false,
+    "Q40/Q31 sort benches: insert a gather LocalPartition before the ORDER BY "
+    "so the scan/pack pipeline keeps all drivers (a final ORDER BY otherwise "
+    "collapses the whole pipeline to one driver).");
+DEFINE_bool(
     synth_join_sort,
     false,
     "Q31 join bench: append the 4-key sort after the join.");
