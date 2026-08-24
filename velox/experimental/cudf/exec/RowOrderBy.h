@@ -120,7 +120,9 @@ class RowOrderBy : public CudfOperatorBase {
   std::vector<int32_t> deferredCols_;
   int64_t cursor_ = 0;
   bool finished_ = false;
-  std::vector<uint8_t> hostRows_;
+  std::vector<uint8_t> hostRows_; // prefetch target (next chunk)
+  std::vector<uint8_t> hostRowsCur_; // chunk being extracted
+  int64_t prefetchBegin_ = -1;
   std::vector<uint8_t> hostNulls_;
   std::vector<uint8_t> hostChars_;
   bool hostCharsReady_ = false;
