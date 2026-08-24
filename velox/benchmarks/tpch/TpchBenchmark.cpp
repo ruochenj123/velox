@@ -87,6 +87,12 @@ DEFINE_int32(
     "Q40 sort bench: number of sort keys (1..4, low-cardinality first).");
 
 DEFINE_bool(
+    synth_join_build_filter,
+    false,
+    "Q31 (flipped): apply the --s_selectivity_pct predicate to the BUILD side "
+    "(S) instead of the probe, so the probe carries all 100M R rows and only "
+    "sel%% of them find a match = true JOIN selectivity.");
+DEFINE_bool(
     synth_join_flip,
     false,
     "Q31: FLIP the sides -- probe R (keys + payloads, thinned by "
