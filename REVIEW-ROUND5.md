@@ -93,6 +93,35 @@ query costs. Warm (3rd in-process repeat, SF100): Q22 0.63 s both arms (cold
    warp-cooperative gather, tiled transposes, key pre-extraction.
 3. Warm `row` vs `row_enc` on Q1/Q4/Q12/Q14/Q16/Q19 to decide whether the
    low-cardinality dictionary path (#2 in the plan) is worth doing at all.
+3a. **v2 "SPINE DEFERRAL" redesign (review decision 2026-08-24)** -- the 4
+   bnd winners (Q2/Q5/Q8/Q11) share one shape: fact-table probe spine
+   packed at the boundary, kind-1 chain over small eager builds, ONE
+   materialization at the agg. Simplify to exactly that: deferral only for
+   the probe-side chain rooted at one boundary pack; builds always eager
+   (values, strings ok); provenance = ONE (store, ids) pair; materialize at
+   the first non-probe consumer. DELETES kind 3, makeCrossingStoreFromHost
+   (both cases), GPU-resident build materialization, N-source provenance/
+   terminal gather, BoundaryHostStore-for-builds. ADAPTIVE: pack always
+   retains host batches; the first probe chooses per batch (references vs
+   eager gather) from observed numMatches/probeRows -- eager default,
+   defer on high reduction; batches self-describing via hasProvenance().
+   Gives up build-side payload deferral (Q10) -- measured as fine (bnd lost
+   Q10 anyway). ~1-2 days incl. validation, as the follow-up commit.
+3b. **Defer-vs-eager policy (quantitative, from the bnd win/loss stats,
+   2026-08-24)** -- decision variable = the REDUCTION FACTOR between the
+   boundary and the materialization point: deferral wins when the chain
+   shrinks cardinality a lot before materializing (Q5: keys through a 22.7M
+   -row store, 728K-row round trip -> 1.06x; Q8 245K -> 1.12x; Q11 1.63x;
+   Q2 1.19x) and loses when the round trip re-ships ~the whole output (Q9:
+   32.6M rows + two 32.6M-row kind-3 edges -> 0.71x; Q10: 11.5M -> 0.82x).
+   Plan-time: cardinality estimates; adaptive: probe falls back to eager
+   output when numMatches/probeRows stays high. Analogous to the CPU-side
+   hybrid's payload policy (kHybridJoinMinPayloadBytes). Pair with:
+   kind-3 default -> eager (measured evidence: eager >= bnd on 13/22), the
+   host-materializing variant kept behind the wide-payload policy.
+   Also: extend kind 1 to any provenance-preserving op (sort/topN/limit/
+   filter-on-crossing-cols); aggregation is the true barrier. Document the
+   invariant in DESIGN-whole-query-deferral.md.
 4. **Decline-when-all-inputs-GPU-resident** (review discussion 2026-08-23):
    the RowHashJoin adapter should decline joins where BOTH sides arrive
    GPU-resident (fed by cudf operators, e.g. Q18's agg->build), handing them
@@ -104,7 +133,17 @@ query costs. Warm (3rd in-process repeat, SF100): Q22 0.63 s both arms (cold
    rebase, as a source-shape check in RowHashJoin{Build,Probe}Adapter::
    canRunOnGPU (plan-walk: does either source chain reach a TableScan
    without a pipeline breaker that runs on GPU?).
-5. Agg rebatch A/B: upstream `concatOptimizationEnabled` (CudfBatchConcat
+5. **CudfConversion.{h,cpp} reconstruction** (review request 2026-08-24):
+   too many accreted rounds (merge/pack/boundary/strings/pointer slots/
+   deferral). Restructure tryPinnedPack: fold the lazy-init groups
+   (emitRowStore_/pinnedPackSyncMode_/boundary resolution and
+   rowLayoutReady_) into ONE per-instance init; split the monolith into
+   named steps (resolveConsumer, computeLayout, loadChildren, pack, ship);
+   rename laterKeyNames_ reuse in the prune path (subsetPackNames_); cache
+   the collectChainKeyNames plan walk per task; keep behavior identical
+   (gate before/after). Do AFTER the deferral commit lands so the diff
+   stays reviewable.
+6. Agg rebatch A/B: upstream `concatOptimizationEnabled` (CudfBatchConcat
    before every CudfHashAggregation, default off) — measure Q1/Q4/Q17/Q18
    col+row warm, on vs off. Also note join->join small batches (Q18 join[8]:
    129 batches avg 50 rows) as a separate concat opportunity for both arms.
