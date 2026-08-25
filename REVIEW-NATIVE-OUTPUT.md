@@ -52,5 +52,19 @@ whenever the exit carried payload (Q31 flipped: 0.77–0.98x; Q40).
 and original Q31 on `synth_join_smoke`, TPC-H q3/q9 SF1; arms
 row/rown/bnd/bndn/bndan vs cpu, multiset compare through `materialize()`.
 Table-B rerun (scrambled hit-rate data, payload on the probe) with native
-arms: `results/singleop_joinhit_flip_scat_native` — see
-`FINDINGS-factorial.md`.
+arms: `results/singleop_joinhit_flip_scat_native` (jobs 13953182/83; gate
+13953181: 20/20 PASS). Medians of 3, seconds, `col / row / rown / bnd / bndn`:
+
+| sel | proj 4 | proj 8 | proj 12 | proj 16 |
+|---|---|---|---|---|
+| 10% | 3.58 / 2.36 / 2.21 / 1.80 / 1.82 | 3.67 / 3.89 / 3.69 / 2.79 / 2.73 | 4.76 / 5.57 / 5.35 / 3.13 / 3.12 | 4.96 / 5.96 / 5.71 / 3.40 / 3.38 |
+| 30% | 2.56 / 2.58 / 2.27 / 2.05 / 2.00 | 3.85 / 4.32 / 3.67 / 3.09 / 3.03 | 5.27 / 6.52 / 5.29 / 3.71 / 3.62 | 5.55 / 6.63 / 5.65 / 4.05 / 4.00 |
+| 60% | 3.37 / 2.97 / 2.37 / 2.32 / 2.29 | 4.28 / 4.83 / 4.05 / 3.59 / 3.50 | 5.78 / 7.27 / 6.12 / 4.46 / 4.53 | 6.68 / 8.05 / 6.84 / 4.96 / 4.96 |
+| 90% | 3.19 / 3.40 / 2.62 / 2.72 / 2.58 | 4.83 / 5.32 / 4.33 / 4.11 / 4.06 | 6.71 / 8.37 / 6.96 / 5.30 / 5.20 | 7.02 / 9.39 / 7.46 / 6.08 / 5.76 |
+
+- Native output lifts eager row 4-30% (rown/row), more at high
+  selectivity (larger output); rown ~= col (0.87-1.42x). The remaining
+  eager-row deficit at wide payload is the field-major pack, not the exit.
+- bndn == bnd (+-5%): the deferred exit was already host-side. Deferral
+  wins every cell: col/bndn 1.19-1.97x.
+- All arms are ~5-10% faster than the earlier table B (harness copy gone).
