@@ -476,7 +476,7 @@ TpchPlan TpchQueryBuilder::getSsbPlan(int queryId) const {
       loColumns = {"lo_orderdate", "lo_extendedprice", "lo_discount",
                    "lo_quantity"};
       loFilters = {"lo_discount between 1 and 3", "lo_quantity < 25"};
-      dims = {dateDim({"d_year = 1993"})};
+      dims = {dateDim({"d_year = 1993"}, {"d_year"})};
       aggExprInput = "lo_extendedprice * lo_discount";
       break;
     case 102: // Q1.2
@@ -484,7 +484,7 @@ TpchPlan TpchQueryBuilder::getSsbPlan(int queryId) const {
                    "lo_quantity"};
       loFilters = {"lo_discount between 4 and 6",
                    "lo_quantity between 26 and 35"};
-      dims = {dateDim({"d_yearmonthnum = 199401"})};
+      dims = {dateDim({"d_yearmonthnum = 199401"}, {"d_yearmonthnum"})};
       aggExprInput = "lo_extendedprice * lo_discount";
       break;
     case 103: // Q1.3
@@ -492,7 +492,9 @@ TpchPlan TpchQueryBuilder::getSsbPlan(int queryId) const {
                    "lo_quantity"};
       loFilters = {"lo_discount between 5 and 7",
                    "lo_quantity between 26 and 35"};
-      dims = {dateDim({"d_weeknuminyear = 6", "d_year = 1994"})};
+      dims = {dateDim(
+          {"d_weeknuminyear = 6", "d_year = 1994"},
+          {"d_weeknuminyear", "d_year"})};
       aggExprInput = "lo_extendedprice * lo_discount";
       break;
     case 104: // Q2.1
@@ -548,7 +550,7 @@ TpchPlan TpchQueryBuilder::getSsbPlan(int queryId) const {
            {"s_city IN ('UNITED KI1', 'UNITED KI5')"}},
           queryId == 109
               ? dateDim({"d_year between 1992 and 1997"}, {"d_year"})
-              : dateDim({"d_yearmonth = 'Dec1997'"}, {"d_year"})};
+              : dateDim({"d_yearmonth = 'Dec1997'"}, {"d_yearmonth", "d_year"})};
       aggExprInput = "lo_revenue";
       groupBy = {"c_city", "s_city", "d_year"};
       break;
@@ -754,6 +756,8 @@ TpchPlan TpchQueryBuilder::buildQueryPlan(int queryId) const {
       return getJoinLSPlan();
     case 30:
       return getJoinOCPlan();
+    case 32:
+      return getCaseAPlan();
     // Hybrid single-operator benchmarks (synthetic tables R/S)
     case 31:
       return getQ31Plan();
@@ -3281,6 +3285,72 @@ TpchPlan TpchQueryBuilder::getJoinLOPlan() const {
           .localPartition(std::vector<std::string>{})
           .finalAggregation()
           .planNode();
+
+  TpchPlan context;
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q32 (case-a microbench): SINGLE join whose output goes straight to the
+// CPU -- no aggregation. The build filter is highly selective, so the probe
+// spine survives at ~1%: the batch-level adaptive pack should flip to
+// deferred, and the terminal probe (a CPU exit) emits a host RowVector with
+// the deferred payload gathered host-side, never uploaded.
+// SELECT l_orderkey, l_extendedprice, l_discount, l_returnflag, o_orderdate
+// (5 output columns: the --include_results row printer elides past 5)
+// FROM lineitem, orders
+// WHERE l_orderkey = o_orderkey
+//   AND o_orderdate >= DATE '1998-07-01' AND o_orderpriority = '1-URGENT'
+TpchPlan TpchQueryBuilder::getCaseAPlan() const {
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey", "l_extendedprice", "l_discount", "l_returnflag"};
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey", "o_orderdate", "o_orderpriority"};
+
+  const auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  const auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  auto orderDateFilter = formatDateFilter(
+      "o_orderdate", ordersSelectedRowType, "'1998-07-01'", "");
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+  core::PlanNodeId ordersPlanNodeId;
+
+  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(
+                        kOrders,
+                        ordersSelectedRowType,
+                        ordersFileColumns,
+                        {orderDateFilter, "o_orderpriority = '1-URGENT'"})
+                    .captureScanNodeId(ordersPlanNodeId)
+                    .planNode();
+
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(
+                      kLineitem,
+                      lineitemSelectedRowType,
+                      lineitemFileColumns,
+                      {})
+                  .captureScanNodeId(lineitemPlanNodeId)
+                  .hashJoin(
+                      {"l_orderkey"},
+                      {"o_orderkey"},
+                      orders,
+                      "",
+                      {"l_orderkey",
+                       "l_extendedprice",
+                       "l_discount",
+                       "l_returnflag",
+                       "o_orderdate"})
+                  .planNode();
 
   TpchPlan context;
   context.plan = std::move(plan);
