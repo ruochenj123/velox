@@ -326,6 +326,11 @@ QueryBenchmarkBase::run(
   try {
     for (;;) {
       CursorParameters params;
+      // Do not copy result vectors into the cursor (2026-08-25): the copy is
+      // a harness artifact paid by every arm, and it would flatten a
+      // native-layout result (HostRowVector) into an empty RowVector. The
+      // task outlives result printing, so the originals stay valid.
+      params.copyResult = false;
       params.maxDrivers = FLAGS_num_drivers;
       params.planNode = tpchPlan.plan;
       params.queryConfigs = queryConfigs;
