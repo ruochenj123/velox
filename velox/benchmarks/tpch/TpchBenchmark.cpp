@@ -181,6 +181,13 @@ void TpchBenchmark::runMain(
       for (auto& v : actualResults) {
         if (auto* m = dynamic_cast<const MaterializableVector*>(v.get())) {
           v = m->materialize();
+        } else {
+          // The cursor no longer copies results (copyResult=false), so
+          // encoded outputs (e.g. dictionary-wrapped probe columns of the
+          // CPU hash join) must be flattened here to print as values.
+          VectorPtr flat = v;
+          BaseVector::flattenVector(flat);
+          v = std::dynamic_pointer_cast<RowVector>(flat);
         }
       }
     }
