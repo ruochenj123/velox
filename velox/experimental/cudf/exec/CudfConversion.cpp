@@ -1075,6 +1075,11 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   // Boundary-hybrid is only meaningful on the row path straight into a
   // RowHashJoinBuild/Probe (resolved above).
   const bool boundary = boundaryMode_ == 1 && rowMode;
+  // Per-batch record of the (possibly adaptive) decision: sum = number of
+  // batches packed in boundary mode, count = batches. fromVeloxBoundaryMode
+  // is the resolution-time value only (0 for adaptive before the switch).
+  addRuntimeStat(
+      "fromVeloxDeferredBatches", RuntimeCounter(boundary ? 1 : 0));
   // Spine denominator for the endpoint's survival ratio: every row this
   // pack ships (eager or deferred) enters the chain.
   if (deferralEligible_ && rowMode) {
