@@ -1,19 +1,27 @@
 # Review guide: branch `row-sort` (row-wise GPU sort)
 
-Base: snapshot `17783f3e0` = the review state of `wip/whole-query-deferral`
-(spine deferral v2 + batch-level adaptive + host-exit), committed as-is.
-Commits on top (review in order):
+Base (2026-08-25): the review stack of the deferral work (`review-stack`,
+= spine deferral v2 + batch-level adaptive + host exit + native row output).
+Commits on top, in order:
 
-1. `af129b096` Row-wise GPU sort (RowOrderBy) + Q44/Q45
-2. `cfaaa237f` global rowid base = provenance store size (join->sort fix)
-3. `6793870d2` parallel host emission; sort endpoint reports S = rows
-4. `8dc9dd612` `--synth_sort_gather` for Q40/Q31
+1. Row-wise GPU sort (RowOrderBy) + Q44/Q45
+2. global rowid base = provenance store size (join->sort fix)
+3. parallel host emission; sort endpoint reports S = rows
+4. REVIEW-ROWSORT.md, DESIGN-build-side-deferral.md
+5. coalesce deferred payload into per-store columns while the device sorts
+6. stage timers (device key sort / row gather; D2H wait, host extract, host gather)
+7. an empty deferred column set resolves EAGER; per-batch deferred stat;
+   'nothing to defer' decided from the actual input type
+8. RowOrderBy native row output (`HostRowVector` per chunk; shared heap,
+   per-column null-bit map added to `HostRowVector`)
+
+(The old pre-rebase head is kept as branch `row-sort-pre-rebase`.)
 
 ## What to read
 
 | File | What |
 |---|---|
-| `exec/RowOrderBy.{h,cpp}` | The operator. `doAddInput` accumulates RowStoreVector (row pack / row joins, also through a gather) or CudfVector; `concatenateRowInputs` / `transposeCudfInputs` build ONE row store (+ string heap rebase, padded null sidecar, `addInt64Field` makes `__rowid` global = store base + local); `sortRows` extracts keys -> cudf columns -> `cudf::sorted_order` -> ONE `gatherRowsWarp` of whole rows; chunked (1M) emission: `emitHostChunk` (CPU exit, parallel extraction, D2H prefetch) or `emitColumnarChunk`; `gatherDeferred` materializes deferred payload from per-batch `BoundaryHostStore`s. |
+| `exec/RowOrderBy.{h,cpp}` | The operator. Under `--row_output_native`, `emitHostChunk` returns a `HostRowVector` (rows D2H'd, no extraction). `doAddInput` accumulates RowStoreVector (row pack / row joins, also through a gather) or CudfVector; `concatenateRowInputs` / `transposeCudfInputs` build ONE row store (+ string heap rebase, padded null sidecar, `addInt64Field` makes `__rowid` global = store base + local); `sortRows` extracts keys -> cudf columns -> `cudf::sorted_order` -> ONE `gatherRowsWarp` of whole rows; chunked (1M) emission: `emitHostChunk` (CPU exit, parallel extraction, D2H prefetch) or `emitColumnarChunk`; `gatherDeferred` materializes deferred payload from per-batch `BoundaryHostStore`s. |
 | `exec/GpuRowOps.{cu,cuh}` | `addInt64Field` kernel. |
 | `exec/DeferralPlan.h` | Chain walk generalized: OrderByNode adjacent/terminal, gather LocalPartition pass-through, `orderByBehindGather`. |
 | `exec/CudfConversion.cpp` (resolveRowPathOnce) | Row-sort consumer (direct or behind a gather): sort keys = crossing set / null-key guard, pruning = sort output, endpoint = sort node. |
