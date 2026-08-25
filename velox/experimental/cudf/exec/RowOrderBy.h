@@ -78,6 +78,10 @@ class RowOrderBy : public CudfOperatorBase {
 
   RowVectorPtr emitHostChunk(int64_t begin, int32_t n);
   RowVectorPtr emitColumnarChunk(int64_t begin, int32_t n);
+  std::vector<std::unique_ptr<cudf::column>> transposeChunkColumns(
+      const uint8_t* base,
+      const uint8_t* nullBase,
+      int32_t n);
   /// Host-gather the deferred output columns for `n` sorted rows whose
   /// GLOBAL rowids are `globalIds` (concatenation order).
   std::vector<VectorPtr> gatherDeferred(

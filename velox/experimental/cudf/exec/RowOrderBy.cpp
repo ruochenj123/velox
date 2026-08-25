@@ -694,6 +694,78 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
 }
 
 RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
+  if (!deferredCols_.empty()) {
+    // DEFERRED exit (2026-08-25): uniformly COLUMNAR. Ids are extracted on
+    // the device, the deferred payload is gathered on the host, and the
+    // GPU-side (key) columns are transposed on the device and brought over
+    // as columns. The rows themselves never cross.
+    prefetchBegin_ = -1;
+    const uint8_t* base =
+        static_cast<const uint8_t*>(sorted_.data()) + begin * rowWidth_;
+    const uint8_t* nullBase = nullPad_ > 0
+        ? static_cast<const uint8_t*>(sortedNulls_.data()) + begin * nullPad_
+        : nullptr;
+    const int32_t numCols = outputType_->size();
+    GpuFixedRowStore chunk;
+    chunk.row_buffer = const_cast<uint8_t*>(base);
+    chunk.row_width = rowWidth_;
+    chunk.num_rows = n;
+    chunk.num_fields = static_cast<int32_t>(fields_.size());
+    chunk.fields = nullptr;
+    const size_t bytes = static_cast<size_t>(n) * sizeof(int64_t);
+    if (bytes > idsDev_.size()) {
+      idsDev_ = rmm::device_buffer(bytes, stream_);
+    }
+    extractKeysFromRows(
+        chunk, fields_[rowIdField_].offset, 8, idsDev_.data(), stream_.value());
+    std::vector<int64_t> gids(n);
+    cudaMemcpyAsync(
+        gids.data(), idsDev_.data(), bytes, cudaMemcpyDeviceToHost,
+        stream_.value());
+    stream_.synchronize();
+    std::vector<VectorPtr> children(numCols);
+    const auto tpHG = std::chrono::steady_clock::now();
+    auto cols = gatherDeferred(gids, n);
+    addRuntimeStat(
+        "rowSortHostGatherNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpHG)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    for (size_t k = 0; k < deferredCols_.size(); k++) {
+      children[deferredCols_[k]] = std::move(cols[k]);
+    }
+    auto gpuCols = transposeChunkColumns(base, nullBase, n);
+    std::vector<std::unique_ptr<cudf::column>> subset;
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    std::vector<int32_t> subsetIdx;
+    for (int32_t i = 0; i < numCols; i++) {
+      if (gpuCols[i] != nullptr) {
+        subset.push_back(std::move(gpuCols[i]));
+        names.push_back(outputType_->nameOf(i));
+        types.push_back(outputType_->childAt(i));
+        subsetIdx.push_back(i);
+      }
+    }
+    if (!subset.empty()) {
+      auto tbl = std::make_unique<cudf::table>(std::move(subset));
+      auto host = with_arrow::toVeloxColumn(
+          tbl->view(),
+          pool(),
+          std::static_pointer_cast<const Type>(
+              ROW(std::move(names), std::move(types))),
+          stream_,
+          get_output_mr());
+      for (size_t k = 0; k < subsetIdx.size(); k++) {
+        children[subsetIdx[k]] = host->childAt(k);
+      }
+    }
+    addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, n, std::move(children));
+  }
   // ---- D2H: this chunk was prefetched by the previous call (or now) ----
   const auto rowsBytes = static_cast<size_t>(n) * rowWidth_;
   if (prefetchBegin_ != begin) {
@@ -759,27 +831,7 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
 
   const uint8_t* rows = hostRowsCur_.data();
   const int32_t numCols = outputType_->size();
-  std::vector<VectorPtr> children(numCols);
-  if (!deferredCols_.empty()) {
-    std::vector<int64_t> gids(n);
-    const int32_t idOff = fields_[rowIdField_].offset;
-    for (int32_t r = 0; r < n; r++) {
-      std::memcpy(&gids[r], rows + static_cast<int64_t>(r) * rowWidth_ + idOff, 8);
-    }
-    const auto tpHG = std::chrono::steady_clock::now();
-    auto cols = gatherDeferred(gids, n);
-    addRuntimeStat(
-        "rowSortHostGatherNanos",
-        RuntimeCounter(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - tpHG)
-                .count(),
-            RuntimeCounter::Unit::kNanos));
-    for (size_t k = 0; k < deferredCols_.size(); k++) {
-      children[deferredCols_[k]] = std::move(cols[k]);
-    }
-  }
-
+  std::vector<VectorPtr> children(numCols); // eager: nothing deferred
   if (CudfConfig::getInstance().benchmarkRowOutputNative) {
     // Native row output: hand this chunk's D2H'd rows to the consumer as-is
     // (with the shared string heap, this chunk's null sidecar and the
@@ -820,7 +872,6 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
             : std::make_shared<const std::vector<uint8_t>>(),
         std::move(nullsOwned),
         nullPad_,
-        std::move(children),
         std::move(nullBits));
   }
   const auto tpExtract = std::chrono::steady_clock::now();
@@ -949,6 +1000,85 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
       pool(), outputType_, nullptr, n, std::move(children));
 }
 
+// Device transpose of one chunk of sorted rows into cudf columns, in
+// output order; deferred columns are left nullptr for the caller (uploaded
+// for a GPU consumer, host-gathered for a CPU exit). Shared by
+// emitColumnarChunk and the deferred path of emitHostChunk.
+std::vector<std::unique_ptr<cudf::column>> RowOrderBy::transposeChunkColumns(
+    const uint8_t* base,
+    const uint8_t* nullBase,
+    int32_t n) {
+  const int32_t numCols = outputType_->size();
+  std::vector<std::unique_ptr<rmm::device_buffer>> colBufs(numCols);
+  std::vector<uint8_t*> fixedPtrs;
+  std::vector<FieldDesc> fixedFields;
+  for (int32_t i = 0; i < numCols; i++) {
+    const auto fi = outFieldIdx_[i];
+    if (fi < 0 || fields_[fi].kind == kFieldString) {
+      continue;
+    }
+    colBufs[i] = std::make_unique<rmm::device_buffer>(
+        static_cast<size_t>(n) * fields_[fi].byte_width, stream_);
+    fixedPtrs.push_back(static_cast<uint8_t*>(colBufs[i]->data()));
+    fixedFields.push_back(fields_[fi]);
+  }
+  if (!fixedFields.empty()) {
+    rowsToColumns(
+        base, fixedFields.data(), fixedPtrs.data(),
+        static_cast<int32_t>(fixedFields.size()), n, rowWidth_, stream_.value());
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(numCols);
+  for (int32_t i = 0; i < numCols; i++) {
+    const auto fi = outFieldIdx_[i];
+    if (fi < 0) {
+      columns.push_back(nullptr); // deferred: supplied by the caller
+      continue;
+    }
+    const auto& fd = fields_[fi];
+    rmm::device_buffer mask{};
+    cudf::size_type nullCount = 0;
+    if (nullPad_ > 0) {
+      mask = rmm::device_buffer(cudf::bitmask_allocation_size_bytes(n), stream_);
+      sidecarToMask(
+          nullBase, nullPad_, fi, n, static_cast<uint32_t*>(mask.data()),
+          stream_.value());
+      nullCount = cudf::null_count(
+          static_cast<const cudf::bitmask_type*>(mask.data()), 0, n, stream_);
+    }
+    if (fd.kind == kFieldString) {
+      const size_t offBytes = (static_cast<size_t>(n) + 1) * sizeof(int64_t);
+      if (offBytes > strOffsetsDev_.size()) {
+        strOffsetsDev_ = rmm::device_buffer(offBytes, stream_);
+      }
+      const int64_t totalChars = stringFieldOffsets(
+          base, n, rowWidth_, fd.offset,
+          static_cast<int64_t*>(strOffsetsDev_.data()), stream_.value());
+      auto offsetsCol = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32}, n + 1,
+          cudf::mask_state::UNALLOCATED, stream_, get_output_mr());
+      rmm::device_buffer chars(totalChars, stream_);
+      stringFieldToChars(
+          base, n, rowWidth_, fd.offset,
+          static_cast<const uint8_t*>(heap_.data()),
+          static_cast<const int64_t*>(strOffsetsDev_.data()),
+          offsetsCol->mutable_view().data<int32_t>(),
+          static_cast<uint8_t*>(chars.data()), stream_.value());
+      columns.push_back(cudf::make_strings_column(
+          n, std::move(offsetsCol), std::move(chars), nullCount, std::move(mask)));
+      continue;
+    }
+    columns.push_back(std::make_unique<cudf::column>(
+        veloxToCudfDataType(outputType_->childAt(i)),
+        n,
+        std::move(*colBufs[i]),
+        std::move(mask),
+        nullCount));
+  }
+  return columns;
+}
+
 RowVectorPtr RowOrderBy::emitColumnarChunk(int64_t begin, int32_t n) {
   const uint8_t* base =
       static_cast<const uint8_t*>(sorted_.data()) + begin * rowWidth_;
@@ -1001,74 +1131,14 @@ RowVectorPtr RowOrderBy::emitColumnarChunk(int64_t begin, int32_t n) {
   }
 
   // Fixed-width columns: one scatter kernel.
-  std::vector<std::unique_ptr<rmm::device_buffer>> colBufs(numCols);
-  std::vector<uint8_t*> fixedPtrs;
-  std::vector<FieldDesc> fixedFields;
+  auto columns = transposeChunkColumns(base, nullBase, n);
   for (int32_t i = 0; i < numCols; i++) {
-    const auto fi = outFieldIdx_[i];
-    if (fi < 0 || fields_[fi].kind == kFieldString) {
-      continue;
+    if (outFieldIdx_[i] < 0) {
+      VELOX_CHECK_NOT_NULL(deferred[i]);
+      columns[i] = std::move(deferred[i]);
     }
-    colBufs[i] = std::make_unique<rmm::device_buffer>(
-        static_cast<size_t>(n) * fields_[fi].byte_width, stream_);
-    fixedPtrs.push_back(static_cast<uint8_t*>(colBufs[i]->data()));
-    fixedFields.push_back(fields_[fi]);
-  }
-  if (!fixedFields.empty()) {
-    rowsToColumns(
-        base, fixedFields.data(), fixedPtrs.data(),
-        static_cast<int32_t>(fixedFields.size()), n, rowWidth_, stream_.value());
   }
 
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(numCols);
-  for (int32_t i = 0; i < numCols; i++) {
-    const auto fi = outFieldIdx_[i];
-    if (fi < 0) {
-      VELOX_CHECK_NOT_NULL(deferred[i]);
-      columns.push_back(std::move(deferred[i]));
-      continue;
-    }
-    const auto& fd = fields_[fi];
-    rmm::device_buffer mask{};
-    cudf::size_type nullCount = 0;
-    if (nullPad_ > 0) {
-      mask = rmm::device_buffer(cudf::bitmask_allocation_size_bytes(n), stream_);
-      sidecarToMask(
-          nullBase, nullPad_, fi, n, static_cast<uint32_t*>(mask.data()),
-          stream_.value());
-      nullCount = cudf::null_count(
-          static_cast<const cudf::bitmask_type*>(mask.data()), 0, n, stream_);
-    }
-    if (fd.kind == kFieldString) {
-      const size_t offBytes = (static_cast<size_t>(n) + 1) * sizeof(int64_t);
-      if (offBytes > strOffsetsDev_.size()) {
-        strOffsetsDev_ = rmm::device_buffer(offBytes, stream_);
-      }
-      const int64_t totalChars = stringFieldOffsets(
-          base, n, rowWidth_, fd.offset,
-          static_cast<int64_t*>(strOffsetsDev_.data()), stream_.value());
-      auto offsetsCol = cudf::make_numeric_column(
-          cudf::data_type{cudf::type_id::INT32}, n + 1,
-          cudf::mask_state::UNALLOCATED, stream_, get_output_mr());
-      rmm::device_buffer chars(totalChars, stream_);
-      stringFieldToChars(
-          base, n, rowWidth_, fd.offset,
-          static_cast<const uint8_t*>(heap_.data()),
-          static_cast<const int64_t*>(strOffsetsDev_.data()),
-          offsetsCol->mutable_view().data<int32_t>(),
-          static_cast<uint8_t*>(chars.data()), stream_.value());
-      columns.push_back(cudf::make_strings_column(
-          n, std::move(offsetsCol), std::move(chars), nullCount, std::move(mask)));
-      continue;
-    }
-    columns.push_back(std::make_unique<cudf::column>(
-        veloxToCudfDataType(outputType_->childAt(i)),
-        n,
-        std::move(*colBufs[i]),
-        std::move(mask),
-        nullCount));
-  }
   auto table = std::make_unique<cudf::table>(std::move(columns));
   addRuntimeStat("rowToColOutputRows", RuntimeCounter(static_cast<int64_t>(n)));
   return std::make_shared<CudfVector>(
