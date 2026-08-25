@@ -272,6 +272,11 @@ class RowHashJoinProbe : public CudfOperatorBase {
   std::vector<int32_t> materializeIds_;
   std::vector<exec::HybridRowId> materializeRowIds_;
   std::vector<const char*> materializeSentinelScratch_;
+  bool hostExit_ = false; // consumer is CudfToVelox: emit host RowVector
+  std::vector<uint8_t> hostRowsScratch_;
+  std::vector<uint8_t> hostCharsScratch_;
+  std::vector<uint8_t> hostNullsScratch_;
+  RowVectorPtr makeHostOutput(int32_t numMatches, rmm::cuda_stream_view stream);
 
   // ---- Out-of-line strings (eager compaction) ----
   rmm::device_buffer probeCharsBuffer_;   // heap of a transposed CudfVector probe

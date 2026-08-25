@@ -1517,6 +1517,11 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         if (ops[i] == this) {
           if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
             emitColumnar_ = 0; // next op is a row-join -> keep row layout
+          } else if (dynamic_cast<CudfToVelox*>(ops[i + 1]) != nullptr) {
+            // CPU exit: with provenance, emit a HOST RowVector directly
+            // (CudfToVelox passes non-CudfVector inputs through) -- the
+            // deferred payload never touches the GPU (paper case (a)).
+            hostExit_ = true;
           }
           break;
         }
@@ -1534,7 +1539,7 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   // Recorded before the numMatches==0 early-return so empty batches count.
   if (emitColumnar_ == 1) {
     DeferralStats::instance().recordSurvived(
-        joinNode_->id(), numMatches);
+        joinNode_->id(), hostExit_ ? 0 : numMatches);
   }
 
   // ---- 4. Row gather ----
@@ -1714,6 +1719,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
 
   // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
   if (emitColumnar_ == 1) {
+    if (hostExit_ && probeProvStore_ != nullptr) {
+      return makeHostOutput(numMatches, stream);
+    }
     return makeColumnarOutput(numMatches, stream);
   }
 
@@ -1777,6 +1785,144 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     out->setProvenance(probeProvStore_, outputRowIdField_);
   }
   return out;
+}
+
+// ============================================================================
+// makeColumnarOutput — row->col transpose at the terminal join
+// ============================================================================
+// Converts the gathered fixed-stride row buffer (probeGatherBuffer_, layout
+// described by outputFields_ / outputRowWidth_) into a column-major cudf::table
+// wrapped in a CudfVector, so that downstream columnar cudf operators
+// (aggregation, orderBy, ...) can consume it.
+// ============================================================================
+// makeHostOutput -- direct CPU-exit emission (spine deferral, paper case a)
+// ============================================================================
+// The consumer is CudfToVelox (results leave the GPU anyway): D2H the
+// gathered fixed rows once, extract fields host-side, gather DEFERRED
+// columns from the provenance store by the __rowid values embedded in the
+// rows. Deferred payload is never uploaded.
+RowVectorPtr RowHashJoinProbe::makeHostOutput(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  const int32_t numCols = outputType_->size();
+  const int64_t rowsBytes =
+      static_cast<int64_t>(numMatches) * outputRowWidth_;
+  hostRowsScratch_.resize(rowsBytes);
+  cudaMemcpyAsync(
+      hostRowsScratch_.data(),
+      probeGatherBuffer_.data(),
+      rowsBytes,
+      cudaMemcpyDeviceToHost,
+      stream.value());
+  // Strings' compacted heap, if any GPU-gathered string column exists.
+  if (outputCharsBuffer_.size() > 0) {
+    hostCharsScratch_.resize(outputCharsBuffer_.size());
+    cudaMemcpyAsync(
+        hostCharsScratch_.data(),
+        outputCharsBuffer_.data(),
+        outputCharsBuffer_.size(),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  }
+  // Null sidecar of the output rows, if present.
+  if (outputNullStride_ > 0) {
+    hostNullsScratch_.resize(
+        static_cast<int64_t>(numMatches) * outputNullStride_);
+    cudaMemcpyAsync(
+        hostNullsScratch_.data(),
+        outputNullBuffer_.data(),
+        hostNullsScratch_.size(),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  }
+  stream.synchronize();
+
+  // Deferred ids straight from the host rows.
+  const uint8_t* rows = hostRowsScratch_.data();
+  std::vector<VectorPtr> children(numCols);
+  if (!deferredOutputCols_.empty()) {
+    VELOX_CHECK_GE(outputRowIdField_, 0);
+    const int32_t idOff = outputFields_[outputRowIdField_].offset;
+    materializeIds_.resize(numMatches);
+    for (int32_t r = 0; r < numMatches; r++) {
+      int64_t id;
+      std::memcpy(&id, rows + static_cast<int64_t>(r) * outputRowWidth_ + idOff, 8);
+      materializeIds_[r] = static_cast<int32_t>(id);
+    }
+    probeProvStore_->idsForGlobalRows(
+        materializeIds_.data(), numMatches, materializeRowIds_);
+    const auto& storeType = probeProvStore_->rowType();
+    for (auto outIdx : deferredOutputCols_) {
+      auto col = BaseVector::create(
+          outputType_->childAt(outIdx), numMatches, pool());
+      probeProvStore_->gather(
+          static_cast<int32_t>(
+              storeType->getChildIdx(outputType_->nameOf(outIdx))),
+          materializeRowIds_,
+          col,
+          materializeSentinelScratch_);
+      children[outIdx] = std::move(col);
+    }
+  }
+
+  // GPU-gathered columns: strided host extraction.
+  for (int i = 0; i < numCols; i++) {
+    if (children[i] != nullptr) {
+      continue; // deferred, done above
+    }
+    const auto& fd = outputFields_[i];
+    auto vec = BaseVector::create(outputType_->childAt(i), numMatches, pool());
+    auto* flat = vec->asFlatVector<int64_t>(); // placeholder; per-type below
+    (void)flat;
+    if (fd.kind == kFieldString) {
+      auto* fv = vec->template asFlatVector<StringView>();
+      for (int32_t r = 0; r < numMatches; r++) {
+        const uint8_t* slot =
+            rows + static_cast<int64_t>(r) * outputRowWidth_ + fd.offset;
+        uint32_t len;
+        std::memcpy(&len, slot, 4);
+        const char* src;
+        if (len <= 12) {
+          src = reinterpret_cast<const char*>(slot + 4);
+        } else {
+          uint64_t off;
+          std::memcpy(&off, slot + 8, 8);
+          src = reinterpret_cast<const char*>(hostCharsScratch_.data() + off);
+        }
+        fv->set(r, StringView(src, len));
+      }
+    } else {
+      auto* raw = vec->valuesAsVoid()
+          ? const_cast<void*>(vec->valuesAsVoid())
+          : nullptr;
+      VELOX_CHECK_NOT_NULL(raw);
+      uint8_t* dst = static_cast<uint8_t*>(raw);
+      const int32_t w = fd.byte_width;
+      for (int32_t r = 0; r < numMatches; r++) {
+        std::memcpy(
+            dst + static_cast<int64_t>(r) * w,
+            rows + static_cast<int64_t>(r) * outputRowWidth_ + fd.offset,
+            w);
+      }
+    }
+    if (outputNullStride_ > 0) {
+      const uint8_t byteMask = static_cast<uint8_t>(1u << (i & 7));
+      const int32_t byteIdx = i >> 3;
+      for (int32_t r = 0; r < numMatches; r++) {
+        if (hostNullsScratch_[static_cast<int64_t>(r) * outputNullStride_ +
+                              byteIdx] &
+            byteMask) {
+          vec->setNull(r, true);
+        }
+      }
+    }
+    children[i] = std::move(vec);
+  }
+  outputCharsBuffer_ = rmm::device_buffer{};
+  addRuntimeStat(
+      "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
+  return std::make_shared<RowVector>(
+      pool(), outputType_, nullptr, numMatches, std::move(children));
 }
 
 RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
