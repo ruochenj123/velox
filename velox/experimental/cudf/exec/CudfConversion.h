@@ -200,6 +200,7 @@ class CudfFromVelox : public CudfOperatorBase {
   // with packable keys under --boundary_hybrid; the eager/deferred switch
   // is then evaluated per batch against endpointJoinId_'s DeferralStats.
   bool deferralEligible_{false};
+  bool nothingToDeferChecked_ = false; // once, at the first batch
   std::string endpointJoinId_;
   std::vector<std::string> joinOutputNames_;
   std::vector<std::string> subsetPackNames_;
