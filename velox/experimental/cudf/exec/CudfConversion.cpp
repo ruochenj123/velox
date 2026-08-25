@@ -550,6 +550,31 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
         endpointJoinId_ = chain.endpointJoinId;
       }
     }
+    // Nothing to defer => nothing to gain: if every input column the chain
+    // needs is already in the crossing set (keys + later keys), boundary
+    // mode would only add the host-exit path. Resolve EAGER (measured
+    // 2026-08-24: keys-only probes lost 0.6-0.9x under deferral).
+    if (deferralEligible_ && !joinOutputNames_.empty()) {
+      bool anyDeferred = false;
+      for (const auto& n : outputType_->names()) {
+        const bool crossing =
+            std::find(boundaryKeyNames_.begin(), boundaryKeyNames_.end(), n) !=
+                boundaryKeyNames_.end() ||
+            std::find(laterKeyNames_.begin(), laterKeyNames_.end(), n) !=
+                laterKeyNames_.end();
+        const bool needed =
+            std::find(joinOutputNames_.begin(), joinOutputNames_.end(), n) !=
+            joinOutputNames_.end();
+        if (!crossing && needed) {
+          anyDeferred = true;
+          break;
+        }
+      }
+      if (!anyDeferred) {
+        deferralEligible_ = false;
+        boundaryMode_ = 0;
+      }
+    }
     addRuntimeStat(
         "fromVeloxBoundaryMode",
         RuntimeCounter(static_cast<int64_t>(boundaryMode_)));
