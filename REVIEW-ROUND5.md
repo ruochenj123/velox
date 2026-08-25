@@ -77,6 +77,33 @@ query costs. Warm (3rd in-process repeat, SF100): Q22 0.63 s both arms (cold
   sweep_sf100enc_summary.txt, sf100fb (fallback), warm_* (methodology).
 
 ## Queued (post-review)
+0. **BATCH-LEVEL adaptive deferral (review decisions 2026-08-24,
+   supersedes the cross-execution DeferralStats mode as the headline
+   mechanism)**: decision variable measured AT THE MATERIALIZATION POINT.
+   Chain endpoint join E = last HashJoin before a non-join consumer
+   (statically known via the collectChainKeyNames plan walk). The pack
+   records P (packed rows) under key E; the endpoint probe (the one whose
+   emitColumnar decision fires) records S under E -- its output rows, or
+   **0 when its consumer is CudfToVelox (CPU exit: materialization
+   uploads nothing -> ALWAYS defer; = paper case (a))**. Pack switches
+   per accumulated batch: eager until S/P <= threshold, then deferred and
+   STICK (one-way). S is observable in eager mode too (same match counts),
+   so the observation phase needs no deferral machinery; measuring S also
+   subsumes the join-fanout caveat. First-join match rate may serve as an
+   early conservative trigger (PK builds: rates only multiply down).
+   Probe handles mixed batches via a two-slot ProbeLayout selected by
+   input->hasProvenance(); chained outputs/materialization already
+   per-batch; builds unaffected (always eager under v2). Threshold needs
+   one calibration sweep (upload+gather constants). Est. ~0.5-1 day;
+   implement after the current finals so always-defer / execution-adaptive
+   arms have clean comparison numbers.
+0b. **Direct host emission at the CPU exit** (review 2026-08-24): when the
+   probe's consumer is CudfToVelox and provenance exists, emit a host
+   RowVector directly (D2H gathered fixed rows + host field extraction +
+   provenance gather) instead of the uniform upload-then-download path.
+   Realizes paper case (a) fully (zero payload upload); REQUIRED before
+   the single-join case-(a) experiment; pairs naturally with item 0 (same
+   emission switch).
 1. **Lazy string compaction / pointer slots** (review discussion 2026-08-22):
    replace the heap-relative u64 offset in `RowStrSlot` with an absolute
    device pointer; each RowStoreVector keeps a shared_ptr list of the
@@ -147,3 +174,57 @@ query costs. Warm (3rd in-process repeat, SF100): Q22 0.63 s both arms (cold
    before every CudfHashAggregation, default off) — measure Q1/Q4/Q17/Q18
    col+row warm, on vs off. Also note join->join small batches (Q18 join[8]:
    129 batches avg 50 rows) as a separate concat opportunity for both arms.
+
+## 2026-08-24 (afternoon): items 0b + 0 IMPLEMENTED (uncommitted, for review)
+
+Final paper tables are in exp/2026-08-21-whole-query-deferral/FINDINGS-factorial.md
+("FINAL PAPER TABLES"). The two queued implementations landed on top:
+
+### 0b. Direct host emission at CPU exit (RowHashJoin.{h,cpp})
+- Terminal-probe resolution now also detects a CudfToVelox consumer ->
+  `hostExit_`. With provenance, the probe emits a host `RowVector` directly
+  (`makeHostOutput`): ONE D2H of the gathered fixed rows (+ compacted string
+  heap + null sidecar), host-side strided field extraction, and the DEFERRED
+  columns gathered from the BoundaryHostStore by the __rowid read out of the
+  host rows -- deferred payload never touches the GPU (paper case (a)).
+  CudfToVelox passes non-CudfVector inputs through untouched.
+
+### 0. Batch-level adaptive deferral (endpoint measurement)
+- DeferralPlan.h: chain walk now follows PROBE-side edges only and returns
+  `endpointJoinId` -- the terminal join of the chain (= materialization point).
+- DeferralStats.h: reworked to {packed, survived, reports} per endpoint id.
+  The spine pack records P (rows shipped); ONLY the terminal probe records S
+  (its match count) -- and a CPU exit records S=0, so single-join queries
+  always defer. shouldDefer = reports>0 && S <= threshold*P.
+- CudfConversion: with --deferral_adaptive the pack starts EAGER and
+  re-checks per BATCH; on the first true it flips one-way to the crossing-set
+  layout (resets the layout caches; stat fromVeloxDeferralSwitch).
+- RowHashJoin probe: detects the new field-name signature per batch and
+  recomputes input capture + output layout (stat probeLayoutSwitch), so a
+  query can mix eager and deferred batches mid-stream.
+
+### New microbench: Q32 (case-a)
+TpchQueryBuilder q32: lineitem JOIN orders (o_orderdate >= 1998-07-01 AND
+o_orderpriority = '1-URGENT'), 6 output cols incl. strings, NO aggregation --
+the only plan whose join output goes straight to the CPU. Exercises
+makeHostOutput + the S=0 endpoint rule.
+
+Validation: gate 13910992 (0b, 22q SF1) = 63/63 PASS ex. known q15 FP tie.
+Gate 13911134 (Q32 all arms + 22q batch-adaptive) pending.
+Binaries: dev-named only (bin/velox_cudf_tpch_benchmark_dev3); the finals
+binaries were not touched.
+
+### Validation update (2026-08-24, gate 13911615)
+25/26 PASS (only the known q15 FP tie). Q32 passes on ALL arms; hostExitRows
+fired (0b executed); adaptive switched mid-query on 12/22 queries incl. the
+deep chains (q9: 3 pack switches / 5 probe re-inits). Fixed en route:
+- keyChannelsResolved_ was a once-guard: after the mid-query switch the
+  later-join-key channels stayed classified as payload -> null srcs ->
+  SEGV in packIntoSlot (q2/q5/q8/q9/q18). The switch now re-resolves.
+- Q32 trimmed to 5 output columns (RowVector::toString elides past 5) and
+  compare_results.py strips dictionary "[i->j] " cell annotations.
+CORRECTION: the FINAL tables are SCAN-BASED (not resident) -- verified
+against the resident-vs-scan comparison table; FINDINGS header fixed.
+SF100 batch-level-adaptive perf runs queued: TPC-H 13911674
+(sweep_finalab_g1000000/), SSB 13911675 (ssb_bla/), dev3 harness,
+same protocol as finals.
