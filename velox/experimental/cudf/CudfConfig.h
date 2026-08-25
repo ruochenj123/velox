@@ -142,6 +142,18 @@ struct CudfConfig {
   /// (the two cudf::gather calls in unfilteredOutput) when finished.
   bool benchmarkLogGatherTime{false};
 
+  /// Row arms: pack only the columns the adjacent join needs (its keys +
+  /// its output columns); filter-only columns never cross. Standard for
+  /// the eager row pack; under spine deferral the probe-side pack crosses
+  /// the (smaller) crossing set instead.
+  bool benchmarkPruneRowColumns{true};
+
+  /// Spine deferral: adaptive defer-vs-eager. false = --boundary_hybrid
+  /// always defers; true = eager until a prior execution of the same join
+  /// observed match rate <= benchmarkDeferralThreshold (see DeferralStats).
+  bool benchmarkDeferralAdaptive{false};
+  double benchmarkDeferralThreshold{0.5};
+
   /// [Benchmark] When true, CudfHashJoinProbe skips cudf::gather entirely
   /// and returns a dummy 1-row output. Use to measure gather's true e2e
   /// impact by comparing e2e with vs without this flag.

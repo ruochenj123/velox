@@ -73,6 +73,13 @@ void CudfBatchConcat::doAddInput(RowVectorPtr input) {
 // ============================================================================
 RowVectorPtr CudfBatchConcat::concatRowStore() {
   VELOX_CHECK(!rowBuffer_.empty());
+  for (const auto& v : rowBuffer_) {
+    VELOX_CHECK(
+        !v->hasProvenance(),
+        "CudfBatchConcat: re-batching provenance-carrying (spine deferral) "
+        "row stores is not supported -- each batch references its own host "
+        "store");
+  }
 
   const auto& first = rowBuffer_.front();
   const int32_t rowWidth = first->rowWidth();

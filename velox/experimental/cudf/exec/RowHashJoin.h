@@ -72,6 +72,8 @@ class RowHashJoinBridge : public exec::JoinBridge {
     int32_t rowWidth;
     // Host-side field descriptors (for probe to compute output layout)
     std::vector<FieldDesc> hostFields;
+    // Subset-pack (pruned) builds: field names, for BY-NAME resolution.
+    std::vector<std::string> hostFieldNames;
 
     // ---- Boundary-hybrid (CudfConfig::benchmarkBoundaryHybrid) ----
     // When set, the GPU row store above holds ONLY the join-key columns
@@ -259,6 +261,18 @@ class RowHashJoinProbe : public CudfOperatorBase {
   // Output null sidecar for the current batch (rows = numMatches) and the
   // output stride; allocated only when an input store carries nulls.
   rmm::device_buffer outputNullBuffer_;
+  // ---- Spine deferral v2 (2026-08-24) ----
+  // Crossing-set field names of the probe input ("" entries never resolve);
+  // per-batch provenance store + the hidden __rowid field indices.
+  std::vector<std::string> probeFieldNames_;
+  std::shared_ptr<BoundaryHostStore> probeProvStore_;
+  int32_t probeRowIdField_ = -1;
+  int32_t outputRowIdField_ = -1;
+  std::vector<int32_t> deferredOutputCols_; // outType indices materialized late
+  std::vector<int32_t> materializeIds_;
+  std::vector<exec::HybridRowId> materializeRowIds_;
+  std::vector<const char*> materializeSentinelScratch_;
+
   // ---- Out-of-line strings (eager compaction) ----
   rmm::device_buffer probeCharsBuffer_;   // heap of a transposed CudfVector probe
   std::vector<StringGatherField> outputStringFields_; // string fields in output

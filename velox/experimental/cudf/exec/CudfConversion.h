@@ -191,6 +191,17 @@ class CudfFromVelox : public CudfOperatorBase {
   // type can differ from outputType_, e.g. a scan batch carrying a
   // filter-only column).
   std::vector<std::string> boundaryKeyNames_;
+  // Spine deferral v2 (2026-08-24): crossing set (keys + later-join keys +
+  // hidden __rowid) for boundary packs; pruned subset names for eager row
+  // packs; adjacent join's output names; index of the hidden rowid field.
+  std::vector<std::string> crossingNames_;
+  std::vector<std::string> laterKeyNames_;
+  std::vector<std::string> joinOutputNames_;
+  std::vector<std::string> subsetPackNames_;
+  bool prunedPack_{false};
+  int32_t rowIdField_{-1};
+  TypePtr boundaryStoreType_;
+  static constexpr const char* kRowIdName = "__rowid";
   // Input child index of each packed key, in join-key order (parallel to the
   // keys-only rowFields_ layout).
   std::vector<int32_t> boundaryPackChannels_;

@@ -7,6 +7,7 @@
 
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/DedicatedStream.h"
+#include "velox/experimental/cudf/exec/DeferralStats.h"
 #include "velox/experimental/cudf/exec/GpuRowOps.cuh"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/RowStoreVector.h"
@@ -508,6 +509,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   // Null sidecar for the combined build store (2026-08-17 null support).
   rmm::device_buffer buildNullBuffer;
   rmm::device_buffer buildCharsBuffer; // out-of-line string heap
+  std::vector<std::string> buildFieldNames; // pruned-pack names (by-name keys)
   int32_t buildNullStride = 0;
   std::vector<rmm::device_buffer> keyBuffers;
   std::shared_ptr<cudf::hash_join> hashJoin;
@@ -812,6 +814,7 @@ void RowHashJoinBuild::doNoMoreInput() {
     auto rightKeys = joinNode_->rightKeys();
     auto rightType = joinNode_->sources()[1]->outputType();
     std::vector<cudf::size_type> keyColIndices;
+    buildFieldNames = firstRowStore->fieldNames();
     if (boundaryBuild) {
       // Keys-only layout: field k IS rightKeys[k] (CudfFromVelox packed the
       // key columns in join-key order), so the key indices are simply 0..K-1
@@ -822,6 +825,15 @@ void RowHashJoinBuild::doNoMoreInput() {
           "boundary-hybrid build: keys-only layout width mismatch");
       for (size_t k = 0; k < rightKeys.size(); k++) {
         keyColIndices.push_back(static_cast<cudf::size_type>(k));
+      }
+    } else if (!buildFieldNames.empty()) {
+      // Pruned subset pack: resolve keys BY NAME against the store's own
+      // field names (channel indices of the full type do not apply).
+      for (auto& k : rightKeys) {
+        const auto fi = firstRowStore->fieldIndexOf(k->name());
+        VELOX_CHECK_GE(
+            fi, 0, "row build: key '{}' not in pruned pack", k->name());
+        keyColIndices.push_back(static_cast<cudf::size_type>(fi));
       }
     } else {
       for (auto& k : rightKeys) {
@@ -1000,6 +1012,7 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.numRows = numRows;
   bd.rowWidth = rowWidth;
   bd.hostFields = std::move(fields);
+  bd.hostFieldNames = std::move(buildFieldNames);
   bd.nullBuffer = std::move(buildNullBuffer);
   bd.nullStride = buildNullStride;
   bd.charsBuffer = std::move(buildCharsBuffer);
@@ -1189,8 +1202,25 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     if (!initialized_) {
       probeFields_ = rowStoreInput->hostFields();
       probeRowWidth_ = rowStoreInput->rowWidth();
+      // Spine deferral v2: a crossing-set input records its column names;
+      // fields (incl. join keys) resolve BY NAME against them, and the
+      // hidden __rowid field indexes the batch's retained host rows.
+      probeFieldNames_ = rowStoreInput->fieldNames();
+      if (!probeFieldNames_.empty()) {
+        std::vector<cudf::size_type> remapped;
+        for (const auto& key : joinNode_->leftKeys()) {
+          const auto fi = rowStoreInput->fieldIndexOf(key->name());
+          VELOX_CHECK_GE(
+              fi, 0, "spine probe: key '{}' not in crossing set", key->name());
+          remapped.push_back(static_cast<cudf::size_type>(fi));
+        }
+        leftKeyIndices_ = std::move(remapped);
+      }
       initialized_ = true;
     }
+    // Per-batch provenance (each emitted pack batch has its own store).
+    probeProvStore_ = rowStoreInput->provenanceStore();
+    probeRowIdField_ = rowStoreInput->rowIdField();
 
     // Upload fields descriptor if not done
     if (!fieldsUploaded_) {
@@ -1219,6 +1249,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     stream = cudfInput->stream();
     auto probeView = cudfInput->getTableView();
     probeRows = probeView.num_rows();
+    // No provenance on a GPU-columnar input.
+    probeProvStore_.reset();
+    probeRowIdField_ = -1;
 
     if (!initialized_) {
       // Include ALL columns in row layout (key embedded)
@@ -1292,7 +1325,32 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     int32_t dstOffset = 0;
     for (int i = 0; i < outType->size(); i++) {
       auto name = outType->nameOf(i);
-      auto leftIdx = leftType->getChildIdxIfExists(name);
+      // Probe-side resolution: BY NAME against the crossing set when the
+      // input is a subset pack (spine deferral v2), else by child index.
+      std::optional<uint32_t> leftIdx;
+      if (!probeFieldNames_.empty()) {
+        for (size_t f = 0; f < probeFieldNames_.size(); f++) {
+          if (probeFieldNames_[f] == name) {
+            leftIdx = static_cast<uint32_t>(f);
+            break;
+          }
+        }
+        // A probe-side column NOT in the crossing set is DEFERRED: it will
+        // be materialized from the provenance store, not gathered on GPU.
+        if (!leftIdx.has_value() &&
+            leftType->getChildIdxIfExists(name).has_value()) {
+          VELOX_CHECK_NOT_NULL(
+              probeProvStore_,
+              "spine probe: column '{}' absent from crossing set and no "
+              "provenance store",
+              name);
+          deferredOutputCols_.push_back(i);
+          outputFields_.push_back({-1, 0, kFieldFixed}); // placeholder
+          continue;
+        }
+      } else {
+        leftIdx = leftType->getChildIdxIfExists(name);
+      }
       int32_t byteWidth;
       int32_t kind;
       if (leftIdx.has_value()) {
@@ -1307,7 +1365,19 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         pSrcField.push_back(srcCol);
         pDstField.push_back(i);
       } else {
-        int srcCol = rightType->getChildIdx(name);
+        int srcCol = -1;
+        if (!buildData_->hostFieldNames.empty()) {
+          for (size_t f = 0; f < buildData_->hostFieldNames.size(); f++) {
+            if (buildData_->hostFieldNames[f] == name) {
+              srcCol = static_cast<int>(f);
+              break;
+            }
+          }
+          VELOX_CHECK_GE(
+              srcCol, 0, "row join: output column '{}' not packed", name);
+        } else {
+          srcCol = rightType->getChildIdx(name);
+        }
         byteWidth = buildHostFields[srcCol].byte_width;
         kind = buildHostFields[srcCol].kind;
         if (kind == kFieldString) {
@@ -1331,6 +1401,19 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
             {dstOffset, leftIdx.has_value() ? 0 : 1});
       }
       dstOffset += byteWidth;
+    }
+    // Spine deferral v2: chained/materialized outputs carry the hidden
+    // __rowid as an extra trailing field (gathered like any 8B field; not
+    // part of outputType).
+    if (probeProvStore_ != nullptr) {
+      dstOffset = alignUp(dstOffset, 8);
+      outputRowIdField_ = static_cast<int32_t>(outputFields_.size());
+      probeGatherMappings_.push_back(
+          {probeFields_[probeRowIdField_].offset, dstOffset, 8});
+      pSrcField.push_back(probeRowIdField_);
+      pDstField.push_back(0); // rowid is never null; bit 0 never set by it
+      outputFields_.push_back({dstOffset, 8, kFieldFixed});
+      dstOffset += 8;
     }
     outputRowWidth_ = (dstOffset + 7) & ~7;
     if (!outputStringFields_.empty()) {
@@ -1398,6 +1481,11 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       probeGpuStore, matcherKeyDescs, probeRows, stream,
       leftIndices, rightIndices);
   const auto tpGather = std::chrono::steady_clock::now();
+
+  // Adaptive deferral: record observed reduction for this join (consulted
+  // by the pack on later executions; see DeferralStats.h).
+  DeferralStats::instance().record(
+      joinNode_->id(), probeRows, numMatches);
 
   // ---- 4. Row gather ----
 
@@ -1650,6 +1738,20 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     out->setCharsBuffer(std::move(outputCharsBuffer_));
     outputCharsBuffer_ = rmm::device_buffer{};
   }
+  // Spine deferral v2: name the fields (deferred slots get "" so they never
+  // resolve) and pass the provenance through; the __rowid rides as the
+  // trailing hidden field.
+  if (probeProvStore_ != nullptr) {
+    std::vector<std::string> names;
+    names.reserve(outputFields_.size());
+    for (int i = 0; i < static_cast<int>(outputType_->size()); i++) {
+      names.push_back(
+          outputFields_[i].offset < 0 ? std::string() : outputType_->nameOf(i));
+    }
+    names.push_back("__rowid");
+    out->setFieldNames(std::move(names));
+    out->setProvenance(probeProvStore_, outputRowIdField_);
+  }
   return out;
 }
 
@@ -1664,7 +1766,90 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
     int32_t numMatches,
     rmm::cuda_stream_view stream) {
   const int32_t numCols = outputType_->size();
-  VELOX_CHECK_EQ(static_cast<size_t>(numCols), outputFields_.size());
+  VELOX_CHECK_LE(static_cast<size_t>(numCols), outputFields_.size());
+
+  // Spine deferral v2: materialize DEFERRED probe-side columns from the
+  // provenance store -- extract the hidden __rowid field of the gathered
+  // rows, read the ids back, host-gather survivors, upload, and splice the
+  // columns into the output table below.
+  std::vector<std::unique_ptr<cudf::column>> deferredCols(numCols);
+  if (!deferredOutputCols_.empty() && numMatches > 0) {
+    VELOX_CHECK_NOT_NULL(probeProvStore_);
+    VELOX_CHECK_GE(outputRowIdField_, 0);
+    auto tpDefer = std::chrono::steady_clock::now();
+    // rowids: device-extract the hidden field, then D2H.
+    rmm::device_buffer idsDev(
+        static_cast<size_t>(numMatches) * sizeof(int64_t), stream);
+    GpuFixedRowStore outStore;
+    outStore.row_buffer = static_cast<uint8_t*>(probeGatherBuffer_.data());
+    outStore.row_width = outputRowWidth_;
+    outStore.num_rows = numMatches;
+    extractKeysFromRows(
+        outStore,
+        outputFields_[outputRowIdField_].offset,
+        8,
+        idsDev.data(),
+        stream.value());
+    std::vector<int64_t> ids64(numMatches);
+    cudaMemcpyAsync(
+        ids64.data(),
+        idsDev.data(),
+        static_cast<size_t>(numMatches) * sizeof(int64_t),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    stream.synchronize();
+    materializeIds_.resize(numMatches);
+    for (int32_t i = 0; i < numMatches; i++) {
+      materializeIds_[i] = static_cast<int32_t>(ids64[i]);
+    }
+    probeProvStore_->idsForGlobalRows(
+        materializeIds_.data(), numMatches, materializeRowIds_);
+    const auto& storeType = probeProvStore_->rowType();
+    std::vector<VectorPtr> hostCols;
+    std::vector<std::string> hostNames;
+    for (auto outIdx : deferredOutputCols_) {
+      const auto& name = outputType_->nameOf(outIdx);
+      auto col = BaseVector::create(
+          outputType_->childAt(outIdx), numMatches, pool());
+      probeProvStore_->gather(
+          static_cast<int32_t>(storeType->getChildIdx(name)),
+          materializeRowIds_,
+          col,
+          materializeSentinelScratch_);
+      hostCols.push_back(std::move(col));
+      hostNames.push_back(name);
+    }
+    // Upload as one table; column order == deferredOutputCols_ order.
+    auto hostRow = std::make_shared<RowVector>(
+        pool(),
+        ROW(std::move(hostNames),
+            [&] {
+              std::vector<TypePtr> ts;
+              for (auto outIdx : deferredOutputCols_) {
+                ts.push_back(outputType_->childAt(outIdx));
+              }
+              return ts;
+            }()),
+        nullptr,
+        numMatches,
+        std::move(hostCols));
+    auto tbl = with_arrow::toCudfTable(
+        hostRow, pool(), stream, get_output_mr());
+    auto cols = tbl->release();
+    for (size_t k = 0; k < deferredOutputCols_.size(); k++) {
+      deferredCols[deferredOutputCols_[k]] = std::move(cols[k]);
+    }
+    addRuntimeStat(
+        "deferredMaterializeRows",
+        RuntimeCounter(static_cast<int64_t>(numMatches)));
+    addRuntimeStat(
+        "deferredMaterializeNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpDefer)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+  }
 
   // Allocate one device buffer per FIXED output column and remember its
   // base ptr; string columns (2026-08-21) are materialized separately below.
@@ -1672,7 +1857,8 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
   std::vector<uint8_t*> fixedPtrs;
   std::vector<FieldDesc> fixedFields;
   for (int i = 0; i < numCols; i++) {
-    if (outputFields_[i].kind == kFieldString) {
+    if (outputFields_[i].kind == kFieldString ||
+        outputFields_[i].offset < 0 /* deferred: materialized above */) {
       continue;
     }
     int64_t bytes = static_cast<int64_t>(numMatches) *
@@ -1698,6 +1884,12 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(numCols);
   for (int i = 0; i < numCols; i++) {
+    if (outputFields_[i].offset < 0) {
+      // Deferred column, uploaded in the materialization block above.
+      VELOX_CHECK_NOT_NULL(deferredCols[i]);
+      columns.push_back(std::move(deferredCols[i]));
+      continue;
+    }
     auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
     rmm::device_buffer mask{};
     cudf::size_type nullCount = 0;

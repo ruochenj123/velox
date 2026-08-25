@@ -18,6 +18,8 @@
 #include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/DeferralPlan.h"
+#include "velox/experimental/cudf/exec/DeferralStats.h"
 #include "velox/experimental/cudf/exec/DedicatedStream.h"
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
@@ -31,6 +33,7 @@
 
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
@@ -477,20 +480,40 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
     // Key names are captured for ANY adjacent row-join op: boundary mode
     // packs exactly these; the row pack's null-KEY guard checks exactly
     // these (null join keys are unrepresentable in the row matcher).
+    // Spine deferral v2 (2026-08-24): boundary (crossing-set + host
+    // retention) applies ONLY to a pack feeding a join PROBE -- the spine.
+    // Build-side packs are always EAGER; with pruning they carry just the
+    // columns the join needs (keys + join output).
     boundaryMode_ = 0;
     if (rowWiseMode && next != nullptr) {
+      std::shared_ptr<const core::HashJoinNode> adjJoin;
       if (auto* probe = dynamic_cast<RowHashJoinProbe*>(next)) {
         for (const auto& key : probe->joinNode()->leftKeys()) {
           boundaryKeyNames_.push_back(key->name());
+        }
+        adjJoin = probe->joinNode();
+        const auto& cfg = CudfConfig::getInstance();
+        if (!boundaryKeyNames_.empty() && cfg.benchmarkBoundaryHybrid) {
+          // Adaptive: eager until a prior execution observed enough
+          // reduction at this join (DeferralStats); else always defer.
+          boundaryMode_ = !cfg.benchmarkDeferralAdaptive ||
+                  DeferralStats::instance().shouldDefer(
+                      adjJoin->id(), cfg.benchmarkDeferralThreshold)
+              ? 1
+              : 0;
         }
       } else if (auto* build = dynamic_cast<RowHashJoinBuild*>(next)) {
         for (const auto& key : build->joinNode()->rightKeys()) {
           boundaryKeyNames_.push_back(key->name());
         }
+        adjJoin = build->joinNode();
       }
-      if (!boundaryKeyNames_.empty() &&
-          CudfConfig::getInstance().benchmarkBoundaryHybrid) {
-        boundaryMode_ = 1;
+      if (adjJoin != nullptr) {
+        joinOutputNames_ = adjJoin->outputType()->names();
+        // Crossing set: keys of LATER joins in the chain must also cross
+        // as values (a later join hashes on them). Cached per plan walk.
+        const auto& planRoot = operatorCtx_->task()->planFragment().planNode;
+        laterKeyNames_ = collectChainKeyNames(planRoot, adjJoin->id()).later;
       }
     }
     addRuntimeStat(
@@ -530,17 +553,26 @@ bool CudfFromVelox::computeLayoutOnce(
   // ---- One-time layout: offsets/widths + cudf dtypes ----
   const int numCols = static_cast<int>(inRowType->size());
   if (!rowLayoutReady_ && boundary) {
-    // ---- Keys-only layout: pack exactly the join-key columns, in join-key
-    // order. The stride is the KEY row width, so toCudfBytes below reports
-    // the true boundary traffic (keys only). Unsupported key types are a
-    // hard error rather than a silent fallback: the downstream boundary
-    // probe/build REQUIRES the keys-only layout, and a full-width fallback
-    // pack would be misread as keys.
+    // ---- Crossing-set layout (spine deferral v2): pack the adjacent
+    // join's keys, then every LATER join key present in this input, then a
+    // hidden __rowid BIGINT (index into the batch's retained host rows).
+    // The stride is the crossing width, so toCudfBytes reports the true
+    // boundary traffic. Unsupported crossing types are a hard error rather
+    // than a silent fallback: the downstream probe REQUIRES this layout,
+    // and a full-width fallback pack would be misread.
+    crossingNames_ = boundaryKeyNames_;
+    for (const auto& n : laterKeyNames_) {
+      if (inRowType->getChildIdxIfExists(n).has_value() &&
+          std::find(crossingNames_.begin(), crossingNames_.end(), n) ==
+              crossingNames_.end()) {
+        crossingNames_.push_back(n);
+      }
+    }
     boundaryPackChannels_.clear();
     std::vector<FieldDesc> fields;
-    fields.reserve(boundaryKeyNames_.size());
+    fields.reserve(crossingNames_.size() + 1);
     int32_t offset = 0;
-    for (const auto& name : boundaryKeyNames_) {
+    for (const auto& name : crossingNames_) {
       const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
       boundaryPackChannels_.push_back(ch);
       const auto& type = inRowType->childAt(ch);
@@ -575,10 +607,92 @@ bool CudfFromVelox::computeLayoutOnce(
       fields.push_back(fd);
       offset += fd.byte_width;
     }
+    // Hidden __rowid: filled by the pack (not from a channel).
+    offset = (offset + 7) & ~7;
+    rowIdField_ = static_cast<int32_t>(fields.size());
+    fields.push_back({offset, 8});
+    offset += 8;
+    crossingNames_.push_back(kRowIdName);
     rowFields_ = std::move(fields);
-    rowWidth_ = (offset + 7) & ~7; // 8-byte aligned keys-only stride
+    rowWidth_ = (offset + 7) & ~7; // 8-byte aligned crossing stride
     dataWidth_ = offset;
     rowLayoutReady_ = true;
+  }
+  // ---- Pruned eager layout: pack only keys + the join's output columns.
+  // Filter-only channels never cross. Applies to build-side and non-
+  // boundary probe-side row packs.
+  if (!rowLayoutReady_ && rowMode &&
+      CudfConfig::getInstance().benchmarkPruneRowColumns &&
+      !joinOutputNames_.empty()) {
+    std::vector<std::string> needed = boundaryKeyNames_;
+    for (const auto& n : joinOutputNames_) {
+      if (inRowType->getChildIdxIfExists(n).has_value() &&
+          std::find(needed.begin(), needed.end(), n) == needed.end()) {
+        needed.push_back(n);
+      }
+    }
+    if (static_cast<int>(needed.size()) < numCols) {
+      prunedPack_ = true;
+      subsetPackNames_ = std::move(needed);
+      boundaryPackChannels_.clear();
+      std::vector<FieldDesc> fields;
+      std::vector<cudf::data_type> dtypes;
+      int32_t offset = 0;
+      for (const auto& name : subsetPackNames_) {
+        const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
+        const auto& type = inRowType->childAt(ch);
+        FieldDesc fd;
+        switch (type->kind()) {
+          case TypeKind::TINYINT: fd.byte_width = 1; break;
+          case TypeKind::SMALLINT: fd.byte_width = 2; break;
+          case TypeKind::INTEGER:
+          case TypeKind::REAL: fd.byte_width = 4; break;
+          case TypeKind::BIGINT:
+          case TypeKind::DOUBLE: fd.byte_width = 8; break;
+          case TypeKind::VARCHAR:
+          case TypeKind::VARBINARY:
+            fd.byte_width = kRowStrSlotBytes;
+            fd.kind = kFieldString;
+            hasStringFields_ = true;
+            break;
+          default:
+            // Unpackable type in the needed set: give up pruning; the full
+            // layout below decides packability for the whole schema.
+            prunedPack_ = false;
+        }
+        if (!prunedPack_) {
+          break;
+        }
+        cudf::data_type dtype;
+        try {
+          dtype = veloxToCudfDataType(type);
+        } catch (const std::exception&) {
+          prunedPack_ = false;
+          break;
+        }
+        if (fd.kind == kFieldString) {
+          offset = (offset + 7) & ~7;
+        } else {
+          offset = (offset + fd.byte_width - 1) & ~(fd.byte_width - 1);
+        }
+        fd.offset = offset;
+        boundaryPackChannels_.push_back(ch);
+        fields.push_back(fd);
+        dtypes.push_back(dtype);
+        offset += fd.byte_width;
+      }
+      if (prunedPack_) {
+        rowFields_ = std::move(fields);
+        colDtypes_ = std::move(dtypes);
+        rowWidth_ = (offset + 7) & ~7;
+        dataWidth_ = offset;
+        rowLayoutReady_ = true;
+      } else {
+        boundaryPackChannels_.clear();
+        subsetPackNames_.clear();
+        hasStringFields_ = false;
+      }
+    }
   }
   if (!rowLayoutReady_) {
     int32_t offset = 0;
@@ -684,8 +798,14 @@ bool CudfFromVelox::loadChildren(
 
   const bool allowNulls = rowMode && !boundary;
   // Resolve join-key channels once (names came from the adjacent join op).
+  // Under boundary the whole CROSSING set behaves like keys (later joins
+  // hash on them; nulls unrepresentable, flat required).
   if (!keyChannelsResolved_ && rowMode) {
-    for (const auto& name : boundaryKeyNames_) {
+    const auto& names = boundary ? crossingNames_ : boundaryKeyNames_;
+    for (const auto& name : names) {
+      if (name == kRowIdName) {
+        continue;
+      }
       auto idx = inRowType->getChildIdxIfExists(name);
       if (idx.has_value()) {
         keyChannels_.push_back(static_cast<int32_t>(idx.value()));
@@ -716,9 +836,13 @@ bool CudfFromVelox::loadChildren(
       // String channels (2026-08-21): Parquet strings often arrive
       // dictionary-encoded; the pack reads FlatVector<StringView>, so
       // flatten here (a copy of the StringViews, not of the bytes).
-      if (child != nullptr && rowMode && !boundary &&
-          rowFields_[c].kind == kFieldString &&
-          child->encoding() != VectorEncoding::Simple::FLAT) {
+      // Subset-pack channels (boundary crossing / pruned) must also be
+      // flat: filter pushdown yields DICTIONARY columns.
+      if (child != nullptr && rowMode &&
+          child->encoding() != VectorEncoding::Simple::FLAT &&
+          (boundary || prunedPack_ ||
+           inRowType->childAt(c)->kind() == TypeKind::VARCHAR ||
+           inRowType->childAt(c)->kind() == TypeKind::VARBINARY)) {
         BaseVector::flattenVector(child);
         child = BaseVector::loadedVectorShared(child);
       }
@@ -802,7 +926,8 @@ void CudfFromVelox::packIntoSlot(
   if (rowMode) {
     const int32_t rowWidth = rowWidth_;
     // Boundary mode packs only the key channels (rowFields_ was computed
-    // over boundaryPackChannels_); normal mode packs every channel, where
+    // over boundaryPackChannels_ / subsetPackNames_); normal mode packs
+    // every channel, where
     // rowFields_.size() == numCols and packed index == channel index.
     const int numPacked = static_cast<int>(rowFields_.size());
     uint8_t* const heapBase = base + heapOffset;
@@ -812,7 +937,19 @@ void CudfFromVelox::packIntoSlot(
       const int64_t n = selectedInputs[b]->size();
       uint8_t* const tile = base + rowsSoFar * rowWidth;
       for (int k = 0; k < numPacked; k++) {
-        const int c = boundary ? boundaryPackChannels_[k] : k;
+        // Subset packs (boundary crossing set / pruned): field k comes
+        // from channel boundaryPackChannels_[k]; the hidden __rowid field
+        // (boundary only) is filled below, not from a channel.
+        if (boundary && k == rowIdField_) {
+          const int32_t off = rowFields_[k].offset;
+          uint8_t* d = tile + off;
+          for (int64_t r = 0; r < n; r++, d += rowWidth) {
+            const int64_t rowid = rowsSoFar + r;
+            std::memcpy(d, &rowid, 8);
+          }
+          continue;
+        }
+        const int c = (boundary || prunedPack_) ? boundaryPackChannels_[k] : k;
         const int32_t off = rowFields_[k].offset;
         const int32_t w = rowFields_[k].byte_width;
         const uint8_t* src = srcs[b * numCols + c];
@@ -872,13 +1009,16 @@ void CudfFromVelox::packIntoSlot(
       int64_t rowsBefore = 0;
       for (size_t b = 0; b < selectedInputs.size(); b++) {
         const int64_t n = selectedInputs[b]->size();
-        for (int c = 0; c < numCols; c++) {
+        // Bit index = PACKED FIELD index (consumers map fields, not
+        // channels); for identity packs field == channel.
+        for (int k = 0; k < numPacked; k++) {
+          const int c = prunedPack_ ? boundaryPackChannels_[k] : k;
           const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
           if (nulls == nullptr) {
             continue;
           }
-          const uint8_t byteMask = static_cast<uint8_t>(1u << (c & 7));
-          const int32_t byteIdx = c >> 3;
+          const uint8_t byteMask = static_cast<uint8_t>(1u << (k & 7));
+          const int32_t byteIdx = k >> 3;
           for (int64_t r = 0; r < n; r++) {
             if (velox::bits::isBitNull(nulls, r)) {
               nullBase[(rowsBefore + r) * nullStride + byteIdx] |= byteMask;
@@ -977,12 +1117,14 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   // StringViews (lengths only; no byte traffic).
   int64_t heapBytes = 0;
   if (rowMode && !boundary && hasStringFields_) {
+    const int numPackedFields = static_cast<int>(rowFields_.size());
     for (size_t b = 0; b < selectedInputs.size(); b++) {
       const int64_t n = selectedInputs[b]->size();
-      for (int c = 0; c < numCols; c++) {
-        if (rowFields_[c].kind != kFieldString) {
+      for (int k = 0; k < numPackedFields; k++) {
+        if (rowFields_[k].kind != kFieldString) {
           continue;
         }
+        const int c = prunedPack_ ? boundaryPackChannels_[k] : k;
         const auto* sv =
             reinterpret_cast<const StringView*>(pb.srcs[b * numCols + c]);
         const uint64_t* nulls = pb.rawNullsPtrs[b * numCols + c];
@@ -1076,27 +1218,32 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       rowStoreResult->setCharsInTail(heapOffset, heapBytes);
     }
     if (boundary) {
-      // ---- Host retention: the payload never crosses the boundary. ----
-      // Rebuild each selected input as a RowVector of its LOADED children
-      // (the same vectors keepAlive pinned for the pack, so this is a
-      // buffer-sharing wrap, not a copy) and attach them to the emitted
-      // vector. Concatenated in this exact order they equal the GPU rows
-      // row-for-row, which is the identity the join's host gather uses.
-      std::vector<RowVectorPtr> retained;
-      retained.reserve(selectedInputs.size());
+      // ---- Spine deferral v2: retain THIS emitted batch's host rows as a
+      // per-batch BoundaryHostStore; the hidden __rowid field indexes it.
+      // Payload never crosses; materialization gathers survivors later.
+      if (boundaryStoreType_ == nullptr) {
+        boundaryStoreType_ = inRowType;
+      }
+      auto store = std::make_shared<BoundaryHostStore>(
+          std::dynamic_pointer_cast<const RowType>(boundaryStoreType_),
+          selectedInputs[0]->pool());
       for (size_t b = 0; b < selectedInputs.size(); b++) {
         std::vector<VectorPtr> children(numCols);
         for (int c = 0; c < numCols; c++) {
           children[c] = pb.keepAlive[b * numCols + c];
         }
-        retained.push_back(std::make_shared<RowVector>(
-            pool,
+        store->addBatch(std::make_shared<RowVector>(
+            selectedInputs[b]->pool(),
             inRowType,
             nullptr,
             selectedInputs[b]->size(),
             std::move(children)));
       }
-      rowStoreResult->setBoundaryPayload(std::move(retained));
+      rowStoreResult->setProvenance(std::move(store), rowIdField_);
+      rowStoreResult->setFieldNames(crossingNames_);
+    }
+    if (prunedPack_) {
+      rowStoreResult->setFieldNames(subsetPackNames_);
     }
     result = std::move(rowStoreResult);
   } else {

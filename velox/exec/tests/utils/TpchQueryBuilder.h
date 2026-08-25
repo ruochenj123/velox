@@ -231,6 +231,13 @@ class TpchQueryBuilder {
       residentCache_;
   TpchPlan buildQueryPlan(int queryId) const;
   void makeResident(TpchPlan& plan) const;
+
+  // ---- SSB (Star Schema Benchmark), 2026-08-24 ----
+  // Detected in initialize() by a lineorder/ directory in the data path.
+  // Query ids 101..113 = Q1.1..Q4.3. Dimension tables build, lineorder is
+  // the probe spine (the shape spine deferral is designed for).
+  bool ssb_{false};
+  TpchPlan getSsbPlan(int queryId) const;
 };
 
 } // namespace facebook::velox::exec::test

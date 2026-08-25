@@ -86,6 +86,13 @@ DEFINE_bool(boundary_hybrid, false,
 DEFINE_bool(row_table, false,
     "Row-native chained matcher (RowNativeHashTable) instead of "
     "cudf::hash_join inside the row-wise join operators.");
+DEFINE_bool(deferral_adaptive, false,
+    "With --boundary_hybrid: eager until a prior repeat observed match "
+    "rate <= --deferral_threshold at the adjacent join (DeferralStats).");
+DEFINE_double(deferral_threshold, 0.5, "Adaptive deferral match-rate bound.");
+DEFINE_bool(prune_row_columns, true,
+    "Row arms: pack only the columns the adjacent join needs (keys + join "
+    "output); filter-only columns never cross.");
 DEFINE_bool(row_table_pack_keys, true,
     "With --row_table: composite-key range packing when the ranges fit.");
 DEFINE_bool(keep_project_on_cpu, true,
@@ -160,6 +167,9 @@ void CudfTpchBenchmark::initialize() {
   cfg.benchmarkRowTable = FLAGS_row_table;
   cfg.benchmarkRowTablePackKeys = FLAGS_row_table_pack_keys;
   cfg.benchmarkKeepProjectOnCpu = FLAGS_keep_project_on_cpu;
+  cfg.benchmarkPruneRowColumns = FLAGS_prune_row_columns;
+  cfg.benchmarkDeferralAdaptive = FLAGS_deferral_adaptive;
+  cfg.benchmarkDeferralThreshold = FLAGS_deferral_threshold;
   cfg.benchmarkLogGatherTime = FLAGS_log_gather_time;
   cfg.benchmarkConcatBeforeJoin = FLAGS_concat_join;
   cfg.concatOptimizationEnabled = FLAGS_concat_agg;

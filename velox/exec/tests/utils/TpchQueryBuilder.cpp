@@ -135,6 +135,52 @@ void TpchQueryBuilder::readFileSchema(
 }
 
 void TpchQueryBuilder::initialize(const std::string& dataPath) {
+  // SSB dataset? (lineorder fact table present.)
+  {
+    std::error_code ec;
+    if (fs::exists(dataPath + "/lineorder", ec)) {
+      ssb_ = true;
+      static const std::vector<std::pair<std::string, std::vector<std::string>>>
+          kSsbTables = {
+              {"lineorder",
+               {"lo_orderkey",      "lo_linenumber",  "lo_custkey",
+                "lo_partkey",       "lo_suppkey",     "lo_orderdate",
+                "lo_orderpriority", "lo_shippriority", "lo_quantity",
+                "lo_extendedprice", "lo_ordtotalprice", "lo_discount",
+                "lo_revenue",       "lo_supplycost",  "lo_tax",
+                "lo_commitdate",    "lo_shipmode"}},
+              {"customer",
+               {"c_custkey", "c_name", "c_address", "c_city", "c_nation",
+                "c_region", "c_phone", "c_mktsegment"}},
+              {"supplier",
+               {"s_suppkey", "s_name", "s_address", "s_city", "s_nation",
+                "s_region", "s_phone"}},
+              {"part",
+               {"p_partkey", "p_name", "p_mfgr", "p_category", "p_brand1",
+                "p_color", "p_type", "p_size", "p_container"}},
+              {"date",
+               {"d_datekey", "d_date", "d_dayofweek", "d_month", "d_year",
+                "d_yearmonthnum", "d_yearmonth", "d_daynuminweek",
+                "d_daynuminmonth", "d_daynuminyear", "d_monthnuminyear",
+                "d_weeknuminyear", "d_sellingseason", "d_lastdayinweekfl",
+                "d_lastdayinmonthfl", "d_holidayfl", "d_weekdayfl"}},
+          };
+      for (const auto& [tableName, columns] : kSsbTables) {
+        const fs::path tablePath{dataPath + "/" + tableName};
+        for (auto const& dirEntry : fs::directory_iterator{tablePath}) {
+          if (!dirEntry.is_regular_file() ||
+              dirEntry.path().filename().c_str()[0] == '.') {
+            continue;
+          }
+          if (tableMetadata_[tableName].dataFiles.empty()) {
+            readFileSchema(tableName, dirEntry.path().string(), columns);
+          }
+          tableMetadata_[tableName].dataFiles.push_back(dirEntry.path());
+        }
+      }
+      return;
+    }
+  }
   // Encoded dataset? (see encCodes_ in the header)
   {
     std::ifstream codes(dataPath + "/codes.json");
@@ -264,7 +310,8 @@ TpchQueryBuilder::~TpchQueryBuilder() {
 }
 
 TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
-  auto plan = buildQueryPlan(queryId);
+  auto plan = queryId >= 101 && queryId <= 113 ? getSsbPlan(queryId)
+                                               : buildQueryPlan(queryId);
   if (resident_) {
     makeResident(plan);
   }
@@ -393,6 +440,255 @@ void TpchQueryBuilder::makeResident(TpchPlan& plan) const {
   std::cerr << "[resident] all tables ready" << std::endl;
   // No splits: the scans are served from memory.
   plan.dataFiles.clear();
+}
+
+// ============================================================================
+// SSB (Star Schema Benchmark) Q1.1..Q4.3 as ids 101..113. All queries share
+// one template: lineorder probe spine, dimension builds, aggregation, then
+// (for flights 2-4) an order-by. Filters sit on the dimension scans and on
+// lineorder (flight 1).
+// ============================================================================
+TpchPlan TpchQueryBuilder::getSsbPlan(int queryId) const {
+  struct Dim {
+    std::string table;
+    std::vector<std::string> columns; // scan columns (key first)
+    std::string probeKey;
+    std::string buildKey;
+    std::vector<std::string> filters;
+  };
+  std::vector<std::string> loColumns;
+  std::vector<std::string> loFilters;
+  std::vector<Dim> dims;
+  std::string aggExprInput; // projected column feeding the SUM
+  std::vector<std::string> groupBy;
+  bool orderByGroup = true;
+
+  auto dateDim = [](std::vector<std::string> filters,
+                    std::vector<std::string> extraCols =
+                        {}) -> Dim {
+    std::vector<std::string> cols = {"d_datekey"};
+    for (auto& c : extraCols) cols.push_back(c);
+    return {"date", cols, "lo_orderdate", "d_datekey", std::move(filters)};
+  };
+
+  switch (queryId) {
+    case 101: // Q1.1
+      loColumns = {"lo_orderdate", "lo_extendedprice", "lo_discount",
+                   "lo_quantity"};
+      loFilters = {"lo_discount between 1 and 3", "lo_quantity < 25"};
+      dims = {dateDim({"d_year = 1993"})};
+      aggExprInput = "lo_extendedprice * lo_discount";
+      break;
+    case 102: // Q1.2
+      loColumns = {"lo_orderdate", "lo_extendedprice", "lo_discount",
+                   "lo_quantity"};
+      loFilters = {"lo_discount between 4 and 6",
+                   "lo_quantity between 26 and 35"};
+      dims = {dateDim({"d_yearmonthnum = 199401"})};
+      aggExprInput = "lo_extendedprice * lo_discount";
+      break;
+    case 103: // Q1.3
+      loColumns = {"lo_orderdate", "lo_extendedprice", "lo_discount",
+                   "lo_quantity"};
+      loFilters = {"lo_discount between 5 and 7",
+                   "lo_quantity between 26 and 35"};
+      dims = {dateDim({"d_weeknuminyear = 6", "d_year = 1994"})};
+      aggExprInput = "lo_extendedprice * lo_discount";
+      break;
+    case 104: // Q2.1
+    case 105: // Q2.2
+    case 106: // Q2.3
+      loColumns = {"lo_orderdate", "lo_partkey", "lo_suppkey", "lo_revenue"};
+      dims = {
+          {"part", {"p_partkey", "p_brand1", "p_category"}, "lo_partkey",
+           "p_partkey",
+           queryId == 104
+               ? std::vector<std::string>{"p_category = 'MFGR#12'"}
+               : queryId == 105
+               ? std::vector<std::string>{
+                     "p_brand1 between 'MFGR#2221' and 'MFGR#2228'"}
+               : std::vector<std::string>{"p_brand1 = 'MFGR#2239'"}},
+          {"supplier", {"s_suppkey", "s_region"}, "lo_suppkey", "s_suppkey",
+           {queryId == 104 ? "s_region = 'AMERICA'"
+                           : queryId == 105 ? "s_region = 'ASIA'"
+                                            : "s_region = 'EUROPE'"}},
+          dateDim({}, {"d_year"})};
+      aggExprInput = "lo_revenue";
+      groupBy = {"d_year", "p_brand1"};
+      break;
+    case 107: // Q3.1
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_revenue"};
+      dims = {
+          {"customer", {"c_custkey", "c_nation", "c_region"}, "lo_custkey",
+           "c_custkey", {"c_region = 'ASIA'"}},
+          {"supplier", {"s_suppkey", "s_nation", "s_region"}, "lo_suppkey",
+           "s_suppkey", {"s_region = 'ASIA'"}},
+          dateDim({"d_year between 1992 and 1997"}, {"d_year"})};
+      aggExprInput = "lo_revenue";
+      groupBy = {"c_nation", "s_nation", "d_year"};
+      break;
+    case 108: // Q3.2
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_revenue"};
+      dims = {
+          {"customer", {"c_custkey", "c_city", "c_nation"}, "lo_custkey",
+           "c_custkey", {"c_nation = 'UNITED STATES'"}},
+          {"supplier", {"s_suppkey", "s_city", "s_nation"}, "lo_suppkey",
+           "s_suppkey", {"s_nation = 'UNITED STATES'"}},
+          dateDim({"d_year between 1992 and 1997"}, {"d_year"})};
+      aggExprInput = "lo_revenue";
+      groupBy = {"c_city", "s_city", "d_year"};
+      break;
+    case 109: // Q3.3
+    case 110: // Q3.4
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_revenue"};
+      dims = {
+          {"customer", {"c_custkey", "c_city"}, "lo_custkey", "c_custkey",
+           {"c_city IN ('UNITED KI1', 'UNITED KI5')"}},
+          {"supplier", {"s_suppkey", "s_city"}, "lo_suppkey", "s_suppkey",
+           {"s_city IN ('UNITED KI1', 'UNITED KI5')"}},
+          queryId == 109
+              ? dateDim({"d_year between 1992 and 1997"}, {"d_year"})
+              : dateDim({"d_yearmonth = 'Dec1997'"}, {"d_year"})};
+      aggExprInput = "lo_revenue";
+      groupBy = {"c_city", "s_city", "d_year"};
+      break;
+    case 111: // Q4.1
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_partkey",
+                   "lo_revenue", "lo_supplycost"};
+      dims = {
+          {"customer", {"c_custkey", "c_nation", "c_region"}, "lo_custkey",
+           "c_custkey", {"c_region = 'AMERICA'"}},
+          {"supplier", {"s_suppkey", "s_region"}, "lo_suppkey", "s_suppkey",
+           {"s_region = 'AMERICA'"}},
+          {"part", {"p_partkey", "p_mfgr"}, "lo_partkey", "p_partkey",
+           {"p_mfgr IN ('MFGR#1', 'MFGR#2')"}},
+          dateDim({}, {"d_year"})};
+      aggExprInput = "lo_revenue - lo_supplycost";
+      groupBy = {"d_year", "c_nation"};
+      break;
+    case 112: // Q4.2
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_partkey",
+                   "lo_revenue", "lo_supplycost"};
+      dims = {
+          {"customer", {"c_custkey", "c_region"}, "lo_custkey", "c_custkey",
+           {"c_region = 'AMERICA'"}},
+          {"supplier", {"s_suppkey", "s_nation", "s_region"}, "lo_suppkey",
+           "s_suppkey", {"s_region = 'AMERICA'"}},
+          {"part", {"p_partkey", "p_mfgr", "p_category"}, "lo_partkey",
+           "p_partkey", {"p_mfgr IN ('MFGR#1', 'MFGR#2')"}},
+          dateDim({"d_year IN (1997, 1998)"}, {"d_year"})};
+      aggExprInput = "lo_revenue - lo_supplycost";
+      groupBy = {"d_year", "s_nation", "p_category"};
+      break;
+    case 113: // Q4.3
+      loColumns = {"lo_orderdate", "lo_custkey", "lo_suppkey", "lo_partkey",
+                   "lo_revenue", "lo_supplycost"};
+      dims = {
+          {"customer", {"c_custkey", "c_region"}, "lo_custkey", "c_custkey",
+           {"c_region = 'AMERICA'"}},
+          {"supplier", {"s_suppkey", "s_city", "s_nation"}, "lo_suppkey",
+           "s_suppkey", {"s_nation = 'UNITED STATES'"}},
+          {"part", {"p_partkey", "p_brand1", "p_category"}, "lo_partkey",
+           "p_partkey", {"p_category = 'MFGR#14'"}},
+          dateDim({"d_year IN (1997, 1998)"}, {"d_year"})};
+      aggExprInput = "lo_revenue - lo_supplycost";
+      groupBy = {"d_year", "s_city", "p_brand1"};
+      break;
+    default:
+      VELOX_FAIL("Unknown SSB query id {}", queryId);
+  }
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  TpchPlan context;
+  context.dataFileFormat = format_;
+
+  auto loType = getRowType("lineorder", loColumns);
+  core::PlanNodeId loScanId;
+  auto pb = PlanBuilder(planNodeIdGenerator, pool_.get())
+                .filtersAsNode(filtersAsNode_)
+                .tableScan(
+                    "lineorder",
+                    loType,
+                    getFileColumnNames("lineorder"),
+                    loFilters)
+                .capturePlanNodeId(loScanId);
+  context.dataFiles[loScanId] = getTableFilePaths("lineorder");
+
+  // Columns carried through the join chain: agg input + group-by columns
+  // as they appear; each dim join drops its probe key.
+  for (const auto& d : dims) {
+    auto dimType = getRowType(d.table, d.columns);
+    core::PlanNodeId dimScanId;
+    auto dimPlan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .filtersAsNode(filtersAsNode_)
+                       .tableScan(
+                           d.table,
+                           dimType,
+                           getFileColumnNames(d.table),
+                           d.filters)
+                       .capturePlanNodeId(dimScanId)
+                       .planNode();
+    context.dataFiles[dimScanId] = getTableFilePaths(d.table);
+    // Join output = columns needed AFTER this join: later dims' probe
+    // keys, the aggregate's input columns, and group-by columns seen so
+    // far (from lineorder or from this/earlier dims).
+    std::vector<std::string> aggCols;
+    for (const auto& c : {"lo_extendedprice", "lo_discount", "lo_revenue",
+                          "lo_supplycost"}) {
+      if (aggExprInput.find(c) != std::string::npos) {
+        aggCols.push_back(c);
+      }
+    }
+    std::vector<std::string> neededAfter = aggCols;
+    for (const auto& later : dims) {
+      if (&later > &d) {
+        neededAfter.push_back(later.probeKey);
+      }
+    }
+    for (const auto& g : groupBy) {
+      neededAfter.push_back(g);
+    }
+    std::vector<std::string> outCols;
+    auto want = [&](const std::string& c) {
+      return std::find(neededAfter.begin(), neededAfter.end(), c) !=
+          neededAfter.end() &&
+          std::find(outCols.begin(), outCols.end(), c) == outCols.end();
+    };
+    for (const auto& c : loColumns) {
+      if (want(c)) {
+        outCols.push_back(c);
+      }
+    }
+    for (const auto& c : d.columns) {
+      if (want(c)) {
+        outCols.push_back(c);
+      }
+    }
+    pb.hashJoin({d.probeKey}, {d.buildKey}, dimPlan, "", outCols);
+    loColumns = outCols;
+  }
+
+  pb.project([&] {
+    std::vector<std::string> exprs = groupBy;
+    exprs.push_back(aggExprInput + " AS agg_input");
+    return exprs;
+  }());
+  pb.partialAggregation(groupBy, {"sum(agg_input) AS revenue"})
+      .localPartition(std::vector<std::string>{})
+      .finalAggregation();
+  if (!groupBy.empty() && orderByGroup) {
+    std::vector<std::string> ob;
+    for (const auto& g : groupBy) {
+      ob.push_back(g);
+    }
+    pb.orderBy(ob, false);
+  }
+  context.plan = pb.planNode();
+  context.planName = "SSB Q" + std::to_string(queryId - 100);
+  if (resident_) {
+    // getQueryPlan applies makeResident to the returned plan.
+  }
+  return context;
 }
 
 TpchPlan TpchQueryBuilder::buildQueryPlan(int queryId) const {

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/BoundaryHostStore.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
 #include "velox/vector/ComplexVector.h"
 
@@ -173,6 +174,47 @@ class RowStoreVector : public RowVector {
     boundaryHostBatches_.clear();
   }
 
+  // ---- Spine deferral v2 (2026-08-24) --------------------------------
+  //
+  // A store packed as a SUBSET of its input columns (crossing keys, and for
+  // chained join outputs also build values + the hidden __rowid field)
+  // records its column names so consumers resolve fields BY NAME.
+  void setFieldNames(std::vector<std::string> names) {
+    fieldNames_ = std::move(names);
+  }
+  const std::vector<std::string>& fieldNames() const {
+    return fieldNames_;
+  }
+  /// Field index of `name`: by fieldNames_ when set, else -1.
+  int32_t fieldIndexOf(const std::string& name) const {
+    for (size_t i = 0; i < fieldNames_.size(); i++) {
+      if (fieldNames_[i] == name) {
+        return static_cast<int32_t>(i);
+      }
+    }
+    return -1;
+  }
+
+  /// Single-source provenance: this store's rows carry a hidden __rowid
+  /// BIGINT field (index rowIdField) that indexes `store` (the spine's
+  /// retained host rows). Set by the boundary pack and propagated by
+  /// chained probes; consumed at the materialization point.
+  void setProvenance(
+      std::shared_ptr<BoundaryHostStore> store,
+      int32_t rowIdField) {
+    provenanceStore_ = std::move(store);
+    rowIdField_ = rowIdField;
+  }
+  const std::shared_ptr<BoundaryHostStore>& provenanceStore() const {
+    return provenanceStore_;
+  }
+  int32_t rowIdField() const {
+    return rowIdField_;
+  }
+  bool hasProvenance() const {
+    return provenanceStore_ != nullptr;
+  }
+
  private:
   /// Create null-constant children so the RowVector base is valid
   static std::vector<VectorPtr> makeNullChildren(
@@ -196,6 +238,10 @@ class RowStoreVector : public RowVector {
   // Null sidecar stride in bytes per row (0 = none). Appended per the
   // partial-rebuild note above.
   int32_t nullStride_ = 0;
+  // Spine deferral v2 (appended per the same note).
+  std::vector<std::string> fieldNames_;
+  std::shared_ptr<BoundaryHostStore> provenanceStore_;
+  int32_t rowIdField_ = -1;
   // String heap (see setCharsInTail/setCharsBuffer). Appended per the
   // partial-rebuild note above.
   int64_t charsTailOffset_ = -1;
