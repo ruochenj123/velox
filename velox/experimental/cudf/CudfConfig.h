@@ -146,6 +146,10 @@ struct CudfConfig {
   /// always defers; true = eager until a prior execution of the same join
   /// observed match rate <= benchmarkDeferralThreshold (see DeferralStats).
   bool benchmarkDeferralAdaptive{false};
+  /// Native row output at a CPU exit (2026-08-25): the row-path join emits
+  /// HostRowVector (GPU-layout rows D2H'd) instead of transposing to Velox
+  /// columns; results are extracted only when printed.
+  bool benchmarkRowOutputNative{false};
   double benchmarkDeferralThreshold{0.5};
 
   /// [Benchmark] When true, CudfHashJoinProbe skips cudf::gather entirely

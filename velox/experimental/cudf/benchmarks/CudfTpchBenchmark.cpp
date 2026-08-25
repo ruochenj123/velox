@@ -86,6 +86,11 @@ DEFINE_bool(boundary_hybrid, false,
 DEFINE_bool(row_table, false,
     "Row-native chained matcher (RowNativeHashTable) instead of "
     "cudf::hash_join inside the row-wise join operators.");
+DEFINE_bool(
+    row_output_native,
+    false,
+    "Row-path CPU exit emits HostRowVector (native GPU row layout, D2H only) "
+    "instead of transposing to Velox columns; extracted only when printed.");
 DEFINE_bool(deferral_adaptive, false,
     "With --boundary_hybrid: eager until a prior repeat observed match "
     "rate <= --deferral_threshold at the adjacent join (DeferralStats).");
@@ -165,6 +170,7 @@ void CudfTpchBenchmark::initialize() {
   cfg.benchmarkRowTablePackKeys = FLAGS_row_table_pack_keys;
   cfg.benchmarkKeepProjectOnCpu = FLAGS_keep_project_on_cpu;
   cfg.benchmarkDeferralAdaptive = FLAGS_deferral_adaptive;
+  cfg.benchmarkRowOutputNative = FLAGS_row_output_native;
   cfg.benchmarkDeferralThreshold = FLAGS_deferral_threshold;
   cfg.benchmarkLogGatherTime = FLAGS_log_gather_time;
   cfg.benchmarkConcatBeforeJoin = FLAGS_concat_join;

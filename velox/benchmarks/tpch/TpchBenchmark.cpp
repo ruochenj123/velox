@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/vector/MaterializableVector.h"
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 #include <unordered_set>
 #include <map>
@@ -156,6 +157,15 @@ void TpchBenchmark::runMain(
         ? queryBuilder_->getIoMeterPlan(FLAGS_io_meter_column_pct)
         : getQueryPlan(FLAGS_run_query_verbose);
     auto [cursor, actualResults] = run(queryPlan, queryConfigs_);
+    if (FLAGS_include_results) {
+      // Native-layout results (MaterializableVector) are extracted into
+      // Velox columns only here, where their values are actually needed.
+      for (auto& v : actualResults) {
+        if (auto* m = dynamic_cast<const MaterializableVector*>(v.get())) {
+          v = m->materialize();
+        }
+      }
+    }
     if (!cursor) {
       LOG(ERROR) << "Query terminated with error. Exiting";
       exit(1);

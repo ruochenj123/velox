@@ -5,6 +5,7 @@
  * See RowHashJoin.h for design overview.
  */
 
+#include "velox/experimental/cudf/exec/HostRowVector.h"
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/DedicatedStream.h"
@@ -1719,7 +1720,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
 
   // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
   if (emitColumnar_ == 1) {
-    if (hostExit_ && probeProvStore_ != nullptr) {
+    if (hostExit_ &&
+        (probeProvStore_ != nullptr ||
+         CudfConfig::getInstance().benchmarkRowOutputNative)) {
       return makeHostOutput(numMatches, stream);
     }
     return makeColumnarOutput(numMatches, stream);
@@ -1865,64 +1868,44 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
     }
   }
 
-  // GPU-gathered columns: strided host extraction.
-  for (int i = 0; i < numCols; i++) {
-    if (children[i] != nullptr) {
-      continue; // deferred, done above
-    }
-    const auto& fd = outputFields_[i];
-    auto vec = BaseVector::create(outputType_->childAt(i), numMatches, pool());
-    auto* flat = vec->asFlatVector<int64_t>(); // placeholder; per-type below
-    (void)flat;
-    if (fd.kind == kFieldString) {
-      auto* fv = vec->template asFlatVector<StringView>();
-      for (int32_t r = 0; r < numMatches; r++) {
-        const uint8_t* slot =
-            rows + static_cast<int64_t>(r) * outputRowWidth_ + fd.offset;
-        uint32_t len;
-        std::memcpy(&len, slot, 4);
-        const char* src;
-        if (len <= 12) {
-          src = reinterpret_cast<const char*>(slot + 4);
-        } else {
-          uint64_t off;
-          std::memcpy(&off, slot + 8, 8);
-          src = reinterpret_cast<const char*>(hostCharsScratch_.data() + off);
-        }
-        fv->set(r, StringView(src, len));
-      }
-    } else {
-      auto* raw = vec->valuesAsVoid()
-          ? const_cast<void*>(vec->valuesAsVoid())
-          : nullptr;
-      VELOX_CHECK_NOT_NULL(raw);
-      uint8_t* dst = static_cast<uint8_t*>(raw);
-      const int32_t w = fd.byte_width;
-      for (int32_t r = 0; r < numMatches; r++) {
-        std::memcpy(
-            dst + static_cast<int64_t>(r) * w,
-            rows + static_cast<int64_t>(r) * outputRowWidth_ + fd.offset,
-            w);
-      }
-    }
-    if (outputNullStride_ > 0) {
-      const uint8_t byteMask = static_cast<uint8_t>(1u << (i & 7));
-      const int32_t byteIdx = i >> 3;
-      for (int32_t r = 0; r < numMatches; r++) {
-        if (hostNullsScratch_[static_cast<int64_t>(r) * outputNullStride_ +
-                              byteIdx] &
-            byteMask) {
-          vec->setNull(r, true);
-        }
-      }
-    }
-    children[i] = std::move(vec);
-  }
+  std::vector<FieldDesc> fields(
+      outputFields_.begin(), outputFields_.begin() + numCols);
+  const bool hasChars = outputCharsBuffer_.size() > 0;
   outputCharsBuffer_ = rmm::device_buffer{};
   addRuntimeStat(
       "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
-  return std::make_shared<RowVector>(
-      pool(), outputType_, nullptr, numMatches, std::move(children));
+  if (CudfConfig::getInstance().benchmarkRowOutputNative) {
+    // Native row output: hand the D2H'd rows (+ heap, null sidecar) and the
+    // host-gathered deferred columns to the consumer as-is. No transpose.
+    addRuntimeStat(
+        "hostExitNativeBytes",
+        RuntimeCounter(rowsBytes, RuntimeCounter::Unit::kBytes));
+    return std::make_shared<HostRowVector>(
+        pool(),
+        outputType_,
+        numMatches,
+        std::move(hostRowsScratch_),
+        outputRowWidth_,
+        std::move(fields),
+        hasChars ? std::move(hostCharsScratch_) : std::vector<uint8_t>{},
+        outputNullStride_ > 0 ? std::move(hostNullsScratch_)
+                              : std::vector<uint8_t>{},
+        outputNullStride_,
+        std::move(children));
+  }
+  // GPU-gathered columns: strided host extraction (shared with
+  // HostRowVector::materialize).
+  return extractHostRows(
+      pool(),
+      outputType_,
+      numMatches,
+      rows,
+      outputRowWidth_,
+      fields,
+      hostCharsScratch_.data(),
+      outputNullStride_ > 0 ? hostNullsScratch_.data() : nullptr,
+      outputNullStride_,
+      children);
 }
 
 RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
