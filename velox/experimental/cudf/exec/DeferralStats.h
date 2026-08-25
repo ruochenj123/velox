@@ -25,30 +25,46 @@ class DeferralStats {
     return s;
   }
 
-  void record(const std::string& joinNodeId, int64_t probed, int64_t matched) {
+  /// Spine pack: rows shipped across the boundary for the chain whose
+  /// terminal join is `endpointJoinId` (the denominator).
+  void recordPacked(const std::string& endpointJoinId, int64_t rows) {
     std::lock_guard<std::mutex> l(mu_);
-    auto& e = stats_[joinNodeId];
-    e.first += probed;
-    e.second += matched;
+    stats_[endpointJoinId].packed += rows;
   }
 
-  /// True once observations exist AND the measured match rate is at or
-  /// below `threshold` (i.e. the chain eliminates enough for the deferred
-  /// round trip to win).
-  bool shouldDefer(const std::string& joinNodeId, double threshold) const {
+  /// Terminal probe of the chain: rows leaving the chain (the numerator).
+  /// A CPU exit reports 0 -- with direct host emission the deferred payload
+  /// never crosses the boundary, so deferral always wins there.
+  void recordSurvived(const std::string& endpointJoinId, int64_t rows) {
     std::lock_guard<std::mutex> l(mu_);
-    auto it = stats_.find(joinNodeId);
-    if (it == stats_.end() || it->second.first == 0) {
-      return false; // no observation yet: eager
+    auto& e = stats_[endpointJoinId];
+    e.survived += rows;
+    e.reports++;
+  }
+
+  /// True once the endpoint has reported at least one output batch AND the
+  /// cumulative survival ratio is at or below `threshold`. `packed` runs a
+  /// few batches ahead of `survived` (pipelining), which only biases the
+  /// ratio DOWN -- acceptable for a one-way eager->defer switch.
+  bool shouldDefer(const std::string& endpointJoinId, double threshold) const {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = stats_.find(endpointJoinId);
+    if (it == stats_.end() || it->second.reports == 0 ||
+        it->second.packed == 0) {
+      return false; // no endpoint observation yet: eager
     }
-    return static_cast<double>(it->second.second) /
-        static_cast<double>(it->second.first) <=
-        threshold;
+    return static_cast<double>(it->second.survived) <=
+        threshold * static_cast<double>(it->second.packed);
   }
 
  private:
+  struct Entry {
+    int64_t packed{0};
+    int64_t survived{0};
+    int64_t reports{0};
+  };
   mutable std::mutex mu_;
-  std::unordered_map<std::string, std::pair<int64_t, int64_t>> stats_;
+  std::unordered_map<std::string, Entry> stats_;
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -494,13 +494,12 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
         adjJoin = probe->joinNode();
         const auto& cfg = CudfConfig::getInstance();
         if (!boundaryKeyNames_.empty() && cfg.benchmarkBoundaryHybrid) {
-          // Adaptive: eager until a prior execution observed enough
-          // reduction at this join (DeferralStats); else always defer.
-          boundaryMode_ = !cfg.benchmarkDeferralAdaptive ||
-                  DeferralStats::instance().shouldDefer(
-                      adjJoin->id(), cfg.benchmarkDeferralThreshold)
-              ? 1
-              : 0;
+          // Adaptive (batch-level, 2026-08-24): start EAGER; tryPinnedPack
+          // consults DeferralStats per BATCH and flips one-way to deferred
+          // once the chain endpoint has observed enough reduction.
+          // Non-adaptive: always defer.
+          deferralEligible_ = true;
+          boundaryMode_ = cfg.benchmarkDeferralAdaptive ? 0 : 1;
         }
       } else if (auto* build = dynamic_cast<RowHashJoinBuild*>(next)) {
         for (const auto& key : build->joinNode()->rightKeys()) {
@@ -513,7 +512,9 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
         // Crossing set: keys of LATER joins in the chain must also cross
         // as values (a later join hashes on them). Cached per plan walk.
         const auto& planRoot = operatorCtx_->task()->planFragment().planNode;
-        laterKeyNames_ = collectChainKeyNames(planRoot, adjJoin->id()).later;
+        const auto chain = collectChainKeyNames(planRoot, adjJoin->id());
+        laterKeyNames_ = chain.later;
+        endpointJoinId_ = chain.endpointJoinId;
       }
     }
     addRuntimeStat(
@@ -618,12 +619,13 @@ bool CudfFromVelox::computeLayoutOnce(
     dataWidth_ = offset;
     rowLayoutReady_ = true;
   }
-  // ---- Pruned eager layout: pack only keys + the join's output columns.
-  // Filter-only channels never cross. Applies to build-side and non-
-  // boundary probe-side row packs.
-  if (!rowLayoutReady_ && rowMode &&
-      CudfConfig::getInstance().benchmarkPruneRowColumns &&
-      !joinOutputNames_.empty()) {
+  // ---- Pruned eager layout (STANDARD row-pack behavior): pack only the
+  // adjacent join's keys + its output columns. Filter-only channels --
+  // which the scan must emit for its pushed-down predicates -- never
+  // cross. Falls back to the full identity layout below when there is no
+  // adjacent join, nothing would be saved, or a needed column is
+  // unpackable.
+  if (!rowLayoutReady_ && rowMode && !joinOutputNames_.empty()) {
     std::vector<std::string> needed = boundaryKeyNames_;
     for (const auto& n : joinOutputNames_) {
       if (inRowType->getChildIdxIfExists(n).has_value() &&
@@ -1069,9 +1071,40 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
     // standard path (from_arrow + GPU transpose downstream) intact.
     return nullptr;
   }
+  // Batch-level adaptive deferral (2026-08-24): the eager/deferred choice is
+  // re-checked per BATCH against the chain endpoint's observed survival.
+  // One-way: once deferred, never back. The layout caches are reset so the
+  // next computeLayoutOnce builds the crossing-set layout; the downstream
+  // probe re-initializes when it sees the new field-name signature.
+  if (deferralEligible_ && boundaryMode_ == 0 &&
+      CudfConfig::getInstance().benchmarkDeferralAdaptive &&
+      DeferralStats::instance().shouldDefer(
+          endpointJoinId_,
+          CudfConfig::getInstance().benchmarkDeferralThreshold)) {
+    boundaryMode_ = 1;
+    rowLayoutReady_ = false;
+    // The crossing set behaves as keys under boundary: re-resolve, or the
+    // later-join-key channels stay classified as payload and never load.
+    keyChannelsResolved_ = false;
+    keyChannels_.clear();
+    prunedPack_ = false;
+    hasStringFields_ = false;
+    rowIdField_ = -1;
+    subsetPackNames_.clear();
+    crossingNames_.clear();
+    boundaryPackChannels_.clear();
+    rowFields_.clear();
+    colDtypes_.clear();
+    addRuntimeStat("fromVeloxDeferralSwitch", RuntimeCounter(1));
+  }
   // Boundary-hybrid is only meaningful on the row path straight into a
   // RowHashJoinBuild/Probe (resolved above).
   const bool boundary = boundaryMode_ == 1 && rowMode;
+  // Spine denominator for the endpoint's survival ratio: every row this
+  // pack ships (eager or deferred) enters the chain.
+  if (deferralEligible_ && rowMode) {
+    DeferralStats::instance().recordPacked(endpointJoinId_, totalRows);
+  }
 
   // NOTE: layout derives from the INPUT's actual row type, not outputType_
   // -- the two can disagree (e.g. the build-side scan batch carries fewer

@@ -6,6 +6,7 @@
  */
 
 #include "velox/experimental/cudf/exec/RowHashJoin.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/DedicatedStream.h"
 #include "velox/experimental/cudf/exec/DeferralStats.h"
 #include "velox/experimental/cudf/exec/GpuRowOps.cuh"
@@ -1199,6 +1200,24 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     stream = rowStoreInput->stream();
     probeRows = rowStoreInput->size();
 
+    // Batch-level adaptive deferral: the upstream pack may switch layouts
+    // mid-query (pruned-eager -> crossing-set). Detect the new signature
+    // and recompute both the input capture and the output layout. The
+    // switch is one-way, so this fires at most once per operator.
+    if (initialized_ &&
+        (rowStoreInput->rowWidth() != probeRowWidth_ ||
+         rowStoreInput->fieldNames() != probeFieldNames_)) {
+      initialized_ = false;
+      fieldsUploaded_ = false;
+      outputLayoutComputed_ = false;
+      outputFields_.clear();
+      outputStringFields_.clear();
+      deferredOutputCols_.clear();
+      probeGatherMappings_.clear();
+      buildGatherMappings_.clear();
+      outputRowIdField_ = -1;
+      addRuntimeStat("probeLayoutSwitch", RuntimeCounter(1));
+    }
     if (!initialized_) {
       probeFields_ = rowStoreInput->hostFields();
       probeRowWidth_ = rowStoreInput->rowWidth();
@@ -1482,10 +1501,41 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       leftIndices, rightIndices);
   const auto tpGather = std::chrono::steady_clock::now();
 
-  // Adaptive deferral: record observed reduction for this join (consulted
-  // by the pack on later executions; see DeferralStats.h).
-  DeferralStats::instance().record(
-      joinNode_->id(), probeRows, numMatches);
+  // ---- Determine (once) whether this is the terminal row-mode join ----
+  // A probe is terminal if the operator immediately downstream in the driver
+  // pipeline is NOT another RowHashJoinProbe (i.e. it's a columnar cudf op
+  // such as aggregation/orderBy). Terminal probes must emit CudfVector so the
+  // downstream columnar operator can consume it; chained probes emit
+  // RowStoreVector so the next row-join skips the col->row transpose.
+  if (emitColumnar_ < 0) {
+    emitColumnar_ = 1; // default: assume terminal (safe: always consumable)
+    auto* driver = operatorCtx_->driver();
+    if (driver != nullptr) {
+      const auto ops = driver->operators();
+      // Find self, then inspect the next operator in the pipeline.
+      for (size_t i = 0; i + 1 < ops.size(); i++) {
+        if (ops[i] == this) {
+          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
+            emitColumnar_ = 0; // next op is a row-join -> keep row layout
+          }
+          break;
+        }
+      }
+    }
+    addRuntimeStat(
+        "rowJoinEmitColumnar",
+        RuntimeCounter(static_cast<int64_t>(emitColumnar_)));
+  }
+
+  // Batch-level adaptive deferral: only the chain's TERMINAL probe reports
+  // survivors, keyed by its own join id -- the same id the spine pack
+  // resolved as the chain endpoint (DeferralPlan probe-side walk). A CPU
+  // exit reports 0: with direct host emission, deferring is always right.
+  // Recorded before the numMatches==0 early-return so empty batches count.
+  if (emitColumnar_ == 1) {
+    DeferralStats::instance().recordSurvived(
+        joinNode_->id(), numMatches);
+  }
 
   // ---- 4. Row gather ----
 
@@ -1662,32 +1712,6 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         pool(), outputType_, nullptr, 1, std::move(children));
   }
 
-  // ---- Determine (once) whether this is the terminal row-mode join ----
-  // A probe is terminal if the operator immediately downstream in the driver
-  // pipeline is NOT another RowHashJoinProbe (i.e. it's a columnar cudf op
-  // such as aggregation/orderBy). Terminal probes must emit CudfVector so the
-  // downstream columnar operator can consume it; chained probes emit
-  // RowStoreVector so the next row-join skips the col->row transpose.
-  if (emitColumnar_ < 0) {
-    emitColumnar_ = 1; // default: assume terminal (safe: always consumable)
-    auto* driver = operatorCtx_->driver();
-    if (driver != nullptr) {
-      const auto ops = driver->operators();
-      // Find self, then inspect the next operator in the pipeline.
-      for (size_t i = 0; i + 1 < ops.size(); i++) {
-        if (ops[i] == this) {
-          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
-            emitColumnar_ = 0; // next op is a row-join -> keep row layout
-          }
-          break;
-        }
-      }
-    }
-    addRuntimeStat(
-        "rowJoinEmitColumnar",
-        RuntimeCounter(static_cast<int64_t>(emitColumnar_)));
-  }
-
   // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
   if (emitColumnar_ == 1) {
     return makeColumnarOutput(numMatches, stream);
@@ -1755,13 +1779,6 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   return out;
 }
 
-// ============================================================================
-// makeColumnarOutput — row->col transpose at the terminal join
-// ============================================================================
-// Converts the gathered fixed-stride row buffer (probeGatherBuffer_, layout
-// described by outputFields_ / outputRowWidth_) into a column-major cudf::table
-// wrapped in a CudfVector, so that downstream columnar cudf operators
-// (aggregation, orderBy, ...) can consume it.
 RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
     int32_t numMatches,
     rmm::cuda_stream_view stream) {

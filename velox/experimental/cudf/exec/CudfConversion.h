@@ -196,6 +196,11 @@ class CudfFromVelox : public CudfOperatorBase {
   // packs; adjacent join's output names; index of the hidden rowid field.
   std::vector<std::string> crossingNames_;
   std::vector<std::string> laterKeyNames_;
+  // Batch-level adaptive deferral: set when this pack feeds a join PROBE
+  // with packable keys under --boundary_hybrid; the eager/deferred switch
+  // is then evaluated per batch against endpointJoinId_'s DeferralStats.
+  bool deferralEligible_{false};
+  std::string endpointJoinId_;
   std::vector<std::string> joinOutputNames_;
   std::vector<std::string> subsetPackNames_;
   bool prunedPack_{false};

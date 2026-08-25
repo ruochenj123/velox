@@ -34,6 +34,11 @@ struct ChainKeyNames {
   /// Number of ancestor joins in the chain (0 == the adjacent join is the
   /// terminal row join of its pipeline).
   int32_t chainLength{0};
+  /// Plan-node id of the chain's TERMINAL join -- the last join reachable
+  /// from the adjacent one through PROBE-side edges only. This is where
+  /// deferred payload materializes (or exits to the CPU), and the key under
+  /// which DeferralStats accumulates the chain's survival ratio.
+  std::string endpointJoinId;
 };
 
 namespace deferral_detail {
@@ -85,13 +90,19 @@ inline ChainKeyNames collectChainKeyNames(
     return out;
   }
   deferral_detail::appendKeys(adjacent, out.adjacent);
-  // Walk ancestors nearest-first; the chain ends at the first non-join.
+  out.endpointJoinId = adjacent->id();
+  // Walk ancestors nearest-first; the chain ends at the first non-join OR
+  // the first BUILD-side edge (a build accumulates -- it is a
+  // materialization point, so the chain's rows stop there and the
+  // ancestor's keys need not cross as row fields).
   for (int32_t i = static_cast<int32_t>(path.size()) - 2; i >= 0; i--) {
     auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(path[i]);
-    if (join == nullptr) {
+    if (join == nullptr || join->sources().empty() ||
+        join->sources()[0].get() != path[i + 1].get()) {
       break;
     }
     deferral_detail::appendKeys(join, out.later);
+    out.endpointJoinId = join->id();
     out.chainLength++;
   }
   return out;
