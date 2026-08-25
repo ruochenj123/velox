@@ -1,6 +1,7 @@
 /*
  * RowOrderBy.cpp (branch row-sort, 2026-08-24) -- see RowOrderBy.h.
  */
+#include "velox/experimental/cudf/exec/HostRowVector.h"
 #include "velox/experimental/cudf/exec/RowOrderBy.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
@@ -779,6 +780,49 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     }
   }
 
+  if (CudfConfig::getInstance().benchmarkRowOutputNative) {
+    // Native row output: hand this chunk's D2H'd rows to the consumer as-is
+    // (with the shared string heap, this chunk's null sidecar and the
+    // host-gathered deferred columns). No column extraction; the harness
+    // materializes only when results are printed.
+    if (hasStrings_ && hostCharsShared_ == nullptr) {
+      hostCharsShared_ =
+          std::make_shared<const std::vector<uint8_t>>(std::move(hostChars_));
+    }
+    std::vector<FieldDesc> f(numCols);
+    std::vector<int32_t> nullBits(numCols, 0);
+    for (int32_t i = 0; i < numCols; i++) {
+      const auto fi = outFieldIdx_[i];
+      if (fi >= 0) {
+        f[i] = fields_[fi];
+        nullBits[i] = fi; // the sidecar is indexed by FIELD
+      }
+    }
+    std::vector<uint8_t> rowsOwned = std::move(hostRowsCur_);
+    std::vector<uint8_t> nullsOwned;
+    if (nullPad_ > 0) {
+      nullsOwned = std::move(hostNulls_);
+    }
+    addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
+    addRuntimeStat(
+        "hostExitNativeBytes",
+        RuntimeCounter(
+            static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
+    return std::make_shared<HostRowVector>(
+        pool(),
+        outputType_,
+        n,
+        std::move(rowsOwned),
+        rowWidth_,
+        std::move(f),
+        hostCharsShared_ != nullptr
+            ? hostCharsShared_
+            : std::make_shared<const std::vector<uint8_t>>(),
+        std::move(nullsOwned),
+        nullPad_,
+        std::move(children),
+        std::move(nullBits));
+  }
   const auto tpExtract = std::chrono::steady_clock::now();
   // ---- GPU-gathered columns: TWO parallel passes over row ranges for ALL
   // columns at once (thread teams are per chunk, not per column). Pass 1:

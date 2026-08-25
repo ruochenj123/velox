@@ -129,6 +129,7 @@ class RowOrderBy : public CudfOperatorBase {
   int64_t prefetchBegin_ = -1;
   std::vector<uint8_t> hostNulls_;
   std::vector<uint8_t> hostChars_;
+  std::shared_ptr<const std::vector<uint8_t>> hostCharsShared_; // native output
   bool hostCharsReady_ = false;
   rmm::device_buffer idsDev_;
   rmm::device_buffer strOffsetsDev_; // int64[n+1] scratch
