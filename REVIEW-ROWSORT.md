@@ -47,6 +47,14 @@ Commits on top, in order:
 
 ## Results (exp/2026-08-21-whole-query-deferral/FINDINGS-factorial.md)
 
+With native row output (harness sort12, no result copy for any arm; gate
+13955365 12/12 ordered PASS): the eager row sort beats cudf-columnar
+1.15-1.31x on the CPU-protocol plan and 1.22-1.45x on the gathered plan
+(Q40, SF30); on Q41 (64-256 BIGINT payload columns) it trails 0.84-0.87x,
+the field-major pack being the residual. The deferred sort is unchanged
+(its exit was already host-side) and still loses on a standalone sort.
+Earlier (pre-native) numbers below for reference:
+
 - Q40 (SF30 lineitem, CPU-protocol cells): device sort a wash; e2e row
   1.0-1.45x over col on the single-driver plan, parity with a parallel scan;
   GPU 2-7x over cpu.
