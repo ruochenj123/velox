@@ -81,7 +81,11 @@ class RowOrderBy : public CudfOperatorBase {
   std::vector<std::unique_ptr<cudf::column>> transposeChunkColumns(
       const uint8_t* base,
       const uint8_t* nullBase,
-      int32_t n);
+      int32_t n,
+      bool withRowId = false);
+  // Deferred columnar chunk: transposed GPU-side columns kept between the
+  // id read and the splice (transpose-first, round 6).
+  std::vector<std::unique_ptr<cudf::column>> gpuColsForChunk_;
   /// Host-gather the deferred output columns for `n` sorted rows whose
   /// GLOBAL rowids are `globalIds` (concatenation order).
   std::vector<VectorPtr> gatherDeferred(

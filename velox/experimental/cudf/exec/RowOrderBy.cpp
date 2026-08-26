@@ -706,21 +706,15 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
         ? static_cast<const uint8_t*>(sortedNulls_.data()) + begin * nullPad_
         : nullptr;
     const int32_t numCols = outputType_->size();
-    GpuFixedRowStore chunk;
-    chunk.row_buffer = const_cast<uint8_t*>(base);
-    chunk.row_width = rowWidth_;
-    chunk.num_rows = n;
-    chunk.num_fields = static_cast<int32_t>(fields_.size());
-    chunk.fields = nullptr;
-    const size_t bytes = static_cast<size_t>(n) * sizeof(int64_t);
-    if (bytes > idsDev_.size()) {
-      idsDev_ = rmm::device_buffer(bytes, stream_);
-    }
-    extractKeysFromRows(
-        chunk, fields_[rowIdField_].offset, 8, idsDev_.data(), stream_.value());
+    // Transpose FIRST (round 6): the chunk goes rows -> columns once on the
+    // device, with __rowid as one more column; the ids are read from it.
+    auto gpuCols = transposeChunkColumns(base, nullBase, n, true);
+    auto rowIdCol = std::move(gpuCols.back());
+    gpuCols.pop_back();
     std::vector<int64_t> gids(n);
     cudaMemcpyAsync(
-        gids.data(), idsDev_.data(), bytes, cudaMemcpyDeviceToHost,
+        gids.data(), rowIdCol->view().data<int64_t>(),
+        static_cast<size_t>(n) * sizeof(int64_t), cudaMemcpyDeviceToHost,
         stream_.value());
     stream_.synchronize();
     std::vector<VectorPtr> children(numCols);
@@ -736,7 +730,6 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     for (size_t k = 0; k < deferredCols_.size(); k++) {
       children[deferredCols_[k]] = std::move(cols[k]);
     }
-    auto gpuCols = transposeChunkColumns(base, nullBase, n);
     std::vector<std::unique_ptr<cudf::column>> subset;
     std::vector<std::string> names;
     std::vector<TypePtr> types;
@@ -1007,7 +1000,8 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
 std::vector<std::unique_ptr<cudf::column>> RowOrderBy::transposeChunkColumns(
     const uint8_t* base,
     const uint8_t* nullBase,
-    int32_t n) {
+    int32_t n,
+    bool withRowId) {
   const int32_t numCols = outputType_->size();
   std::vector<std::unique_ptr<rmm::device_buffer>> colBufs(numCols);
   std::vector<uint8_t*> fixedPtrs;
@@ -1021,6 +1015,14 @@ std::vector<std::unique_ptr<cudf::column>> RowOrderBy::transposeChunkColumns(
         static_cast<size_t>(n) * fields_[fi].byte_width, stream_);
     fixedPtrs.push_back(static_cast<uint8_t*>(colBufs[i]->data()));
     fixedFields.push_back(fields_[fi]);
+  }
+  std::unique_ptr<rmm::device_buffer> rowIdBuf;
+  if (withRowId) {
+    VELOX_CHECK_GE(rowIdField_, 0);
+    rowIdBuf = std::make_unique<rmm::device_buffer>(
+        static_cast<size_t>(n) * 8, stream_);
+    fixedPtrs.push_back(static_cast<uint8_t*>(rowIdBuf->data()));
+    fixedFields.push_back(fields_[rowIdField_]);
   }
   if (!fixedFields.empty()) {
     rowsToColumns(
@@ -1076,6 +1078,14 @@ std::vector<std::unique_ptr<cudf::column>> RowOrderBy::transposeChunkColumns(
         std::move(mask),
         nullCount));
   }
+  if (withRowId) {
+    columns.push_back(std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::INT64},
+        n,
+        std::move(*rowIdBuf),
+        rmm::device_buffer{},
+        0));
+  }
   return columns;
 }
 
@@ -1088,23 +1098,18 @@ RowVectorPtr RowOrderBy::emitColumnarChunk(int64_t begin, int32_t n) {
   const int32_t numCols = outputType_->size();
   std::vector<std::unique_ptr<cudf::column>> deferred(numCols);
   if (!deferredCols_.empty()) {
-    GpuFixedRowStore chunk;
-    chunk.row_buffer = const_cast<uint8_t*>(base);
-    chunk.row_width = rowWidth_;
-    chunk.num_rows = n;
-    chunk.num_fields = static_cast<int32_t>(fields_.size());
-    chunk.fields = nullptr;
-    const size_t bytes = static_cast<size_t>(n) * sizeof(int64_t);
-    if (bytes > idsDev_.size()) {
-      idsDev_ = rmm::device_buffer(bytes, stream_);
-    }
-    extractKeysFromRows(
-        chunk, fields_[rowIdField_].offset, 8, idsDev_.data(), stream_.value());
+    // Transpose FIRST (round 6): the chunk goes rows -> columns once on the
+    // device, with __rowid as one more column; the ids are read from it.
+    auto gpuCols = transposeChunkColumns(base, nullBase, n, true);
+    auto rowIdCol = std::move(gpuCols.back());
+    gpuCols.pop_back();
     std::vector<int64_t> gids(n);
     cudaMemcpyAsync(
-        gids.data(), idsDev_.data(), bytes, cudaMemcpyDeviceToHost,
+        gids.data(), rowIdCol->view().data<int64_t>(),
+        static_cast<size_t>(n) * sizeof(int64_t), cudaMemcpyDeviceToHost,
         stream_.value());
     stream_.synchronize();
+    gpuColsForChunk_ = std::move(gpuCols);
     const auto tpHG = std::chrono::steady_clock::now();
     auto cols = gatherDeferred(gids, n);
     addRuntimeStat(
@@ -1131,7 +1136,9 @@ RowVectorPtr RowOrderBy::emitColumnarChunk(int64_t begin, int32_t n) {
   }
 
   // Fixed-width columns: one scatter kernel.
-  auto columns = transposeChunkColumns(base, nullBase, n);
+  auto columns = deferredCols_.empty()
+      ? transposeChunkColumns(base, nullBase, n)
+      : std::move(gpuColsForChunk_);
   for (int32_t i = 0; i < numCols; i++) {
     if (outFieldIdx_[i] < 0) {
       VELOX_CHECK_NOT_NULL(deferred[i]);
