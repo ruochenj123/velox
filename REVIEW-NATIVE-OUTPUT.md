@@ -16,33 +16,46 @@ Commits on top of the snapshot:
 ## Why
 
 Fairness rule for the layout experiments: every arm delivers its result to
-host memory exactly once, in its own native layout. The columnar arm does
-(`CudfToVelox`: D2H + arrow import). The row arm used to transpose rows to
-columns (on the GPU for the join, on the host for the sort) purely to
-satisfy Velox's `RowVector` API — an API tax that made eager row trail col
-whenever the exit carried payload (Q31 flipped: 0.77–0.98x; Q40).
+host memory exactly once, in its own native layout, with no conversion at
+the exit. Final design (2026-08-25, after review discussion):
+
+- **eager** = rows: the joined/sorted rows are D2H'd and handed over as a
+  `HostRowVector` (zero-child `RowVector` carrying the row bytes, string
+  heap, null sidecar, field layout). Extraction into Velox columns happens
+  only when results are printed (`MaterializableVector::materialize()`).
+- **deferred** = columns: the ids are read from the crossing rows, the
+  deferred payload is gathered on the host from the retained batch, and the
+  GPU-side output columns (keys, later keys, build-side values) are
+  transposed ON THE DEVICE (`transposeGpuOutputColumns`, factored out of
+  `makeColumnarOutput`; `transposeChunkColumns` for the sort) and brought
+  over through the arrow path. No host extraction, no mixed result.
+- No build-side deferral (decided: the build is packed before the probe
+  can observe anything, so it cannot follow the batch-level controller;
+  builds are the small side).
+
+Before this, the row arm transposed rows to columns purely to satisfy the
+`RowVector` API (eager row trailed col 0.77-0.98x on Q31-flipped; Q40 sort
+at parity); the deferred exit extracted the key columns on the host.
 
 ## What
 
 | File | What |
 |---|---|
-| `velox/vector/MaterializableVector.h` | Interface: `materialize()` → ordinary Velox columns, on demand. |
-| `velox/experimental/cudf/exec/HostRowVector.h` | Header-only. A `RowVector` with **zero children** (allowed: `children.size() <= type->size()`) carrying the D2H'd row bytes, compacted string heap, null sidecar, the field layout, and any already-materialized (host-gathered deferred) columns. `extractHostRows()` is the strided extraction shared with the non-native path. |
-| `velox/experimental/cudf/exec/RowHashJoin.cpp` | `makeHostOutput` returns a `HostRowVector` under the flag; the CPU-exit route now also takes eager rows (`hostExit_ && (provenance || native)`), so an eager row join no longer goes through `makeColumnarOutput` at a CPU exit. Stat `hostExitNativeBytes`. |
+| `velox/vector/MaterializableVector.h` | Interface: `materialize()` -> ordinary Velox columns, on demand. |
+| `velox/experimental/cudf/exec/HostRowVector.h` | Header-only, eager results only. `extractHostRows()` is the strided extraction used by `materialize()` and by the non-native eager exit. |
+| `velox/experimental/cudf/exec/RowHashJoin.cpp` | `makeHostOutput`: deferred -> ids + host gather + device transpose -> columnar `RowVector`; eager -> `HostRowVector` under `--row_output_native`, else extraction. `transposeGpuOutputColumns` shared with `makeColumnarOutput`. |
 | `velox/experimental/cudf/CudfConfig.h`, `benchmarks/CudfTpchBenchmark.cpp` | `benchmarkRowOutputNative` / `--row_output_native`. |
-| `velox/benchmarks/tpch/TpchBenchmark.cpp` | Under `--include_results`, results implementing `MaterializableVector` are materialized before printing/checksums — so correctness gates see real values while timed runs never extract. |
+| `velox/benchmarks/QueryBenchmarkBase.cpp` | `copyResult=false`: the cursor no longer copies results (harness artifact; it flattened native results). |
+| `velox/benchmarks/tpch/TpchBenchmark.cpp` | Under `--include_results`: native results are materialized, encoded results flattened, before printing/checksums. |
 
 ## Points worth challenging
 
-- Zero-child `RowVector`: anything downstream that walks children would see
-  none. In the benchmark the exit feeds `CudfToVelox` (passes non-Cudf
-  vectors through) and the result callback (uses `size()`); nothing else.
-  A production consumer would need `materialize()` or a row-aware sink.
-- The deferred arm's host gather stays in the timed path (it *is* the
-  materialization); only the layout transpose is removed.
-- The D2H itself stays on the critical path; per the sort breakdown it is
-  hidden by prefetch, but a native exit has no host work to hide behind.
-  Whether it surfaces is what the rerun measures.
+- Zero-child `RowVector`: downstream consumers that walk children see none;
+  in the benchmark the exit feeds `CudfToVelox` (pass-through) and the
+  result callback (`size()` only). A production consumer needs
+  `materialize()` or a row-aware sink.
+- The deferred exit's device transpose costs a kernel + D2H of the same
+  bytes; measured neutral-to-slightly-faster than host extraction.
 - Memory: the benchmark retains all result vectors; native rows are the
   same order of bytes as the columns they replace.
 

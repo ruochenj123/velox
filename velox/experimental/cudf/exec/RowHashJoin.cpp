@@ -1840,10 +1840,13 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
   }
   stream.synchronize();
 
-  // Deferred ids straight from the host rows.
   const uint8_t* rows = hostRowsScratch_.data();
   std::vector<VectorPtr> children(numCols);
   if (!deferredOutputCols_.empty()) {
+    // DEFERRED exit (2026-08-25): uniformly COLUMNAR output. Ids come from
+    // the host rows; the deferred payload is gathered on the host; the
+    // GPU-side columns (keys, later keys, build-side output) are transposed
+    // ON THE DEVICE and brought over as columns -- no host extraction.
     VELOX_CHECK_GE(outputRowIdField_, 0);
     const int32_t idOff = outputFields_[outputRowIdField_].offset;
     materializeIds_.resize(numMatches);
@@ -1866,8 +1869,44 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
           materializeSentinelScratch_);
       children[outIdx] = std::move(col);
     }
+    // GPU-side columns: device transpose, then cudf -> Velox (arrow path).
+    auto gpuCols = transposeGpuOutputColumns(numMatches, stream);
+    std::vector<std::unique_ptr<cudf::column>> subset;
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    std::vector<int32_t> subsetIdx;
+    for (int i = 0; i < numCols; i++) {
+      if (gpuCols[i] != nullptr) {
+        subset.push_back(std::move(gpuCols[i]));
+        names.push_back(outputType_->nameOf(i));
+        types.push_back(outputType_->childAt(i));
+        subsetIdx.push_back(i);
+      }
+    }
+    if (!subset.empty()) {
+      auto tbl = std::make_unique<cudf::table>(std::move(subset));
+      auto host = with_arrow::toVeloxColumn(
+          tbl->view(),
+          pool(),
+          std::static_pointer_cast<const Type>(
+              ROW(std::move(names), std::move(types))),
+          stream,
+          get_output_mr());
+      for (size_t k = 0; k < subsetIdx.size(); k++) {
+        children[subsetIdx[k]] = host->childAt(k);
+      }
+    }
+    outputCharsBuffer_ = rmm::device_buffer{};
+    addRuntimeStat(
+        "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
+    addRuntimeStat(
+        "deferredMaterializeRows",
+        RuntimeCounter(static_cast<int64_t>(numMatches)));
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, numMatches, std::move(children));
   }
 
+  // EAGER exit: rows.
   std::vector<FieldDesc> fields(
       outputFields_.begin(), outputFields_.begin() + numCols);
   const bool hasChars = outputCharsBuffer_.size() > 0;
@@ -1887,11 +1926,11 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
         std::move(hostRowsScratch_),
         outputRowWidth_,
         std::move(fields),
-        hasChars ? std::move(hostCharsScratch_) : std::vector<uint8_t>{},
+        std::make_shared<const std::vector<uint8_t>>(
+            hasChars ? std::move(hostCharsScratch_) : std::vector<uint8_t>{}),
         outputNullStride_ > 0 ? std::move(hostNullsScratch_)
                               : std::vector<uint8_t>{},
-        outputNullStride_,
-        std::move(children));
+        outputNullStride_);
   }
   // GPU-gathered columns: strided host extraction (shared with
   // HostRowVector::materialize).
@@ -1904,8 +1943,127 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
       fields,
       hostCharsScratch_.data(),
       outputNullStride_ > 0 ? hostNullsScratch_.data() : nullptr,
-      outputNullStride_,
-      children);
+      outputNullStride_);
+}
+
+// Device transpose of the GPU-gathered output rows into cudf columns, in
+// output-column order; deferred columns (offset < 0) are left nullptr for
+// the caller to supply (uploaded for a GPU consumer, host-gathered for a
+// CPU exit). Shared by makeColumnarOutput and makeHostOutput.
+std::vector<std::unique_ptr<cudf::column>>
+RowHashJoinProbe::transposeGpuOutputColumns(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  const int32_t numCols = outputType_->size();
+  std::vector<std::unique_ptr<rmm::device_buffer>> colBuffers(numCols);
+  std::vector<uint8_t*> fixedPtrs;
+  std::vector<FieldDesc> fixedFields;
+  for (int i = 0; i < numCols; i++) {
+    if (outputFields_[i].kind == kFieldString ||
+        outputFields_[i].offset < 0 /* deferred: materialized above */) {
+      continue;
+    }
+    int64_t bytes = static_cast<int64_t>(numMatches) *
+        outputFields_[i].byte_width;
+    colBuffers[i] = std::make_unique<rmm::device_buffer>(bytes, stream);
+    fixedPtrs.push_back(static_cast<uint8_t*>(colBuffers[i]->data()));
+    fixedFields.push_back(outputFields_[i]);
+  }
+
+  // Scatter row buffer -> columns.
+  if (!fixedFields.empty()) {
+    rowsToColumns(
+        static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+        fixedFields.data(),
+        fixedPtrs.data(),
+        static_cast<int32_t>(fixedFields.size()),
+        numMatches,
+        outputRowWidth_,
+        stream.value());
+  }
+
+  // Wrap each device buffer as a cudf::column with the right type.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(numCols);
+  for (int i = 0; i < numCols; i++) {
+    if (outputFields_[i].offset < 0) {
+      columns.push_back(nullptr); // deferred: supplied by the caller
+      continue;
+    }
+    auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
+    rmm::device_buffer mask{};
+    cudf::size_type nullCount = 0;
+    if (outputNullStride_ > 0) {
+      // Convert this column's sidecar bits into an Arrow validity mask
+      // (2026-08-17 null support). UNKNOWN_NULL_COUNT defers counting.
+      mask = rmm::device_buffer(
+          cudf::bitmask_allocation_size_bytes(numMatches), stream);
+      sidecarToMask(
+          static_cast<const uint8_t*>(outputNullBuffer_.data()),
+          outputNullStride_,
+          i,
+          numMatches,
+          static_cast<uint32_t*>(mask.data()),
+          stream.value());
+      nullCount = cudf::null_count(
+          static_cast<const cudf::bitmask_type*>(mask.data()),
+          0,
+          static_cast<cudf::size_type>(numMatches),
+          stream);
+    }
+    if (outputFields_[i].kind == kFieldString) {
+      // Slots (inline or heap) -> cudf strings column: lengths, exclusive
+      // scan (one sync for the total), then a byte copy per row.
+      const size_t offBytes =
+          (static_cast<size_t>(numMatches) + 1) * sizeof(int64_t);
+      if (offBytes > outputRowBaseBuffer_.size()) {
+        outputRowBaseBuffer_ = rmm::device_buffer(offBytes, stream);
+      }
+      const int64_t totalChars = stringFieldOffsets(
+          static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+          numMatches,
+          outputRowWidth_,
+          outputFields_[i].offset,
+          static_cast<int64_t*>(outputRowBaseBuffer_.data()),
+          stream.value());
+      VELOX_CHECK_LE(
+          totalChars,
+          static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+          "row join: string column exceeds int32 offsets");
+      auto offsetsCol = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32},
+          numMatches + 1,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          get_output_mr());
+      rmm::device_buffer chars(totalChars, stream);
+      stringFieldToChars(
+          static_cast<const uint8_t*>(probeGatherBuffer_.data()),
+          numMatches,
+          outputRowWidth_,
+          outputFields_[i].offset,
+          static_cast<const uint8_t*>(outputCharsBuffer_.data()),
+          static_cast<const int64_t*>(outputRowBaseBuffer_.data()),
+          offsetsCol->mutable_view().data<int32_t>(),
+          static_cast<uint8_t*>(chars.data()),
+          stream.value());
+      columns.push_back(cudf::make_strings_column(
+          numMatches,
+          std::move(offsetsCol),
+          std::move(chars),
+          nullCount,
+          std::move(mask)));
+      continue;
+    }
+    columns.push_back(std::make_unique<cudf::column>(
+        cudfType,
+        static_cast<cudf::size_type>(numMatches),
+        std::move(*colBuffers[i]),      // data buffer (ownership moved)
+        std::move(mask),
+        nullCount));
+  }
+
+  return columns;
 }
 
 RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
@@ -1999,114 +2157,12 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
 
   // Allocate one device buffer per FIXED output column and remember its
   // base ptr; string columns (2026-08-21) are materialized separately below.
-  std::vector<std::unique_ptr<rmm::device_buffer>> colBuffers(numCols);
-  std::vector<uint8_t*> fixedPtrs;
-  std::vector<FieldDesc> fixedFields;
-  for (int i = 0; i < numCols; i++) {
-    if (outputFields_[i].kind == kFieldString ||
-        outputFields_[i].offset < 0 /* deferred: materialized above */) {
-      continue;
-    }
-    int64_t bytes = static_cast<int64_t>(numMatches) *
-        outputFields_[i].byte_width;
-    colBuffers[i] = std::make_unique<rmm::device_buffer>(bytes, stream);
-    fixedPtrs.push_back(static_cast<uint8_t*>(colBuffers[i]->data()));
-    fixedFields.push_back(outputFields_[i]);
-  }
-
-  // Scatter row buffer -> columns.
-  if (!fixedFields.empty()) {
-    rowsToColumns(
-        static_cast<const uint8_t*>(probeGatherBuffer_.data()),
-        fixedFields.data(),
-        fixedPtrs.data(),
-        static_cast<int32_t>(fixedFields.size()),
-        numMatches,
-        outputRowWidth_,
-        stream.value());
-  }
-
-  // Wrap each device buffer as a cudf::column with the right type.
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(numCols);
+  auto columns = transposeGpuOutputColumns(numMatches, stream);
   for (int i = 0; i < numCols; i++) {
     if (outputFields_[i].offset < 0) {
-      // Deferred column, uploaded in the materialization block above.
       VELOX_CHECK_NOT_NULL(deferredCols[i]);
-      columns.push_back(std::move(deferredCols[i]));
-      continue;
+      columns[i] = std::move(deferredCols[i]);
     }
-    auto cudfType = veloxToCudfDataType(outputType_->childAt(i));
-    rmm::device_buffer mask{};
-    cudf::size_type nullCount = 0;
-    if (outputNullStride_ > 0) {
-      // Convert this column's sidecar bits into an Arrow validity mask
-      // (2026-08-17 null support). UNKNOWN_NULL_COUNT defers counting.
-      mask = rmm::device_buffer(
-          cudf::bitmask_allocation_size_bytes(numMatches), stream);
-      sidecarToMask(
-          static_cast<const uint8_t*>(outputNullBuffer_.data()),
-          outputNullStride_,
-          i,
-          numMatches,
-          static_cast<uint32_t*>(mask.data()),
-          stream.value());
-      nullCount = cudf::null_count(
-          static_cast<const cudf::bitmask_type*>(mask.data()),
-          0,
-          static_cast<cudf::size_type>(numMatches),
-          stream);
-    }
-    if (outputFields_[i].kind == kFieldString) {
-      // Slots (inline or heap) -> cudf strings column: lengths, exclusive
-      // scan (one sync for the total), then a byte copy per row.
-      const size_t offBytes =
-          (static_cast<size_t>(numMatches) + 1) * sizeof(int64_t);
-      if (offBytes > outputRowBaseBuffer_.size()) {
-        outputRowBaseBuffer_ = rmm::device_buffer(offBytes, stream);
-      }
-      const int64_t totalChars = stringFieldOffsets(
-          static_cast<const uint8_t*>(probeGatherBuffer_.data()),
-          numMatches,
-          outputRowWidth_,
-          outputFields_[i].offset,
-          static_cast<int64_t*>(outputRowBaseBuffer_.data()),
-          stream.value());
-      VELOX_CHECK_LE(
-          totalChars,
-          static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
-          "row join: string column exceeds int32 offsets");
-      auto offsetsCol = cudf::make_numeric_column(
-          cudf::data_type{cudf::type_id::INT32},
-          numMatches + 1,
-          cudf::mask_state::UNALLOCATED,
-          stream,
-          get_output_mr());
-      rmm::device_buffer chars(totalChars, stream);
-      stringFieldToChars(
-          static_cast<const uint8_t*>(probeGatherBuffer_.data()),
-          numMatches,
-          outputRowWidth_,
-          outputFields_[i].offset,
-          static_cast<const uint8_t*>(outputCharsBuffer_.data()),
-          static_cast<const int64_t*>(outputRowBaseBuffer_.data()),
-          offsetsCol->mutable_view().data<int32_t>(),
-          static_cast<uint8_t*>(chars.data()),
-          stream.value());
-      columns.push_back(cudf::make_strings_column(
-          numMatches,
-          std::move(offsetsCol),
-          std::move(chars),
-          nullCount,
-          std::move(mask)));
-      continue;
-    }
-    columns.push_back(std::make_unique<cudf::column>(
-        cudfType,
-        static_cast<cudf::size_type>(numMatches),
-        std::move(*colBuffers[i]),      // data buffer (ownership moved)
-        std::move(mask),
-        nullCount));
   }
 
   auto table = std::make_unique<cudf::table>(std::move(columns));

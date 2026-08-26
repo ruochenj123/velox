@@ -18,13 +18,13 @@
 #include "velox/vector/MaterializableVector.h"
 
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
 
-/// Extract Velox columns from GPU-layout host rows. `preset[i]`, when set,
-/// is an already-materialized column (deferred payload gathered on the host)
-/// and is used as-is.
+/// Extract Velox columns from GPU-layout host rows (eager results only:
+/// every output column is in the rows).
 inline RowVectorPtr extractHostRows(
     memory::MemoryPool* pool,
     const RowTypePtr& type,
@@ -35,14 +35,10 @@ inline RowVectorPtr extractHostRows(
     const uint8_t* chars,
     const uint8_t* nulls,
     int32_t nullStride,
-    const std::vector<VectorPtr>& preset) {
+    const std::vector<int32_t>* nullBits = nullptr) {
   const int numCols = static_cast<int>(type->size());
   std::vector<VectorPtr> children(numCols);
   for (int i = 0; i < numCols; i++) {
-    if (static_cast<size_t>(i) < preset.size() && preset[i] != nullptr) {
-      children[i] = preset[i];
-      continue;
-    }
     const auto& fd = fields[i];
     auto vec = BaseVector::create(type->childAt(i), n, pool);
     if (fd.kind == kFieldString) {
@@ -73,8 +69,11 @@ inline RowVectorPtr extractHostRows(
       }
     }
     if (nullStride > 0 && nulls != nullptr) {
-      const uint8_t byteMask = static_cast<uint8_t>(1u << (i & 7));
-      const int32_t byteIdx = i >> 3;
+      // Null bit index: the output column by default (join layout); the
+      // sort's sidecar is indexed by FIELD, passed via nullBits.
+      const int32_t bit = nullBits != nullptr ? (*nullBits)[i] : i;
+      const uint8_t byteMask = static_cast<uint8_t>(1u << (bit & 7));
+      const int32_t byteIdx = bit >> 3;
       for (vector_size_t r = 0; r < n; r++) {
         if (nulls[static_cast<int64_t>(r) * nullStride + byteIdx] & byteMask) {
           vec->setNull(r, true);
@@ -95,10 +94,10 @@ class HostRowVector : public RowVector, public MaterializableVector {
       std::vector<uint8_t> rows,
       int32_t rowWidth,
       std::vector<FieldDesc> fields,
-      std::vector<uint8_t> chars,
+      std::shared_ptr<const std::vector<uint8_t>> chars,
       std::vector<uint8_t> nulls,
       int32_t nullStride,
-      std::vector<VectorPtr> materialized)
+      std::vector<int32_t> nullBits = {})
       : RowVector(pool, type, nullptr, n, std::vector<VectorPtr>{}),
         rows_(std::move(rows)),
         rowWidth_(rowWidth),
@@ -106,7 +105,7 @@ class HostRowVector : public RowVector, public MaterializableVector {
         chars_(std::move(chars)),
         nulls_(std::move(nulls)),
         nullStride_(nullStride),
-        materialized_(std::move(materialized)) {}
+        nullBits_(std::move(nullBits)) {}
 
   RowVectorPtr materialize() const override {
     return extractHostRows(
@@ -116,10 +115,10 @@ class HostRowVector : public RowVector, public MaterializableVector {
         rows_.data(),
         rowWidth_,
         fields_,
-        chars_.data(),
+        chars_ ? chars_->data() : nullptr,
         nulls_.empty() ? nullptr : nulls_.data(),
         nullStride_,
-        materialized_);
+        nullBits_.empty() ? nullptr : &nullBits_);
   }
 
   int64_t rowBytes() const {
@@ -130,10 +129,10 @@ class HostRowVector : public RowVector, public MaterializableVector {
   std::vector<uint8_t> rows_;
   int32_t rowWidth_;
   std::vector<FieldDesc> fields_;
-  std::vector<uint8_t> chars_;
+  std::shared_ptr<const std::vector<uint8_t>> chars_; // heap, shareable
   std::vector<uint8_t> nulls_;
   int32_t nullStride_;
-  std::vector<VectorPtr> materialized_; // per output column; deferred payload
+  std::vector<int32_t> nullBits_; // per output column; empty = column index
 };
 
 } // namespace facebook::velox::cudf_velox
