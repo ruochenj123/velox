@@ -362,17 +362,6 @@ class RowHashJoinProbe : public CudfOperatorBase {
 // Bridge translator: connects plan node to row-wise operators
 // ============================================================================
 
-/// Row-sort helpers (branch row-sort): columnar cudf table -> fixed-stride
-/// row layout / row buffer (+ string heap). Implemented in RowHashJoin.cpp.
-std::pair<std::vector<FieldDesc>, int32_t> rowLayoutFromCudfTable(
-    const cudf::table_view& table);
-rmm::device_buffer transposeCudfTableToRows(
-    const cudf::table_view& table,
-    const std::vector<FieldDesc>& fields,
-    int32_t rowWidth,
-    uint8_t* d_row_buffer,
-    cudaStream_t stream);
-
 class RowHashJoinBridgeTranslator : public exec::Operator::PlanNodeTranslator {
  public:
   std::unique_ptr<exec::Operator> toOperator(

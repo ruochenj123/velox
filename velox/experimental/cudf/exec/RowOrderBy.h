@@ -3,7 +3,7 @@
  *
  * Row-wise GPU sort. Consumes fixed-stride row batches (RowStoreVector from
  * the row pack / row joins, possibly through a gather LocalPartition) or
- * columnar CudfVector batches (transposed on arrival), concatenates them
+ * (row pack output only), concatenates them
  * into one row store, sorts on the key fields (extracted to cudf columns,
  * cudf::sorted_order) and applies the permutation with ONE row gather --
  * the row-native counterpart of cudf::sort_by_key's per-column gathers.
@@ -71,7 +71,6 @@ class RowOrderBy : public CudfOperatorBase {
 
   void captureLayout(const RowStoreVector& v);
   void concatenateRowInputs();
-  void transposeCudfInputs();
   void sortRows();
   void resolveOutputOnce();
   int32_t fieldIndexOf(const std::string& name) const;
@@ -100,7 +99,6 @@ class RowOrderBy : public CudfOperatorBase {
 
   // ---- inputs ----
   std::vector<std::shared_ptr<RowStoreVector>> rowInputs_;
-  std::vector<CudfVectorPtr> cudfInputs_;
   int64_t totalRows_ = 0;
   int64_t totalChars_ = 0;
 

@@ -162,8 +162,6 @@ void RowOrderBy::doAddInput(RowVectorPtr input) {
     return;
   }
   if (auto rs = std::dynamic_pointer_cast<RowStoreVector>(input)) {
-    VELOX_CHECK(
-        cudfInputs_.empty(), "RowOrderBy: mixed RowStoreVector/CudfVector input");
     if (!layoutReady_) {
       captureLayout(*rs);
     } else {
@@ -182,13 +180,7 @@ void RowOrderBy::doAddInput(RowVectorPtr input) {
     rowInputs_.push_back(std::move(rs));
     return;
   }
-  auto cv = std::dynamic_pointer_cast<CudfVector>(input);
-  VELOX_CHECK_NOT_NULL(
-      cv, "RowOrderBy: input must be RowStoreVector or CudfVector");
-  VELOX_CHECK(
-      rowInputs_.empty(), "RowOrderBy: mixed RowStoreVector/CudfVector input");
-  totalRows_ += cv->size();
-  cudfInputs_.push_back(std::move(cv));
+  VELOX_FAIL("RowOrderBy: input must be a RowStoreVector (row pack)");
 }
 
 // Row inputs -> one contiguous row store (+ padded null sidecar, string
@@ -290,35 +282,6 @@ void RowOrderBy::concatenateRowInputs() {
   }
   stream_.synchronize();
   rowInputs_.clear(); // frees the per-batch GPU buffers
-}
-
-// Columnar inputs -> one row store via the join's transpose helpers.
-void RowOrderBy::transposeCudfInputs() {
-  auto tbl = getConcatenatedTable(
-      std::exchange(cudfInputs_, {}), outputType_, stream_, get_output_mr());
-  VELOX_CHECK_NOT_NULL(tbl);
-  const auto view = tbl->view();
-  auto [f, w] = rowLayoutFromCudfTable(view);
-  fields_ = std::move(f);
-  rowWidth_ = w;
-  fieldNames_.clear();
-  nullStride_ = nullPad_ = 0;
-  rowIdField_ = -1;
-  hasStrings_ = false;
-  for (const auto& fd : fields_) {
-    if (fd.kind == kFieldString) {
-      hasStrings_ = true;
-    }
-  }
-  layoutReady_ = true;
-  sorted_ = rmm::device_buffer(totalRows_ * rowWidth_, stream_);
-  heap_ = transposeCudfTableToRows(
-      view,
-      fields_,
-      rowWidth_,
-      static_cast<uint8_t*>(sorted_.data()),
-      stream_.value());
-  stream_.synchronize(); // the table must outlive the transpose
 }
 
 // Keys -> cudf columns -> sorted_order -> ONE row gather.
@@ -538,8 +501,6 @@ void RowOrderBy::doNoMoreInput() {
   }
   if (!rowInputs_.empty()) {
     concatenateRowInputs();
-  } else {
-    transposeCudfInputs();
   }
   resolveOutputOnce(); // deferred columns are needed by the coalesce
   sortRows();
@@ -1175,7 +1136,6 @@ RowVectorPtr RowOrderBy::doGetOutput() {
 void RowOrderBy::doClose() {
   Operator::close();
   rowInputs_.clear();
-  cudfInputs_.clear();
   stores_.clear();
   storeCols_.clear();
   sorted_ = rmm::device_buffer{};

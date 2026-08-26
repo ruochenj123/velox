@@ -2659,23 +2659,3 @@ exec::OperatorSupplier RowHashJoinBridgeTranslator::toOperatorSupplier(
 }
 
 } // namespace facebook::velox::cudf_velox
-
-// ============================================================================
-// Public wrappers (branch row-sort, 2026-08-24): RowOrderBy's CudfVector
-// input path reuses the join's columnar->row transpose and layout helpers,
-// which live in this file's anonymous namespace.
-// ============================================================================
-namespace facebook::velox::cudf_velox {
-std::pair<std::vector<FieldDesc>, int32_t> rowLayoutFromCudfTable(
-    const cudf::table_view& table) {
-  return computeRowLayoutFromTable(table);
-}
-rmm::device_buffer transposeCudfTableToRows(
-    const cudf::table_view& table,
-    const std::vector<FieldDesc>& fields,
-    int32_t rowWidth,
-    uint8_t* d_row_buffer,
-    cudaStream_t stream) {
-  return transposeToRows(table, fields, rowWidth, d_row_buffer, stream);
-}
-} // namespace facebook::velox::cudf_velox
