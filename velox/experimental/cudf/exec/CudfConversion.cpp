@@ -552,219 +552,136 @@ bool CudfFromVelox::computeLayoutOnce(
     bool rowMode,
     bool boundary) {
   // ---- One-time layout: offsets/widths + cudf dtypes ----
+  // ONE builder (2026-08-25, review round 6) over a chosen column list:
+  //   boundary : the crossing set (adjacent join keys + later chain keys
+  //              present here) + a hidden __rowid; batch retained on host.
+  //   default  : the adjacent join's keys + its output columns present here
+  //              (the scan's filter-only columns never cross); when no
+  //              adjacent join is known, or nothing would be pruned, every
+  //              input column.
+  if (rowLayoutReady_) {
+    return pinnedPackState_ >= 0;
+  }
   const int numCols = static_cast<int>(inRowType->size());
-  if (!rowLayoutReady_ && boundary) {
-    // ---- Crossing-set layout (spine deferral v2): pack the adjacent
-    // join's keys, then every LATER join key present in this input, then a
-    // hidden __rowid BIGINT (index into the batch's retained host rows).
-    // The stride is the crossing width, so toCudfBytes reports the true
-    // boundary traffic. Unsupported crossing types are a hard error rather
-    // than a silent fallback: the downstream probe REQUIRES this layout,
-    // and a full-width fallback pack would be misread.
-    crossingNames_ = boundaryKeyNames_;
+  std::vector<std::string> names;
+  bool subset = false;
+  if (boundary) {
+    names = boundaryKeyNames_;
     for (const auto& n : laterKeyNames_) {
       if (inRowType->getChildIdxIfExists(n).has_value() &&
-          std::find(crossingNames_.begin(), crossingNames_.end(), n) ==
-              crossingNames_.end()) {
-        crossingNames_.push_back(n);
+          std::find(names.begin(), names.end(), n) == names.end()) {
+        names.push_back(n);
       }
     }
-    boundaryPackChannels_.clear();
-    std::vector<FieldDesc> fields;
-    fields.reserve(crossingNames_.size() + 1);
-    int32_t offset = 0;
-    for (const auto& name : crossingNames_) {
-      const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
-      boundaryPackChannels_.push_back(ch);
-      const auto& type = inRowType->childAt(ch);
-      FieldDesc fd;
-      switch (type->kind()) {
-        case TypeKind::TINYINT:
-          fd.byte_width = 1;
-          break;
-        case TypeKind::SMALLINT:
-          fd.byte_width = 2;
-          break;
-        case TypeKind::INTEGER: // includes DATE
-        case TypeKind::REAL:
-          fd.byte_width = 4;
-          break;
-        case TypeKind::BIGINT:
-        case TypeKind::DOUBLE:
-          fd.byte_width = 8;
-          break;
-        default:
+    subset = true;
+  } else {
+    if (rowMode && !joinOutputNames_.empty()) {
+      names = boundaryKeyNames_;
+      for (const auto& n : joinOutputNames_) {
+        if (inRowType->getChildIdxIfExists(n).has_value() &&
+            std::find(names.begin(), names.end(), n) == names.end()) {
+          names.push_back(n);
+        }
+      }
+      subset = static_cast<int>(names.size()) < numCols;
+    }
+    if (!subset) {
+      names = inRowType->names();
+    }
+  }
+
+  boundaryPackChannels_.clear();
+  hasStringFields_ = false;
+  std::vector<FieldDesc> fields;
+  std::vector<cudf::data_type> dtypes;
+  fields.reserve(names.size() + 1);
+  dtypes.reserve(names.size());
+  int32_t offset = 0;
+  for (const auto& name : names) {
+    const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
+    const auto& type = inRowType->childAt(ch);
+    FieldDesc fd;
+    switch (type->kind()) {
+      case TypeKind::TINYINT:
+        fd.byte_width = 1;
+        break;
+      case TypeKind::SMALLINT:
+        fd.byte_width = 2;
+        break;
+      case TypeKind::INTEGER: // includes DATE
+      case TypeKind::REAL:
+        fd.byte_width = 4;
+        break;
+      case TypeKind::BIGINT:
+      case TypeKind::DOUBLE:
+        fd.byte_width = 8;
+        break;
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+        if (boundary) {
           VELOX_FAIL(
               "boundary-hybrid: unsupported join-key type {} for column {}",
               type->toString(),
               name);
-      }
-      // NATURAL-ALIGN each key: extract_keys_kernel reads 4/8-byte keys with
-      // reinterpret_cast wide loads, which fault on unaligned addresses when
-      // a narrow key precedes a wide one in a composite key. Padding bytes
-      // are deterministic (the slot is zeroed once at allocation).
-      offset = (offset + fd.byte_width - 1) & ~(fd.byte_width - 1);
-      fd.offset = offset;
-      fields.push_back(fd);
-      offset += fd.byte_width;
+        }
+        if (!rowMode) {
+          pinnedPackState_ = -1;
+          return false;
+        }
+        fd.byte_width = kRowStrSlotBytes;
+        fd.kind = kFieldString;
+        hasStringFields_ = true;
+        break;
+      default:
+        if (boundary) {
+          VELOX_FAIL(
+              "boundary-hybrid: unsupported join-key type {} for column {}",
+              type->toString(),
+              name);
+        }
+        pinnedPackState_ = -1;
+        return false;
     }
-    // Hidden __rowid: filled by the pack (not from a channel).
+    cudf::data_type dtype;
+    try {
+      dtype = veloxToCudfDataType(type);
+    } catch (const std::exception&) {
+      pinnedPackState_ = -1;
+      return false;
+    }
+    if (fd.kind == kFieldString) {
+      offset = (offset + 7) & ~7;
+    } else {
+      if (cudf::size_of(dtype) != fd.byte_width) {
+        pinnedPackState_ = -1; // width mismatch (e.g. decimals)
+        return false;
+      }
+      offset = (offset + fd.byte_width - 1) & ~(fd.byte_width - 1);
+    }
+    fd.offset = offset;
+    if (subset) {
+      boundaryPackChannels_.push_back(ch);
+    }
+    fields.push_back(fd);
+    dtypes.push_back(dtype);
+    offset += fd.byte_width;
+  }
+  if (boundary) {
     offset = (offset + 7) & ~7;
     rowIdField_ = static_cast<int32_t>(fields.size());
     fields.push_back({offset, 8});
     offset += 8;
+    crossingNames_ = names;
     crossingNames_.push_back(kRowIdName);
-    rowFields_ = std::move(fields);
-    rowWidth_ = (offset + 7) & ~7; // 8-byte aligned crossing stride
-    dataWidth_ = offset;
-    rowLayoutReady_ = true;
+  } else if (subset) {
+    prunedPack_ = true;
+    subsetPackNames_ = std::move(names);
   }
-  // ---- Pruned eager layout (STANDARD row-pack behavior): pack only the
-  // adjacent join's keys + its output columns. Filter-only channels --
-  // which the scan must emit for its pushed-down predicates -- never
-  // cross. Falls back to the full identity layout below when there is no
-  // adjacent join, nothing would be saved, or a needed column is
-  // unpackable.
-  if (!rowLayoutReady_ && rowMode && !joinOutputNames_.empty()) {
-    std::vector<std::string> needed = boundaryKeyNames_;
-    for (const auto& n : joinOutputNames_) {
-      if (inRowType->getChildIdxIfExists(n).has_value() &&
-          std::find(needed.begin(), needed.end(), n) == needed.end()) {
-        needed.push_back(n);
-      }
-    }
-    if (static_cast<int>(needed.size()) < numCols) {
-      prunedPack_ = true;
-      subsetPackNames_ = std::move(needed);
-      boundaryPackChannels_.clear();
-      std::vector<FieldDesc> fields;
-      std::vector<cudf::data_type> dtypes;
-      int32_t offset = 0;
-      for (const auto& name : subsetPackNames_) {
-        const auto ch = static_cast<int32_t>(inRowType->getChildIdx(name));
-        const auto& type = inRowType->childAt(ch);
-        FieldDesc fd;
-        switch (type->kind()) {
-          case TypeKind::TINYINT: fd.byte_width = 1; break;
-          case TypeKind::SMALLINT: fd.byte_width = 2; break;
-          case TypeKind::INTEGER:
-          case TypeKind::REAL: fd.byte_width = 4; break;
-          case TypeKind::BIGINT:
-          case TypeKind::DOUBLE: fd.byte_width = 8; break;
-          case TypeKind::VARCHAR:
-          case TypeKind::VARBINARY:
-            fd.byte_width = kRowStrSlotBytes;
-            fd.kind = kFieldString;
-            hasStringFields_ = true;
-            break;
-          default:
-            // Unpackable type in the needed set: give up pruning; the full
-            // layout below decides packability for the whole schema.
-            prunedPack_ = false;
-        }
-        if (!prunedPack_) {
-          break;
-        }
-        cudf::data_type dtype;
-        try {
-          dtype = veloxToCudfDataType(type);
-        } catch (const std::exception&) {
-          prunedPack_ = false;
-          break;
-        }
-        if (fd.kind == kFieldString) {
-          offset = (offset + 7) & ~7;
-        } else {
-          offset = (offset + fd.byte_width - 1) & ~(fd.byte_width - 1);
-        }
-        fd.offset = offset;
-        boundaryPackChannels_.push_back(ch);
-        fields.push_back(fd);
-        dtypes.push_back(dtype);
-        offset += fd.byte_width;
-      }
-      if (prunedPack_) {
-        rowFields_ = std::move(fields);
-        colDtypes_ = std::move(dtypes);
-        rowWidth_ = (offset + 7) & ~7;
-        dataWidth_ = offset;
-        rowLayoutReady_ = true;
-      } else {
-        boundaryPackChannels_.clear();
-        subsetPackNames_.clear();
-        hasStringFields_ = false;
-      }
-    }
-  }
-  if (!rowLayoutReady_) {
-    int32_t offset = 0;
-    std::vector<FieldDesc> fields;
-    std::vector<cudf::data_type> dtypes;
-    fields.reserve(numCols);
-    dtypes.reserve(numCols);
-    for (int i = 0; i < numCols; i++) {
-      const auto& type = inRowType->childAt(i);
-      FieldDesc fd;
-      fd.offset = offset;
-      switch (type->kind()) {
-        // BOOLEAN is bit-packed in FlatVector -- not byte-copyable here.
-        case TypeKind::TINYINT:
-          fd.byte_width = 1;
-          break;
-        case TypeKind::SMALLINT:
-          fd.byte_width = 2;
-          break;
-        case TypeKind::INTEGER: // includes DATE
-        case TypeKind::REAL:
-          fd.byte_width = 4;
-          break;
-        case TypeKind::BIGINT:
-        case TypeKind::DOUBLE:
-          fd.byte_width = 8;
-          break;
-        case TypeKind::VARCHAR:
-        case TypeKind::VARBINARY:
-          // Out-of-line strings (2026-08-21): 16B slot, row mode only; the
-          // col-major pinned path has no heap and keeps falling back.
-          if (!rowMode) {
-            pinnedPackState_ = -1;
-            return false;
-          }
-          fd.byte_width = kRowStrSlotBytes;
-          fd.kind = kFieldString;
-          break;
-        default:
-          pinnedPackState_ = -1;
-          return false;
-      }
-      cudf::data_type dtype;
-      try {
-        dtype = veloxToCudfDataType(type);
-      } catch (const std::exception&) {
-        pinnedPackState_ = -1;
-        return false;
-      }
-      if (fd.kind == kFieldString) {
-        // 8-align the slot so the 16B copy fast path and the u64 offset
-        // loads are naturally aligned (padding is zeroed once per slot).
-        offset = (offset + 7) & ~7;
-        fd.offset = offset;
-        hasStringFields_ = true;
-      } else if (cudf::size_of(dtype) != fd.byte_width) {
-        pinnedPackState_ = -1; // width mismatch (e.g. decimals)
-        return false;
-      }
-      fields.push_back(fd);
-      dtypes.push_back(dtype);
-      offset += fd.byte_width;
-    }
-    rowFields_ = std::move(fields);
-    colDtypes_ = std::move(dtypes);
-    rowWidth_ = (offset + 7) & ~7; // 8-byte aligned stride (row mode)
-    dataWidth_ = offset; // raw width sum, unpadded (col mode)
-    rowLayoutReady_ = true;
-  }
-
+  rowFields_ = std::move(fields);
+  colDtypes_ = std::move(dtypes);
+  rowWidth_ = (offset + 7) & ~7; // 8-byte aligned stride (row mode)
+  dataWidth_ = offset; // raw width sum, unpadded (col mode)
+  rowLayoutReady_ = true;
   return pinnedPackState_ >= 0;
 }
 

@@ -81,3 +81,31 @@ arms: `results/singleop_joinhit_flip_scat_native` (jobs 13953182/83; gate
 - bndn == bnd (+-5%): the deferred exit was already host-side. Deferral
   wins every cell: col/bndn 1.19-1.97x.
 - All arms are ~5-10% faster than the earlier table B (harness copy gone).
+
+## Round 6 (2026-08-26): three items from the round-5 review — uncommitted on top of 001d18f41
+
+1. **One layout builder** (`CudfConversion.cpp`, `computeLayoutOnce`): the
+   three branches are one builder over a chosen column list. Default =
+   adjacent join keys + join output columns present in the input (the scan's
+   filter-only columns never cross); when no adjacent join is known or
+   nothing would be pruned, every input column. Boundary = crossing set +
+   `__rowid`. The old full-identity branch is gone; fallbacks preserved
+   (unpackable column / width mismatch -> pinned pack declines).
+2. **Probe -> build emits rows** (`RowHashJoin.cpp`, terminal detection):
+   when the next operator is a `RowHashJoinBuild` (bushy plan) and deferral
+   is OFF, the probe hands over `RowStoreVector` rows (the build consumes
+   rows; no rows->columns->rows). Under `--boundary_hybrid` a build-feeding
+   probe stays columnar: a build takes one input layout, and the adaptive
+   switch would otherwise mix rows and columns (found by the 22-query gate).
+   Such a probe reports survival as the chain endpoint.
+3. **Transpose-first deferred exits** (`transposeGpuOutputColumns(...,
+   withRowId)`): the output row buffer, with `__rowid` as one more column,
+   is transposed once on the device; the ids come from that column.
+   `makeColumnarOutput` loses the separate id pass; `makeHostOutput`'s
+   deferred path no longer D2H's the rows at all (GPU-side columns cross
+   once, via the arrow path, together with the id column).
+
+Gates (harness native4): Q31 both orientations + q3/q9, 20/20; all 22
+TPC-H queries at SF1 row/bnd/bnda vs cpu: all pass except q15 (unsupported
+on every GPU arm before this round). Table-B regression rerun: see
+`FINDINGS-factorial.md` (results/singleop_joinhit_flip_scat_native4).

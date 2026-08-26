@@ -1518,6 +1518,16 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
         if (ops[i] == this) {
           if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
             emitColumnar_ = 0; // next op is a row-join -> keep row layout
+          } else if (dynamic_cast<RowHashJoinBuild*>(ops[i + 1]) != nullptr) {
+            // Our output is the BUILD side of a later join (bushy plan).
+            // The build takes ONE layout for all its inputs, so we hand
+            // over rows only when this probe can never switch to deferred
+            // (deferral off); under --boundary_hybrid a build-feeding probe
+            // stays columnar (deferred batches must be materialized, and
+            // the adaptive switch would otherwise mix rows and columns).
+            nextIsBuild_ = true;
+            emitColumnar_ =
+                CudfConfig::getInstance().benchmarkBoundaryHybrid ? 1 : 0;
           } else if (dynamic_cast<CudfToVelox*>(ops[i + 1]) != nullptr) {
             // CPU exit: with provenance, emit a HOST RowVector directly
             // (CudfToVelox passes non-CudfVector inputs through) -- the
@@ -1538,7 +1548,7 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   // resolved as the chain endpoint (DeferralPlan probe-side walk). A CPU
   // exit reports 0: with direct host emission, deferring is always right.
   // Recorded before the numMatches==0 early-return so empty batches count.
-  if (emitColumnar_ == 1) {
+  if (emitColumnar_ == 1 || nextIsBuild_) {
     DeferralStats::instance().recordSurvived(
         joinNode_->id(), hostExit_ ? 0 : numMatches);
   }
@@ -1719,7 +1729,8 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   }
 
   // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
-  if (emitColumnar_ == 1) {
+  // A probe feeding a BUILD emits rows for eager batches only.
+  if (emitColumnar_ == 1 || (nextIsBuild_ && !deferredOutputCols_.empty())) {
     if (hostExit_ &&
         (probeProvStore_ != nullptr ||
          CudfConfig::getInstance().benchmarkRowOutputNative)) {
@@ -1808,6 +1819,73 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
     int32_t numMatches,
     rmm::cuda_stream_view stream) {
   const int32_t numCols = outputType_->size();
+  std::vector<VectorPtr> children(numCols);
+  if (!deferredOutputCols_.empty()) {
+    // DEFERRED exit: uniformly COLUMNAR, and the rows never cross. The
+    // whole output row buffer is transposed on the device (with __rowid as
+    // one more column), the GPU-side columns come over through the arrow
+    // path, the ids are read from the transposed column on the host, and
+    // the deferred payload is gathered from the retained batch.
+    VELOX_CHECK_NOT_NULL(probeProvStore_);
+    auto gpuCols = transposeGpuOutputColumns(numMatches, stream, true);
+    auto rowIdCol = std::move(gpuCols.back());
+    gpuCols.pop_back();
+    std::vector<std::unique_ptr<cudf::column>> subset;
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    std::vector<int32_t> subsetIdx;
+    for (int i = 0; i < numCols; i++) {
+      if (gpuCols[i] != nullptr) {
+        subset.push_back(std::move(gpuCols[i]));
+        names.push_back(outputType_->nameOf(i));
+        types.push_back(outputType_->childAt(i));
+        subsetIdx.push_back(i);
+      }
+    }
+    subset.push_back(std::move(rowIdCol));
+    names.push_back("__rowid");
+    types.push_back(BIGINT());
+    auto tbl = std::make_unique<cudf::table>(std::move(subset));
+    auto host = with_arrow::toVeloxColumn(
+        tbl->view(),
+        pool(),
+        std::static_pointer_cast<const Type>(ROW(std::move(names), std::move(types))),
+        stream,
+        get_output_mr());
+    for (size_t k = 0; k < subsetIdx.size(); k++) {
+      children[subsetIdx[k]] = host->childAt(k);
+    }
+    const auto* ids64 =
+        host->childAt(subsetIdx.size())->asFlatVector<int64_t>()->rawValues();
+    materializeIds_.resize(numMatches);
+    for (int32_t r = 0; r < numMatches; r++) {
+      materializeIds_[r] = static_cast<int32_t>(ids64[r]);
+    }
+    probeProvStore_->idsForGlobalRows(
+        materializeIds_.data(), numMatches, materializeRowIds_);
+    const auto& storeType = probeProvStore_->rowType();
+    for (auto outIdx : deferredOutputCols_) {
+      auto col = BaseVector::create(
+          outputType_->childAt(outIdx), numMatches, pool());
+      probeProvStore_->gather(
+          static_cast<int32_t>(
+              storeType->getChildIdx(outputType_->nameOf(outIdx))),
+          materializeRowIds_,
+          col,
+          materializeSentinelScratch_);
+      children[outIdx] = std::move(col);
+    }
+    outputCharsBuffer_ = rmm::device_buffer{};
+    addRuntimeStat(
+        "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
+    addRuntimeStat(
+        "deferredMaterializeRows",
+        RuntimeCounter(static_cast<int64_t>(numMatches)));
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, numMatches, std::move(children));
+  }
+
+  // EAGER exit: rows. D2H the row buffer (+ string heap, null sidecar).
   const int64_t rowsBytes =
       static_cast<int64_t>(numMatches) * outputRowWidth_;
   hostRowsScratch_.resize(rowsBytes);
@@ -1841,72 +1919,6 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
   stream.synchronize();
 
   const uint8_t* rows = hostRowsScratch_.data();
-  std::vector<VectorPtr> children(numCols);
-  if (!deferredOutputCols_.empty()) {
-    // DEFERRED exit (2026-08-25): uniformly COLUMNAR output. Ids come from
-    // the host rows; the deferred payload is gathered on the host; the
-    // GPU-side columns (keys, later keys, build-side output) are transposed
-    // ON THE DEVICE and brought over as columns -- no host extraction.
-    VELOX_CHECK_GE(outputRowIdField_, 0);
-    const int32_t idOff = outputFields_[outputRowIdField_].offset;
-    materializeIds_.resize(numMatches);
-    for (int32_t r = 0; r < numMatches; r++) {
-      int64_t id;
-      std::memcpy(&id, rows + static_cast<int64_t>(r) * outputRowWidth_ + idOff, 8);
-      materializeIds_[r] = static_cast<int32_t>(id);
-    }
-    probeProvStore_->idsForGlobalRows(
-        materializeIds_.data(), numMatches, materializeRowIds_);
-    const auto& storeType = probeProvStore_->rowType();
-    for (auto outIdx : deferredOutputCols_) {
-      auto col = BaseVector::create(
-          outputType_->childAt(outIdx), numMatches, pool());
-      probeProvStore_->gather(
-          static_cast<int32_t>(
-              storeType->getChildIdx(outputType_->nameOf(outIdx))),
-          materializeRowIds_,
-          col,
-          materializeSentinelScratch_);
-      children[outIdx] = std::move(col);
-    }
-    // GPU-side columns: device transpose, then cudf -> Velox (arrow path).
-    auto gpuCols = transposeGpuOutputColumns(numMatches, stream);
-    std::vector<std::unique_ptr<cudf::column>> subset;
-    std::vector<std::string> names;
-    std::vector<TypePtr> types;
-    std::vector<int32_t> subsetIdx;
-    for (int i = 0; i < numCols; i++) {
-      if (gpuCols[i] != nullptr) {
-        subset.push_back(std::move(gpuCols[i]));
-        names.push_back(outputType_->nameOf(i));
-        types.push_back(outputType_->childAt(i));
-        subsetIdx.push_back(i);
-      }
-    }
-    if (!subset.empty()) {
-      auto tbl = std::make_unique<cudf::table>(std::move(subset));
-      auto host = with_arrow::toVeloxColumn(
-          tbl->view(),
-          pool(),
-          std::static_pointer_cast<const Type>(
-              ROW(std::move(names), std::move(types))),
-          stream,
-          get_output_mr());
-      for (size_t k = 0; k < subsetIdx.size(); k++) {
-        children[subsetIdx[k]] = host->childAt(k);
-      }
-    }
-    outputCharsBuffer_ = rmm::device_buffer{};
-    addRuntimeStat(
-        "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
-    addRuntimeStat(
-        "deferredMaterializeRows",
-        RuntimeCounter(static_cast<int64_t>(numMatches)));
-    return std::make_shared<RowVector>(
-        pool(), outputType_, nullptr, numMatches, std::move(children));
-  }
-
-  // EAGER exit: rows.
   std::vector<FieldDesc> fields(
       outputFields_.begin(), outputFields_.begin() + numCols);
   const bool hasChars = outputCharsBuffer_.size() > 0;
@@ -1953,7 +1965,8 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
 std::vector<std::unique_ptr<cudf::column>>
 RowHashJoinProbe::transposeGpuOutputColumns(
     int32_t numMatches,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    bool withRowId) {
   const int32_t numCols = outputType_->size();
   std::vector<std::unique_ptr<rmm::device_buffer>> colBuffers(numCols);
   std::vector<uint8_t*> fixedPtrs;
@@ -1971,6 +1984,14 @@ RowHashJoinProbe::transposeGpuOutputColumns(
   }
 
   // Scatter row buffer -> columns.
+  std::unique_ptr<rmm::device_buffer> rowIdBuf;
+  if (withRowId) {
+    VELOX_CHECK_GE(outputRowIdField_, 0);
+    rowIdBuf = std::make_unique<rmm::device_buffer>(
+        static_cast<int64_t>(numMatches) * 8, stream);
+    fixedPtrs.push_back(static_cast<uint8_t*>(rowIdBuf->data()));
+    fixedFields.push_back(outputFields_[outputRowIdField_]);
+  }
   if (!fixedFields.empty()) {
     rowsToColumns(
         static_cast<const uint8_t*>(probeGatherBuffer_.data()),
@@ -2063,6 +2084,15 @@ RowHashJoinProbe::transposeGpuOutputColumns(
         nullCount));
   }
 
+  if (withRowId) {
+    // The hidden __rowid as one more INT64 column (no null mask).
+    columns.push_back(std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::INT64},
+        static_cast<cudf::size_type>(numMatches),
+        std::move(*rowIdBuf),
+        rmm::device_buffer{},
+        0));
+  }
   return columns;
 }
 
@@ -2076,28 +2106,21 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
   // provenance store -- extract the hidden __rowid field of the gathered
   // rows, read the ids back, host-gather survivors, upload, and splice the
   // columns into the output table below.
+  // Transpose FIRST (review round 6): the whole output row buffer, with the
+  // hidden __rowid as one more column, goes rows -> columns once on the
+  // device; the ids are read from that column. No separate id pass.
+  const bool hasDeferred = !deferredOutputCols_.empty() && numMatches > 0;
+  auto columns = transposeGpuOutputColumns(numMatches, stream, hasDeferred);
   std::vector<std::unique_ptr<cudf::column>> deferredCols(numCols);
-  if (!deferredOutputCols_.empty() && numMatches > 0) {
+  if (hasDeferred) {
     VELOX_CHECK_NOT_NULL(probeProvStore_);
-    VELOX_CHECK_GE(outputRowIdField_, 0);
     auto tpDefer = std::chrono::steady_clock::now();
-    // rowids: device-extract the hidden field, then D2H.
-    rmm::device_buffer idsDev(
-        static_cast<size_t>(numMatches) * sizeof(int64_t), stream);
-    GpuFixedRowStore outStore;
-    outStore.row_buffer = static_cast<uint8_t*>(probeGatherBuffer_.data());
-    outStore.row_width = outputRowWidth_;
-    outStore.num_rows = numMatches;
-    extractKeysFromRows(
-        outStore,
-        outputFields_[outputRowIdField_].offset,
-        8,
-        idsDev.data(),
-        stream.value());
+    auto rowIdCol = std::move(columns.back());
+    columns.pop_back();
     std::vector<int64_t> ids64(numMatches);
     cudaMemcpyAsync(
         ids64.data(),
-        idsDev.data(),
+        rowIdCol->view().data<int64_t>(),
         static_cast<size_t>(numMatches) * sizeof(int64_t),
         cudaMemcpyDeviceToHost,
         stream.value());
@@ -2157,7 +2180,6 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
 
   // Allocate one device buffer per FIXED output column and remember its
   // base ptr; string columns (2026-08-21) are materialized separately below.
-  auto columns = transposeGpuOutputColumns(numMatches, stream);
   for (int i = 0; i < numCols; i++) {
     if (outputFields_[i].offset < 0) {
       VELOX_CHECK_NOT_NULL(deferredCols[i]);

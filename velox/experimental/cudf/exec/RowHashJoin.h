@@ -279,7 +279,9 @@ class RowHashJoinProbe : public CudfOperatorBase {
   RowVectorPtr makeHostOutput(int32_t numMatches, rmm::cuda_stream_view stream);
   std::vector<std::unique_ptr<cudf::column>> transposeGpuOutputColumns(
       int32_t numMatches,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      bool withRowId = false);
+  bool nextIsBuild_ = false; // our output is a later join's BUILD side
 
   // ---- Out-of-line strings (eager compaction) ----
   rmm::device_buffer probeCharsBuffer_;   // heap of a transposed CudfVector probe
