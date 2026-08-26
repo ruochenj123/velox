@@ -25,7 +25,6 @@ Commits on top, in order:
 | `exec/GpuRowOps.{cu,cuh}` | `addInt64Field` kernel. |
 | `exec/DeferralPlan.h` | Chain walk generalized: OrderByNode adjacent/terminal, gather LocalPartition pass-through, `orderByBehindGather`. |
 | `exec/CudfConversion.cpp` (resolveRowPathOnce) | Row-sort consumer (direct or behind a gather): sort keys = crossing set / null-key guard, pruning = sort output, endpoint = sort node. |
-| `exec/RowHashJoin.cpp` | Public wrappers `rowLayoutFromCudfTable` / `transposeCudfTableToRows` (used by `RowOrderBy::transposeCudfInputs`). |
 | `exec/CudfLocalPartition.cpp` | Gather passes RowStoreVector through untouched. |
 | `exec/OperatorAdapters.cpp`, `CudfConfig.h`, `benchmarks/CudfTpchBenchmark.cpp` | `RowOrderByAdapter`, `benchmarkRowSort`, `--row_sort`. |
 | `exec/tests/utils/TpchQueryBuilder.cpp` | `--synth_sort_gather` in Q40/Q31. The paper's sort workload is Q41 on widesort2 (pre-existing plan). |
