@@ -13,7 +13,6 @@
 #include "velox/experimental/cudf/exec/GpuRowOps.cuh"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/RowStoreVector.h"
-#include "velox/experimental/cudf/exec/RowOrderBy.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -1517,15 +1516,8 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       // Find self, then inspect the next operator in the pipeline.
       for (size_t i = 0; i + 1 < ops.size(); i++) {
         if (ops[i] == this) {
-          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr ||
-              dynamic_cast<RowOrderBy*>(ops[i + 1]) != nullptr ||
-              rowSortConsumesGather(
-                  ops[i + 1],
-                  operatorCtx_->task()->planFragment().planNode)) {
-            // next op is a row-join or a row SORT (directly, or behind a
-            // gather LocalPartition that passes rows through) -> keep the
-            // row layout; the sort is then the chain endpoint.
-            emitColumnar_ = 0;
+          if (dynamic_cast<RowHashJoinProbe*>(ops[i + 1]) != nullptr) {
+            emitColumnar_ = 0; // next op is a row-join -> keep row layout
           } else if (dynamic_cast<RowHashJoinBuild*>(ops[i + 1]) != nullptr) {
             // Our output is the BUILD side of a later join (bushy plan).
             // The build takes ONE layout for all its inputs, so we hand
