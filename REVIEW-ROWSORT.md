@@ -4,8 +4,8 @@ Base (2026-08-25): the review stack of the deferral work (`review-stack`,
 = spine deferral v2 + batch-level adaptive + host exit + native row output).
 Commits on top, in order:
 
-1. Row-wise GPU sort (RowOrderBy) + Q44/Q45
-2. global rowid base = provenance store size (join->sort fix)
+1. Row-wise GPU sort (RowOrderBy)
+2. global rowid base = provenance store size
 3. parallel host emission; sort endpoint reports S = rows
 4. REVIEW-ROWSORT.md, DESIGN-build-side-deferral.md
 5. coalesce deferred payload into per-store columns while the device sorts
@@ -25,10 +25,10 @@ Commits on top, in order:
 | `exec/GpuRowOps.{cu,cuh}` | `addInt64Field` kernel. |
 | `exec/DeferralPlan.h` | Chain walk generalized: OrderByNode adjacent/terminal, gather LocalPartition pass-through, `orderByBehindGather`. |
 | `exec/CudfConversion.cpp` (resolveRowPathOnce) | Row-sort consumer (direct or behind a gather): sort keys = crossing set / null-key guard, pruning = sort output, endpoint = sort node. |
-| `exec/RowHashJoin.cpp` | Probe emits rows to a sort (direct or behind gather); public wrappers `rowLayoutFromCudfTable` / `transposeCudfTableToRows`. |
+| `exec/RowHashJoin.cpp` | Public wrappers `rowLayoutFromCudfTable` / `transposeCudfTableToRows` (used by `RowOrderBy::transposeCudfInputs`). |
 | `exec/CudfLocalPartition.cpp` | Gather passes RowStoreVector through untouched. |
 | `exec/OperatorAdapters.cpp`, `CudfConfig.h`, `benchmarks/CudfTpchBenchmark.cpp` | `RowOrderByAdapter`, `benchmarkRowSort`, `--row_sort`. |
-| `exec/tests/utils/TpchQueryBuilder.cpp` | Q44 (scan->gather->sort), Q45 (join->gather->sort), `--synth_sort_gather` in Q40/Q31. |
+| `exec/tests/utils/TpchQueryBuilder.cpp` | `--synth_sort_gather` in Q40/Q31. The paper's sort workload is Q41 on widesort2 (pre-existing plan). |
 
 ## Design points worth challenging
 
