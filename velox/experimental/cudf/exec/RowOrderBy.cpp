@@ -39,37 +39,6 @@ int32_t padTo8(int32_t n) {
   return (n + 7) & ~7;
 }
 
-// Host-side work in the (single-driver) sort pipeline is embarrassingly
-// parallel over rows; the other pipelines have finished by the time the
-// blocking sort emits, so the cores are idle. Plain std::threads over
-// contiguous row ranges (no shared mutation: disjoint destination bytes).
-constexpr int kMaxEmitThreads = 24;
-template <typename F>
-void parallelRows(int64_t n, F&& body, int64_t kMinPerThread = 1 << 15) {
-  int threads = static_cast<int>(std::min<int64_t>(
-      std::thread::hardware_concurrency(), kMaxEmitThreads));
-  threads = static_cast<int>(
-      std::max<int64_t>(1, std::min<int64_t>(threads, n / kMinPerThread)));
-  if (threads <= 1) {
-    body(0, n, 0);
-    return;
-  }
-  std::vector<std::thread> pool;
-  pool.reserve(threads);
-  const int64_t per = (n + threads - 1) / threads;
-  for (int t = 0; t < threads; t++) {
-    const int64_t b = t * per;
-    const int64_t e = std::min<int64_t>(n, b + per);
-    if (b >= e) {
-      break;
-    }
-    pool.emplace_back([&body, b, e, t] { body(b, e, t); });
-  }
-  for (auto& th : pool) {
-    th.join();
-  }
-}
-
 // Make `dst` wait for all work enqueued so far on `src`.
 void waitOnStream(rmm::cuda_stream_view dst, rmm::cuda_stream_view src) {
   if (dst.value() == src.value()) {
@@ -690,165 +659,52 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     prefetchBegin_ = -1;
   }
 
-  const uint8_t* rows = hostRowsCur_.data();
   const int32_t numCols = outputType_->size();
-  std::vector<VectorPtr> children(numCols); // eager: nothing deferred
+  // Eager exit: this chunk's D2H'd rows as a HostRowVector (row bytes + the
+  // shared string heap + this chunk's null sidecar). Under
+  // --row_output_native it is handed over as-is; otherwise it is extracted
+  // into Velox columns here (the shared extractHostRows, via materialize()).
+  if (hasStrings_ && hostCharsShared_ == nullptr) {
+    hostCharsShared_ =
+        std::make_shared<const std::vector<uint8_t>>(std::move(hostChars_));
+  }
+  std::vector<FieldDesc> f(numCols);
+  std::vector<int32_t> nullBits(numCols, 0);
+  for (int32_t i = 0; i < numCols; i++) {
+    const auto fi = outFieldIdx_[i];
+    if (fi >= 0) {
+      f[i] = fields_[fi];
+      nullBits[i] = fi; // the sidecar is indexed by FIELD
+    }
+  }
+  std::vector<uint8_t> rowsOwned = std::move(hostRowsCur_);
+  std::vector<uint8_t> nullsOwned;
+  if (nullPad_ > 0) {
+    nullsOwned = std::move(hostNulls_);
+  }
+  addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
+  auto hostRows = std::make_shared<HostRowVector>(
+      pool(),
+      outputType_,
+      n,
+      std::move(rowsOwned),
+      rowWidth_,
+      std::move(f),
+      hostCharsShared_ != nullptr
+          ? hostCharsShared_
+          : std::make_shared<const std::vector<uint8_t>>(),
+      std::move(nullsOwned),
+      nullPad_,
+      std::move(nullBits));
   if (CudfConfig::getInstance().benchmarkRowOutputNative) {
-    // Native row output: hand this chunk's D2H'd rows to the consumer as-is
-    // (with the shared string heap, this chunk's null sidecar and the
-    // host-gathered deferred columns). No column extraction; the harness
-    // materializes only when results are printed.
-    if (hasStrings_ && hostCharsShared_ == nullptr) {
-      hostCharsShared_ =
-          std::make_shared<const std::vector<uint8_t>>(std::move(hostChars_));
-    }
-    std::vector<FieldDesc> f(numCols);
-    std::vector<int32_t> nullBits(numCols, 0);
-    for (int32_t i = 0; i < numCols; i++) {
-      const auto fi = outFieldIdx_[i];
-      if (fi >= 0) {
-        f[i] = fields_[fi];
-        nullBits[i] = fi; // the sidecar is indexed by FIELD
-      }
-    }
-    std::vector<uint8_t> rowsOwned = std::move(hostRowsCur_);
-    std::vector<uint8_t> nullsOwned;
-    if (nullPad_ > 0) {
-      nullsOwned = std::move(hostNulls_);
-    }
-    addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
     addRuntimeStat(
         "hostExitNativeBytes",
         RuntimeCounter(
             static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
-    return std::make_shared<HostRowVector>(
-        pool(),
-        outputType_,
-        n,
-        std::move(rowsOwned),
-        rowWidth_,
-        std::move(f),
-        hostCharsShared_ != nullptr
-            ? hostCharsShared_
-            : std::make_shared<const std::vector<uint8_t>>(),
-        std::move(nullsOwned),
-        nullPad_,
-        std::move(nullBits));
+    return hostRows;
   }
   const auto tpExtract = std::chrono::steady_clock::now();
-  // ---- GPU-gathered columns: TWO parallel passes over row ranges for ALL
-  // columns at once (thread teams are per chunk, not per column). Pass 1:
-  // fixed-width strided copies + per-range out-of-line byte totals of every
-  // string column. Pass 2: string bytes into one shared buffer per column
-  // (disjoint ranges) + StringViews set without copying. ----
-  struct StrCol {
-    int32_t col;
-    int32_t fieldOff;
-    FlatVector<StringView>* fv;
-    char* base = nullptr;
-    std::vector<int64_t> rangeBase;
-  };
-  std::vector<StrCol> strCols;
-  struct FixCol {
-    int32_t fieldOff;
-    int32_t width;
-    uint8_t* dst;
-  };
-  std::vector<FixCol> fixCols;
-  for (int32_t i = 0; i < numCols; i++) {
-    if (children[i] != nullptr) {
-      continue; // deferred
-    }
-    const auto& fd = fields_[outFieldIdx_[i]];
-    auto vec = BaseVector::create(outputType_->childAt(i), n, pool());
-    if (fd.kind == kFieldString) {
-      strCols.push_back(
-          {i, fd.offset, vec->template asFlatVector<StringView>(), nullptr, {}});
-    } else {
-      auto* dst = static_cast<uint8_t*>(const_cast<void*>(vec->valuesAsVoid()));
-      VELOX_CHECK_NOT_NULL(dst);
-      fixCols.push_back({fd.offset, fd.byte_width, dst});
-    }
-    children[i] = std::move(vec);
-  }
-  const size_t S = strCols.size();
-  std::vector<int64_t> rangeBytes(static_cast<size_t>(kMaxEmitThreads) * S, 0);
-  const int32_t w = rowWidth_;
-  parallelRows(n, [&](int64_t b, int64_t e, int t) {
-    for (const auto& fc : fixCols) {
-      const int32_t fw = fc.width;
-      for (int64_t r = b; r < e; r++) {
-        std::memcpy(fc.dst + r * fw, rows + r * w + fc.fieldOff, fw);
-      }
-    }
-    for (size_t k = 0; k < S; k++) {
-      int64_t bytes = 0;
-      const int32_t off = strCols[k].fieldOff;
-      for (int64_t r = b; r < e; r++) {
-        uint32_t len;
-        std::memcpy(&len, rows + r * w + off, 4);
-        if (len > kRowStrInlineMax) {
-          bytes += len;
-        }
-      }
-      rangeBytes[static_cast<size_t>(t) * S + k] = bytes;
-    }
-  });
-  for (size_t k = 0; k < S; k++) {
-    auto& sc = strCols[k];
-    sc.rangeBase.assign(kMaxEmitThreads, 0);
-    int64_t total = 0;
-    for (int t = 0; t < kMaxEmitThreads; t++) {
-      sc.rangeBase[t] = total;
-      total += rangeBytes[static_cast<size_t>(t) * S + k];
-    }
-    if (total > 0) {
-      auto buf = AlignedBuffer::allocate<char>(total, pool());
-      sc.base = buf->asMutable<char>();
-      sc.fv->setStringBuffers({buf});
-    }
-  }
-  if (S > 0) {
-    parallelRows(n, [&](int64_t b, int64_t e, int t) {
-      for (size_t k = 0; k < S; k++) {
-        auto& sc = strCols[k];
-        int64_t cursor = sc.rangeBase[t];
-        const int32_t off = sc.fieldOff;
-        for (int64_t r = b; r < e; r++) {
-          const uint8_t* slot = rows + r * w + off;
-          uint32_t len;
-          std::memcpy(&len, slot, 4);
-          if (len <= kRowStrInlineMax) {
-            sc.fv->setNoCopy(
-                static_cast<vector_size_t>(r),
-                StringView(reinterpret_cast<const char*>(slot + 4), len));
-          } else {
-            uint64_t hoff;
-            std::memcpy(&hoff, slot + 8, 8);
-            char* dst = sc.base + cursor;
-            std::memcpy(dst, hostChars_.data() + hoff, len);
-            sc.fv->setNoCopy(static_cast<vector_size_t>(r), StringView(dst, len));
-            cursor += len;
-          }
-        }
-      }
-    });
-  }
-  if (nullPad_ > 0) {
-    for (int32_t i = 0; i < numCols; i++) {
-      const auto fi = outFieldIdx_[i];
-      if (fi < 0) {
-        continue;
-      }
-      const uint8_t byteMask = static_cast<uint8_t>(1u << (fi & 7));
-      const int32_t byteIdx = fi >> 3;
-      for (int32_t r = 0; r < n; r++) {
-        if (hostNulls_[static_cast<int64_t>(r) * nullPad_ + byteIdx] & byteMask) {
-          children[i]->setNull(r, true);
-        }
-      }
-    }
-  }
+  auto out = hostRows->materialize();
   addRuntimeStat(
       "rowSortHostExtractNanos",
       RuntimeCounter(
@@ -856,9 +712,7 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
               std::chrono::steady_clock::now() - tpExtract)
               .count(),
           RuntimeCounter::Unit::kNanos));
-  addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
-  return std::make_shared<RowVector>(
-      pool(), outputType_, nullptr, n, std::move(children));
+  return out;
 }
 
 // Device transpose of one chunk of sorted rows into cudf columns, in
