@@ -114,12 +114,16 @@ class RowOrderBy : public CudfOperatorBase {
   int32_t nullPad_ = 0; // sidecar stride padded to 8 for the row gather
   bool hasStrings_ = false;
   int32_t rowIdField_ = -1;
-  std::vector<std::shared_ptr<BoundaryHostStore>> stores_;
-  std::vector<int64_t> storeBases_; // global rowid base per store
-  // Coalesced per-store columns of the deferred output columns
-  // [store][deferred col], built while the device sorts.
-  std::vector<std::vector<VectorPtr>> storeCols_;
-  void coalesceStores();
+  // ONE host store for the whole sort (coalesced mode): the retained pack
+  // batches are re-added in GPU concatenation order, so the global row index
+  // == __rowid base + local; coalesced while the device sorts, then gathered
+  // with HybridContainer's coalesced-mode extraction.
+  std::unique_ptr<BoundaryHostStore> sortStore_;
+  std::vector<const char*> rowsScratch_;
+  std::vector<exec::HybridRowId> idsScratch_;
+  // Deferred + CPU exit: only the sorted __rowid column is kept on the device.
+  bool idsOnly_ = false;
+  rmm::device_buffer sortedIds_;
   rmm::device_buffer fieldsBuffer_; // FieldDesc[] on device
 
   // ---- sorted data ----

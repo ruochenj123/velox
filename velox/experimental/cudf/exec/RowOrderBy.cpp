@@ -21,6 +21,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -261,15 +262,15 @@ void RowOrderBy::concatenateRowInputs() {
       // holds only the matches, while its rowids index the whole store.
       auto store = v->provenanceStore();
       VELOX_CHECK_NOT_NULL(store);
-      int64_t base;
-      if (!stores_.empty() && stores_.back() == store) {
-        base = storeBases_.back(); // several batches of one store
-      } else {
-        base = idSpaceSoFar;
-        stores_.push_back(store);
-        storeBases_.push_back(base);
-        idSpaceSoFar += store->totalRows();
+      if (sortStore_ == nullptr) {
+        sortStore_ = std::make_unique<BoundaryHostStore>(
+            store->rowType(), pool(), /*scattered=*/false);
       }
+      const int64_t base = sortStore_->totalRows();
+      for (const auto& b : store->batches()) {
+        sortStore_->addBatch(b);
+      }
+      idSpaceSoFar += store->totalRows();
       addInt64Field(
           dst,
           static_cast<int32_t>(n),
@@ -378,6 +379,23 @@ void RowOrderBy::sortRows() {
     keyMasks.push_back(std::move(mask));
   }
 
+  // Deferred payload: coalesce the retained batches on a background thread
+  // (HybridContainer::coalesceBatches, as the CPU hybrid sort does in
+  // SortBuffer), overlapped with the device sort below; joined before the
+  // first host gather.
+  idsOnly_ = emitHost_ == 1 && !deferredCols_.empty();
+  std::thread coalesceThread;
+  std::exception_ptr coalesceError;
+  const auto tpCoalesce = std::chrono::steady_clock::now();
+  if (sortStore_ != nullptr && !deferredCols_.empty()) {
+    coalesceThread = std::thread([&]() {
+      try {
+        sortStore_->coalesce();
+      } catch (...) {
+        coalesceError = std::current_exception();
+      }
+    });
+  }
   cudaEvent_t evSortBegin, evSortEnd, evGatherEnd;
   cudaEventCreate(&evSortBegin);
   cudaEventCreate(&evSortEnd);
@@ -389,12 +407,37 @@ void RowOrderBy::sortRows() {
   cudaEventRecord(evSortEnd, stream_.value());
   const int32_t* permData = perm->view().data<int32_t>();
 
-  // One gather of whole rows by the permutation (slots copied verbatim;
-  // the heap is shared, so string offsets stay valid).
-  rmm::device_buffer gathered(sorted_.size(), stream_);
-  gatherRowsWarp(
-      store, permData, n, static_cast<uint8_t*>(gathered.data()), stream_.value());
-  if (nullPad_ > 0) {
+  rmm::device_buffer gathered;
+  if (idsOnly_) {
+    // Deferred + CPU exit: permute ONLY the __rowid column (8 B/row); the
+    // crossing rows themselves are never needed again.
+    rmm::device_buffer idsCol(static_cast<size_t>(n) * 8, stream_);
+    extractKeysFromRows(
+        store, fields_[rowIdField_].offset, 8, idsCol.data(), stream_.value());
+    cudf::column_view idsView(
+        cudf::data_type{cudf::type_id::INT64}, n, idsCol.data(), nullptr, 0);
+    auto permuted = cudf::gather(
+        cudf::table_view({idsView}),
+        perm->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream_,
+        get_output_mr());
+    sortedIds_ = rmm::device_buffer(static_cast<size_t>(n) * 8, stream_);
+    cudaMemcpyAsync(
+        sortedIds_.data(),
+        permuted->get_column(0).view().data<int64_t>(),
+        static_cast<size_t>(n) * 8,
+        cudaMemcpyDeviceToDevice,
+        stream_.value());
+    stream_.synchronize(); // permuted's storage is released at scope exit
+  } else {
+    // One gather of whole rows by the permutation (slots copied verbatim;
+    // the heap is shared, so string offsets stay valid).
+    gathered = rmm::device_buffer(sorted_.size(), stream_);
+    gatherRowsWarp(
+        store, permData, n, static_cast<uint8_t*>(gathered.data()), stream_.value());
+  }
+  if (!idsOnly_ && nullPad_ > 0) {
     GpuFixedRowStore nstore;
     nstore.row_buffer = static_cast<uint8_t*>(sortedNulls_.data());
     nstore.row_width = nullPad_;
@@ -408,13 +451,13 @@ void RowOrderBy::sortRows() {
     sortedNulls_ = std::move(gatheredNulls);
   }
   cudaEventRecord(evGatherEnd, stream_.value());
-  // While the device sorts and gathers, COALESCE the retained host batches
-  // into contiguous per-store columns (the CPU hybrid sort's trick,
-  // overlapped here with the GPU sort): the final permutation gather then
-  // does one plain indexed read per cell instead of a per-batch scattered
-  // extraction.
-  const auto tpCoalesce = std::chrono::steady_clock::now();
-  coalesceStores();
+  stream_.synchronize();
+  if (coalesceThread.joinable()) {
+    coalesceThread.join();
+    if (coalesceError) {
+      std::rethrow_exception(coalesceError);
+    }
+  }
   addRuntimeStat(
       "rowSortCoalesceNanos",
       RuntimeCounter(
@@ -422,7 +465,6 @@ void RowOrderBy::sortRows() {
               std::chrono::steady_clock::now() - tpCoalesce)
               .count(),
           RuntimeCounter::Unit::kNanos));
-  stream_.synchronize();
   {
     float msSort = 0, msGather = 0;
     cudaEventElapsedTime(&msSort, evSortBegin, evSortEnd);
@@ -445,7 +487,11 @@ void RowOrderBy::sortRows() {
     cudaEventDestroy(evSortEnd);
     cudaEventDestroy(evGatherEnd);
   }
-  sorted_ = std::move(gathered);
+  if (!idsOnly_) {
+    sorted_ = std::move(gathered);
+  } else {
+    sorted_ = rmm::device_buffer{}; // rows not needed: ids only
+  }
   addRuntimeStat(
       "rowSortNanos",
       RuntimeCounter(
@@ -484,7 +530,7 @@ void RowOrderBy::resolveOutputOnce() {
       outFieldIdx_[i] = fi;
     } else {
       VELOX_CHECK(
-          !stores_.empty(),
+          sortStore_ != nullptr,
           "RowOrderBy: column '{}' absent from the row layout and no "
           "provenance store",
           outputType_->nameOf(i));
@@ -523,141 +569,22 @@ void RowOrderBy::doNoMoreInput() {
   DeferralStats::instance().recordSurvived(orderByNode_->id(), totalRows_);
 }
 
-// Per-store contiguous columns of every deferred output column, in store
-// (= global rowid) order. Each store is extracted once, sequentially, by
-// its own thread; the store's batches are released as soon as its columns
-// are coalesced (peak host memory ~ +1 store).
-void RowOrderBy::coalesceStores() {
-  const size_t S = stores_.size();
-  const size_t D = deferredCols_.size();
-  storeCols_.assign(S, {});
-  if (S == 0 || D == 0) {
-    return;
-  }
-  std::vector<int32_t> childIdx(D);
-  for (size_t d = 0; d < D; d++) {
-    childIdx[d] = static_cast<int32_t>(stores_[0]->rowType()->getChildIdx(
-        outputType_->nameOf(deferredCols_[d])));
-  }
-  parallelRows(
-      static_cast<int64_t>(S),
-      [&](int64_t b, int64_t e, int /*t*/) {
-        std::vector<exec::HybridRowId> rowIds;
-        std::vector<const char*> sentinels;
-        std::vector<int32_t> seq;
-        for (int64_t k = b; k < e; k++) {
-          const auto m = static_cast<int32_t>(stores_[k]->totalRows());
-          seq.resize(m);
-          std::iota(seq.begin(), seq.end(), 0);
-          stores_[k]->idsForGlobalRows(seq.data(), m, rowIds);
-          auto& cols = storeCols_[k];
-          cols.resize(D);
-          for (size_t d = 0; d < D; d++) {
-            auto vec = BaseVector::create(
-                outputType_->childAt(deferredCols_[d]), m, pool());
-            stores_[k]->gather(childIdx[d], rowIds, vec, sentinels);
-            cols[d] = std::move(vec);
-          }
-          stores_[k].reset(); // free the retained batches
-        }
-      },
-      /*kMinPerThread=*/1);
-}
-
+// Host gather of the deferred columns at the sorted GLOBAL row ids:
+// HybridContainer's coalesced-mode extraction over the single sort store.
 std::vector<VectorPtr> RowOrderBy::gatherDeferred(
     const std::vector<int64_t>& gids,
     int32_t n) {
-  const size_t S = storeCols_.size();
+  VELOX_CHECK_NOT_NULL(sortStore_);
   const size_t D = deferredCols_.size();
-  // global id -> (store, local) once for all columns.
-  std::vector<int32_t> storeOf(n), localOf(n);
-  parallelRows(n, [&](int64_t b, int64_t e, int /*t*/) {
-    for (int64_t i = b; i < e; i++) {
-      const auto it =
-          std::upper_bound(storeBases_.begin(), storeBases_.end(), gids[i]);
-      const auto k = static_cast<int32_t>(it - storeBases_.begin() - 1);
-      storeOf[i] = k;
-      localOf[i] = static_cast<int32_t>(gids[i] - storeBases_[k]);
-    }
-  });
+  const auto& storeType = sortStore_->rowType();
   std::vector<VectorPtr> out(D);
   for (size_t d = 0; d < D; d++) {
     const auto& type = outputType_->childAt(deferredCols_[d]);
+    const auto childIdx = static_cast<int32_t>(
+        storeType->getChildIdx(outputType_->nameOf(deferredCols_[d])));
     auto res = BaseVector::create(type, n, pool());
-    bool anyNulls = false;
-    for (size_t k = 0; k < S; k++) {
-      anyNulls = anyNulls || storeCols_[k][d]->mayHaveNulls();
-    }
-    if (type->kind() == TypeKind::VARCHAR || type->kind() == TypeKind::VARBINARY) {
-      // Views from the per-store columns; bytes copied into ONE shared
-      // buffer (per-range totals first), set without copying.
-      std::vector<const StringView*> src(S);
-      for (size_t k = 0; k < S; k++) {
-        src[k] = storeCols_[k][d]->template asFlatVector<StringView>()->rawValues();
-      }
-      auto* fv = res->template asFlatVector<StringView>();
-      std::vector<int64_t> rangeBytes(kMaxEmitThreads, 0);
-      parallelRows(n, [&](int64_t b, int64_t e, int t) {
-        int64_t bytes = 0;
-        for (int64_t i = b; i < e; i++) {
-          const auto& v = src[storeOf[i]][localOf[i]];
-          if (!v.isInline()) {
-            bytes += v.size();
-          }
-        }
-        rangeBytes[t] = bytes;
-      });
-      int64_t total = 0;
-      std::vector<int64_t> rangeBase(kMaxEmitThreads, 0);
-      for (int t = 0; t < kMaxEmitThreads; t++) {
-        rangeBase[t] = total;
-        total += rangeBytes[t];
-      }
-      char* base = nullptr;
-      if (total > 0) {
-        auto buf = AlignedBuffer::allocate<char>(total, pool());
-        base = buf->asMutable<char>();
-        fv->setStringBuffers({buf});
-      }
-      parallelRows(n, [&](int64_t b, int64_t e, int t) {
-        int64_t cursor = rangeBase[t];
-        for (int64_t i = b; i < e; i++) {
-          const auto& v = src[storeOf[i]][localOf[i]];
-          if (v.isInline()) {
-            fv->setNoCopy(static_cast<vector_size_t>(i), v);
-          } else {
-            char* dst = base + cursor;
-            std::memcpy(dst, v.data(), v.size());
-            fv->setNoCopy(static_cast<vector_size_t>(i), StringView(dst, v.size()));
-            cursor += v.size();
-          }
-        }
-      });
-    } else {
-      VELOX_CHECK(
-          type->kind() != TypeKind::BOOLEAN,
-          "RowOrderBy: BOOLEAN deferred payload not supported");
-      const int32_t w = static_cast<int32_t>(type->cppSizeInBytes());
-      std::vector<const uint8_t*> src(S);
-      for (size_t k = 0; k < S; k++) {
-        src[k] = static_cast<const uint8_t*>(storeCols_[k][d]->valuesAsVoid());
-      }
-      auto* dst = static_cast<uint8_t*>(const_cast<void*>(res->valuesAsVoid()));
-      VELOX_CHECK_NOT_NULL(dst);
-      parallelRows(n, [&](int64_t b, int64_t e, int /*t*/) {
-        for (int64_t i = b; i < e; i++) {
-          std::memcpy(
-              dst + i * w, src[storeOf[i]] + static_cast<int64_t>(localOf[i]) * w, w);
-        }
-      });
-    }
-    if (anyNulls) {
-      for (int32_t i = 0; i < n; i++) {
-        if (storeCols_[storeOf[i]][d]->isNullAt(localOf[i])) {
-          res->setNull(i, true);
-        }
-      }
-    }
+    sortStore_->gatherCoalesced(
+        childIdx, gids.data(), n, res, rowsScratch_, idsScratch_);
     out[d] = std::move(res);
   }
   addRuntimeStat(
@@ -672,23 +599,16 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     // GPU-side (key) columns are transposed on the device and brought over
     // as columns. The rows themselves never cross.
     prefetchBegin_ = -1;
-    const uint8_t* base =
-        static_cast<const uint8_t*>(sorted_.data()) + begin * rowWidth_;
-    const uint8_t* nullBase = nullPad_ > 0
-        ? static_cast<const uint8_t*>(sortedNulls_.data()) + begin * nullPad_
-        : nullptr;
     const int32_t numCols = outputType_->size();
-    // Ids-only crossing: transpose just the __rowid field of this chunk.
-    rmm::device_buffer idsDev(static_cast<size_t>(n) * 8, stream_);
-    {
-      std::vector<FieldDesc> f{fields_[rowIdField_]};
-      std::vector<uint8_t*> ptrs{static_cast<uint8_t*>(idsDev.data())};
-      rowsToColumns(base, f.data(), ptrs.data(), 1, n, rowWidth_, stream_.value());
-    }
+    // Ids-only crossing: the sorted __rowid column, D2H'd per chunk.
+    VELOX_CHECK(idsOnly_);
     std::vector<int64_t> gids(n);
     cudaMemcpyAsync(
-        gids.data(), idsDev.data(), static_cast<size_t>(n) * sizeof(int64_t),
-        cudaMemcpyDeviceToHost, stream_.value());
+        gids.data(),
+        static_cast<const int64_t*>(sortedIds_.data()) + begin,
+        static_cast<size_t>(n) * sizeof(int64_t),
+        cudaMemcpyDeviceToHost,
+        stream_.value());
     stream_.synchronize();
     std::vector<VectorPtr> children(numCols);
     const auto tpHG = std::chrono::steady_clock::now();
@@ -1123,8 +1043,8 @@ RowVectorPtr RowOrderBy::doGetOutput() {
 void RowOrderBy::doClose() {
   Operator::close();
   rowInputs_.clear();
-  stores_.clear();
-  storeCols_.clear();
+  sortStore_.reset();
+  sortedIds_ = rmm::device_buffer{};
   sorted_ = rmm::device_buffer{};
   sortedNulls_ = rmm::device_buffer{};
   heap_ = rmm::device_buffer{};

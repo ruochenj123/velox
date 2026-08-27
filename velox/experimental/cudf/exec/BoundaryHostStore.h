@@ -52,14 +52,22 @@ class BoundaryHostStore {
  public:
   /// `rowType` is the retained batches' full row type (all columns, in input
   /// child order); extraction addresses columns by child index in this type.
-  BoundaryHostStore(const RowTypePtr& rowType, memory::MemoryPool* pool)
+  /// `scattered` (default, the probe's per-batch store): row ids encode
+  /// (batch, row) and extraction reads the batches in place. `false` (the
+  /// sort's single store): batches are merged by coalesce() into one
+  /// contiguous batch and row ids are global indices (HybridContainer's
+  /// coalesced mode, the CPU hybrid sort's own path).
+  BoundaryHostStore(
+      const RowTypePtr& rowType,
+      memory::MemoryPool* pool,
+      bool scattered = true)
       : rowType_(rowType),
         dummyKeys_(std::vector<TypePtr>{BIGINT()}, pool),
         container_(
             /*keyTypes=*/{},
             rowType->children(),
             &dummyKeys_) {
-    container_.setScatteredModeEnabled(true);
+    container_.setScatteredModeEnabled(scattered);
     container_.setId(0);
     // Register self so the single-container scattered fast path applies.
     std::unordered_map<uint8_t, exec::HybridContainer*> self{{0, &container_}};
@@ -81,14 +89,50 @@ class BoundaryHostStore {
         "BoundaryHostStore: too many retained batches for scattered encoding");
     batchStarts_.push_back(totalRows_);
     totalRows_ += batch->size();
+    batches_.push_back(batch);
     container_.addPayload(std::move(batch));
     return batchId;
+  }
+
+  /// The retained batches, in the order added (a blocking consumer such as
+  /// the sort re-adds them to its own single store).
+  const std::vector<RowVectorPtr>& batches() const {
+    return batches_;
+  }
+
+  /// Coalesced mode only: merge all retained batches into one contiguous
+  /// batch (HybridContainer::coalesceBatches -- column-at-a-time, sources
+  /// released as copied). Safe to run on a background thread as long as
+  /// nothing else touches this store meanwhile.
+  void coalesce() {
+    container_.coalesceBatches();
+  }
+
+  /// Coalesced mode only: gather column `childIdx` at GLOBAL row ids.
+  void gatherCoalesced(
+      int32_t childIdx,
+      const int64_t* globalRows,
+      int32_t numRows,
+      const VectorPtr& result,
+      std::vector<const char*>& rowsScratch,
+      std::vector<exec::HybridRowId>& idsScratch) const {
+    idsScratch.resize(numRows);
+    for (int32_t i = 0; i < numRows; ++i) {
+      idsScratch[i] = exec::HybridRowId{0, static_cast<uint64_t>(globalRows[i])};
+    }
+    static const char kSentinel = 0;
+    if (static_cast<int32_t>(rowsScratch.size()) < numRows) {
+      rowsScratch.assign(numRows, &kSentinel);
+    }
+    const_cast<exec::HybridContainer&>(container_).extractColumn(
+        rowsScratch.data(), numRows, childIdx, result, idsScratch);
   }
 
   /// Drop all retained batches (per-probe-batch reuse: the probe retains one
   /// GPU batch's host payload, gathers survivors, then clears).
   void clearBatches() {
     container_.clear();
+    batches_.clear();
     batchStarts_.clear();
     totalRows_ = 0;
   }
@@ -169,6 +213,7 @@ class BoundaryHostStore {
   exec::HybridContainer container_;
   // batchStarts_[b] = global row id of the first row of batch b.
   std::vector<int64_t> batchStarts_;
+  std::vector<RowVectorPtr> batches_;
   int64_t totalRows_ = 0;
 };
 
