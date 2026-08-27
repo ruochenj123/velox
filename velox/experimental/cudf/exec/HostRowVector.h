@@ -99,7 +99,77 @@ class HostRowVector : public RowVector, public MaterializableVector {
       int32_t nullStride,
       std::vector<int32_t> nullBits = {})
       : RowVector(pool, type, nullptr, n, std::vector<VectorPtr>{}),
+        rows_(std::make_shared<const std::vector<uint8_t>>(std::move(rows))),
+        offset_(0),
+        rowWidth_(rowWidth),
+        fields_(std::make_shared<const std::vector<FieldDesc>>(
+            std::move(fields))),
+        chars_(std::move(chars)),
+        nulls_(std::make_shared<const std::vector<uint8_t>>(std::move(nulls))),
+        nullStride_(nullStride),
+        nullBits_(std::make_shared<const std::vector<int32_t>>(
+            std::move(nullBits))) {}
+
+  /// A view of rows [offset, offset + n) sharing every buffer (no copy):
+  /// lets the exit emit Velox-sized output batches from one D2H'd chunk.
+  VectorPtr slice(vector_size_t offset, vector_size_t n) const override {
+    return std::shared_ptr<HostRowVector>(new HostRowVector(
+        pool(),
+        asRowType(type()),
+        n,
+        rows_,
+        offset_ + offset,
+        rowWidth_,
+        fields_,
+        chars_,
+        nulls_,
+        nullStride_,
+        nullBits_));
+  }
+
+  RowVectorPtr materialize() const override {
+    return extractHostRows(
+        pool(),
+        asRowType(type()),
+        size(),
+        rows_->data() + static_cast<int64_t>(offset_) * rowWidth_,
+        rowWidth_,
+        *fields_,
+        chars_ ? chars_->data() : nullptr,
+        nulls_->empty() ? nullptr
+                        : nulls_->data() +
+                static_cast<int64_t>(offset_) * nullStride_,
+        nullStride_,
+        nullBits_->empty() ? nullptr : nullBits_.get());
+  }
+
+  int64_t rowBytes() const {
+    return static_cast<int64_t>(size()) * rowWidth_;
+  }
+
+  /// Bytes this vector represents (rows x stride): drives Velox's output
+  /// batch sizing (outputBatchRows) the same way a flat RowVector would.
+  uint64_t estimateFlatSize() const override {
+    return static_cast<uint64_t>(size()) * rowWidth_;
+  }
+
+ private:
+  // View constructor (slice): shares all buffers.
+  HostRowVector(
+      memory::MemoryPool* pool,
+      RowTypePtr type,
+      vector_size_t n,
+      std::shared_ptr<const std::vector<uint8_t>> rows,
+      vector_size_t offset,
+      int32_t rowWidth,
+      std::shared_ptr<const std::vector<FieldDesc>> fields,
+      std::shared_ptr<const std::vector<uint8_t>> chars,
+      std::shared_ptr<const std::vector<uint8_t>> nulls,
+      int32_t nullStride,
+      std::shared_ptr<const std::vector<int32_t>> nullBits)
+      : RowVector(pool, type, nullptr, n, std::vector<VectorPtr>{}),
         rows_(std::move(rows)),
+        offset_(offset),
         rowWidth_(rowWidth),
         fields_(std::move(fields)),
         chars_(std::move(chars)),
@@ -107,32 +177,14 @@ class HostRowVector : public RowVector, public MaterializableVector {
         nullStride_(nullStride),
         nullBits_(std::move(nullBits)) {}
 
-  RowVectorPtr materialize() const override {
-    return extractHostRows(
-        pool(),
-        asRowType(type()),
-        size(),
-        rows_.data(),
-        rowWidth_,
-        fields_,
-        chars_ ? chars_->data() : nullptr,
-        nulls_.empty() ? nullptr : nulls_.data(),
-        nullStride_,
-        nullBits_.empty() ? nullptr : &nullBits_);
-  }
-
-  int64_t rowBytes() const {
-    return static_cast<int64_t>(rows_.size());
-  }
-
- private:
-  std::vector<uint8_t> rows_;
+  std::shared_ptr<const std::vector<uint8_t>> rows_;
+  vector_size_t offset_; // first row of this view within rows_
   int32_t rowWidth_;
-  std::vector<FieldDesc> fields_;
+  std::shared_ptr<const std::vector<FieldDesc>> fields_;
   std::shared_ptr<const std::vector<uint8_t>> chars_; // heap, shareable
-  std::vector<uint8_t> nulls_;
+  std::shared_ptr<const std::vector<uint8_t>> nulls_;
   int32_t nullStride_;
-  std::vector<int32_t> nullBits_; // per output column; empty = column index
+  std::shared_ptr<const std::vector<int32_t>> nullBits_; // empty = col index
 };
 
 } // namespace facebook::velox::cudf_velox

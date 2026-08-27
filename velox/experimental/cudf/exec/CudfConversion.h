@@ -291,6 +291,7 @@ class CudfToVelox : public CudfOperatorBase {
   std::deque<CudfVectorPtr> inputs_;
   // Non-CudfVector inputs that pass through without D2H conversion
   std::deque<RowVectorPtr> passthroughInputs_;
+  vector_size_t passthroughCursor_{0}; // rows of the front already emitted
   // Converted CPU-side buffer being drained by successive doGetOutput() calls.
   RowVectorPtr veloxBuffer_;
   // Current offset into veloxBuffer_ for the next slice.

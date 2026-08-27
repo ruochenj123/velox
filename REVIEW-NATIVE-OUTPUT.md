@@ -109,3 +109,14 @@ Gates (harness native4): Q31 both orientations + q3/q9, 20/20; all 22
 TPC-H queries at SF1 row/bnd/bnda vs cpu: all pass except q15 (unsupported
 on every GPU arm before this round). Table-B regression rerun: see
 `FINDINGS-factorial.md` (results/singleop_joinhit_flip_scat_native4).
+
+## Round 7 (2026-08-26, sort review spill-over): output batch parity at the row-path exits
+
+The row-path exits emitted one batch per probe input batch (~1M x selectivity
+rows) while the baselines emit <=10K rows (Velox `outputBatchRows`; the cudf
+path slices its converted output by the same rule in `CudfToVelox`). Now
+`CudfToVelox`'s pass-through drains non-cudf inputs in `outputBatchRows()`-sized
+pieces: `RowVector::slice` for the deferred columnar output, and a new
+`HostRowVector::slice` (a view sharing the row/heap/null buffers; `materialize`
+honors the offset; `estimateFlatSize` = rows x stride so the batch rule sees
+the real size). Files: `HostRowVector.h`, `CudfConversion.{cpp,h}`.

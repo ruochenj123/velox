@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/exec/HostRowVector.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/BenchmarkTimelineFlag.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
@@ -1376,10 +1377,32 @@ RowVectorPtr CudfToVelox::doGetOutput() {
     return nullptr;
   }
 
-  // Drain passthrough inputs first (e.g. skip_output CPU RowVectors)
+  // Drain passthrough inputs first (skip_output CPU RowVectors; the row
+  // path's native exits: HostRowVector / deferred columnar RowVector).
+  // Emit them in Velox-sized output batches (outputBatchRows), exactly as
+  // the cudf path slices its converted output -- parity across arms.
   if (!passthroughInputs_.empty()) {
-    auto result = std::move(passthroughInputs_.front());
-    passthroughInputs_.pop_front();
+    auto& front = passthroughInputs_.front();
+    const auto total = front->size();
+    const auto target = std::max<vector_size_t>(
+        1, outputBatchRows(front->estimateFlatSize() / std::max<vector_size_t>(1, total)));
+    RowVectorPtr result;
+    if (passthroughCursor_ == 0 && total <= target) {
+      result = std::move(front);
+      passthroughInputs_.pop_front();
+      passthroughCursor_ = 0;
+    } else {
+      const auto n = std::min<vector_size_t>(target, total - passthroughCursor_);
+      // HostRowVector overrides slice() with a shared view; a columnar
+      // RowVector slices its children.
+      result = std::static_pointer_cast<RowVector>(
+          front->slice(passthroughCursor_, n));
+      passthroughCursor_ += n;
+      if (passthroughCursor_ >= total) {
+        passthroughInputs_.pop_front();
+        passthroughCursor_ = 0;
+      }
+    }
     finished_ = noMoreInput_ && inputs_.empty() && passthroughInputs_.empty();
     return result;
   }
