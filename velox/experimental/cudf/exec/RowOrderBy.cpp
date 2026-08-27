@@ -463,6 +463,8 @@ void RowOrderBy::resolveOutputOnce() {
     return;
   }
   emitHost_ = 0;
+  chunkRows_ = std::max<int32_t>(
+      1, outputBatchRows(static_cast<uint64_t>(rowWidth_ + nullPad_)));
   if (auto* driver = operatorCtx_->driver()) {
     const auto ops = driver->operators();
     for (size_t i = 0; i + 1 < ops.size(); i++) {
@@ -755,7 +757,7 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
   const int64_t nextBegin = begin + n;
   if (nextBegin < totalRows_) {
     const auto nextN = static_cast<size_t>(
-        std::min<int64_t>(kChunkRows, totalRows_ - nextBegin));
+        std::min<int64_t>(chunkRows_, totalRows_ - nextBegin));
     hostRows_.resize(nextN * rowWidth_);
     cudaMemcpyAsync(
         hostRows_.data(),
@@ -1107,7 +1109,7 @@ RowVectorPtr RowOrderBy::doGetOutput() {
     return nullptr;
   }
   const auto n =
-      static_cast<int32_t>(std::min<int64_t>(kChunkRows, totalRows_ - cursor_));
+      static_cast<int32_t>(std::min<int64_t>(chunkRows_, totalRows_ - cursor_));
   const int64_t begin = cursor_;
   cursor_ += n;
   auto out = emitHost_ == 1 ? emitHostChunk(begin, n)

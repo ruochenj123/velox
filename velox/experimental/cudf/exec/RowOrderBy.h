@@ -67,7 +67,10 @@ class RowOrderBy : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  static constexpr int32_t kChunkRows = 1 << 20;
+  // Output batch size: Velox's own rule (preferred_output_batch_bytes /
+  // row size, capped at max_output_batch_rows), the same sizing the
+  // baseline OrderBy and CudfToVelox use -- resolved once with the layout.
+  int32_t chunkRows_ = 1 << 20;
 
   void captureLayout(const RowStoreVector& v);
   void concatenateRowInputs();
