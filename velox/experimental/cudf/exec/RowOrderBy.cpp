@@ -489,6 +489,15 @@ void RowOrderBy::resolveOutputOnce() {
       deferredCols_.push_back(static_cast<int32_t>(i));
     }
   }
+  // Deferred + CPU exit: ids-only crossing. Every output column -- keys
+  // included -- is gathered on the host from the retained batches, so the
+  // sorted rows never cross and no device transpose is needed.
+  if (emitHost_ == 1 && !deferredCols_.empty()) {
+    deferredCols_.clear();
+    for (size_t i = 0; i < outputType_->size(); i++) {
+      deferredCols_.push_back(static_cast<int32_t>(i));
+    }
+  }
   addRuntimeStat(
       "rowSortEmitHost", RuntimeCounter(static_cast<int64_t>(emitHost_)));
 }
@@ -667,16 +676,17 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
         ? static_cast<const uint8_t*>(sortedNulls_.data()) + begin * nullPad_
         : nullptr;
     const int32_t numCols = outputType_->size();
-    // Transpose FIRST (round 6): the chunk goes rows -> columns once on the
-    // device, with __rowid as one more column; the ids are read from it.
-    auto gpuCols = transposeChunkColumns(base, nullBase, n, true);
-    auto rowIdCol = std::move(gpuCols.back());
-    gpuCols.pop_back();
+    // Ids-only crossing: transpose just the __rowid field of this chunk.
+    rmm::device_buffer idsDev(static_cast<size_t>(n) * 8, stream_);
+    {
+      std::vector<FieldDesc> f{fields_[rowIdField_]};
+      std::vector<uint8_t*> ptrs{static_cast<uint8_t*>(idsDev.data())};
+      rowsToColumns(base, f.data(), ptrs.data(), 1, n, rowWidth_, stream_.value());
+    }
     std::vector<int64_t> gids(n);
     cudaMemcpyAsync(
-        gids.data(), rowIdCol->view().data<int64_t>(),
-        static_cast<size_t>(n) * sizeof(int64_t), cudaMemcpyDeviceToHost,
-        stream_.value());
+        gids.data(), idsDev.data(), static_cast<size_t>(n) * sizeof(int64_t),
+        cudaMemcpyDeviceToHost, stream_.value());
     stream_.synchronize();
     std::vector<VectorPtr> children(numCols);
     const auto tpHG = std::chrono::steady_clock::now();
@@ -690,31 +700,6 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
             RuntimeCounter::Unit::kNanos));
     for (size_t k = 0; k < deferredCols_.size(); k++) {
       children[deferredCols_[k]] = std::move(cols[k]);
-    }
-    std::vector<std::unique_ptr<cudf::column>> subset;
-    std::vector<std::string> names;
-    std::vector<TypePtr> types;
-    std::vector<int32_t> subsetIdx;
-    for (int32_t i = 0; i < numCols; i++) {
-      if (gpuCols[i] != nullptr) {
-        subset.push_back(std::move(gpuCols[i]));
-        names.push_back(outputType_->nameOf(i));
-        types.push_back(outputType_->childAt(i));
-        subsetIdx.push_back(i);
-      }
-    }
-    if (!subset.empty()) {
-      auto tbl = std::make_unique<cudf::table>(std::move(subset));
-      auto host = with_arrow::toVeloxColumn(
-          tbl->view(),
-          pool(),
-          std::static_pointer_cast<const Type>(
-              ROW(std::move(names), std::move(types))),
-          stream_,
-          get_output_mr());
-      for (size_t k = 0; k < subsetIdx.size(); k++) {
-        children[subsetIdx[k]] = host->childAt(k);
-      }
     }
     addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
     return std::make_shared<RowVector>(

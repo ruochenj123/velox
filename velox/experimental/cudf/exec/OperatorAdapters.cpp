@@ -693,8 +693,8 @@ class OrderByAdapter : public OperatorAdapter {
 
 /// RowOrderByAdapter - Replaces OrderBy with RowOrderBy (row-wise GPU sort,
 /// branch row-sort 2026-08-24). Registered ahead of OrderByAdapter when
-/// benchmarkRowSort is on; accepts RowStoreVector (row joins / row pack)
-/// and CudfVector (transposed) input.
+/// benchmarkRowSort is on; takes the row pack's RowStoreVector input, so it
+/// applies only to a sort fed from the CPU scan (canRunOnGPU).
 class RowOrderByAdapter : public OperatorAdapter {
  public:
   RowOrderByAdapter() : OperatorAdapter("RowOrderBy") {}
@@ -707,8 +707,30 @@ class RowOrderByAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
-        nullptr;
+    auto sort = std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+    if (sort == nullptr) {
+      return false;
+    }
+    // The row sort takes the row pack's output only: it applies when the
+    // sort is the FIRST GPU operator of its pipeline, i.e. its input comes
+    // from the CPU scan (through Filter/Project and optionally a gather
+    // LocalPartition). A sort fed by a GPU operator (aggregation, cudf
+    // join, ...) stays cudf's OrderBy on columnar input.
+    core::PlanNodePtr n =
+        sort->sources().empty() ? nullptr : sort->sources()[0];
+    while (n != nullptr) {
+      if (std::dynamic_pointer_cast<const core::TableScanNode>(n)) {
+        return true;
+      }
+      if (std::dynamic_pointer_cast<const core::FilterNode>(n) ||
+          std::dynamic_pointer_cast<const core::ProjectNode>(n) ||
+          std::dynamic_pointer_cast<const core::LocalPartitionNode>(n)) {
+        n = n->sources().empty() ? nullptr : n->sources()[0];
+        continue;
+      }
+      return false;
+    }
+    return false;
   }
 
   bool acceptsGpuInput() const override {
