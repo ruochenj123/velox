@@ -152,6 +152,50 @@ struct CudfConfig {
   bool benchmarkRowOutputNative{false};
   double benchmarkDeferralThreshold{0.5};
 
+  /// Row pack (cpu_col_to_row): pack rows in tiles of this many rows so a
+  /// tile (rows x rowWidth) stays cache-resident across the column passes.
+  /// 0 = one tile per input batch (whole batch, historical behaviour).
+  int32_t benchmarkPackTileRows{0};
+
+  /// Deferred row sort exit: host-gather the deferred payload columns of
+  /// each output chunk on this many threads (columns split across threads;
+  /// 0/1 = the operator thread only).
+  /// -1 = auto: min(48, hardware_concurrency); 0/1 = operator thread only.
+  /// Selective hybrid execution: defer the payload only when the columns
+  /// kept on the host are at least this many bytes per row. With a
+  /// key-only projection the deferred "payload" is a couple of narrow
+  /// columns and the host gather costs more than the crossing it saves.
+  /// 0 disables the gate.
+  int32_t benchmarkDeferMinPayloadBytes{8}; // 2026-09-17: was 48; now equal to the CPU join gate (rowRef width)
+
+  /// Row pack: stage the host-to-device transfer through a pinned block of
+  /// this many bytes instead of one buffer sized to the whole GPU batch.
+  /// The device batch is unchanged (one contiguous row store, same kernels);
+  /// only the staging is chunked, so pinned memory stays bounded and the
+  /// per-query page-locking cost stops scaling with the batch size.
+  /// 0 = one slot per batch (historical behaviour). Default 16 MiB: at the
+  /// 100K-row default GPU batch (~10 MB) a batch fits one block, so the
+  /// single-copy ship is preserved; larger batches are chunked.
+  int64_t benchmarkPackBlockBytes{16 << 20};
+
+  int32_t benchmarkSortGatherThreads{-1};
+  /// Deferred row sort exit: gather straight from the retained batches
+  /// (scattered ids) instead of coalescing them into one contiguous store
+  /// first (skips the serial HybridContainer::coalesceBatches pass).
+  bool benchmarkSortDeferredScattered{true};
+
+  /// Boundary-hybrid JOIN: keep the build side's retained host payload in
+  /// scattered (per-batch) layout (true, historical) or coalesce it into one
+  /// contiguous batch after the build so survivors are gathered with the
+  /// CPU hybrid join's optimized coalesced extraction (false = "layer 3").
+  bool benchmarkJoinDeferredScattered{true};
+
+  /// Boundary-hybrid: also defer the BUILD side's payload (ingress packs the
+  /// build's join keys + rowRef only; the build's payload is retained on the
+  /// host and gathered for survivors by the probe). Historical behaviour
+  /// (false) packs the build side eagerly.
+  bool benchmarkBoundaryBuildDefer{true};
+
   /// [Benchmark] When true, CudfHashJoinProbe skips cudf::gather entirely
   /// and returns a dummy 1-row output. Use to measure gather's true e2e
   /// impact by comparing e2e with vs without this flag.

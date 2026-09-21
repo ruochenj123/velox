@@ -1049,12 +1049,15 @@ class QueryConfig {
   /// variable-width types count 16. Dependents that are stored but never
   /// read count 0. Below the threshold the per-output-row row-id decode tax
   /// outweighs the row-store write savings, so hybrid is disabled.
+  /// 2026-09-12: default lowered from 24 to 8 (same break-even as the sort:
+  /// the payload must be wider than the 8-byte rowRef it replaces; with the
+  /// coalesced/prefetched extraction the per-output-row decode is cheap).
   VELOX_QUERY_CONFIG(
       kHybridJoinMinPayloadBytes,
       hybridJoinMinPayloadBytes,
       "hybrid_join_min_payload_bytes",
       uint32_t,
-      24,
+      8,
       "Minimum read payload bytes for hybrid join to stay enabled.")
 
   /// Minimum total nominal byte width of non-sort-key (payload) columns for

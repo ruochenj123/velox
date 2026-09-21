@@ -90,6 +90,7 @@ class RowOrderBy : public CudfOperatorBase {
   std::vector<std::unique_ptr<cudf::column>> gpuColsForChunk_;
   /// Host-gather the deferred output columns for `n` sorted rows whose
   /// GLOBAL rowids are `globalIds` (concatenation order).
+  static int32_t sortGatherThreads();
   std::vector<VectorPtr> gatherDeferred(
       const std::vector<int64_t>& globalIds,
       int32_t n);
@@ -121,8 +122,14 @@ class RowOrderBy : public CudfOperatorBase {
   std::unique_ptr<BoundaryHostStore> sortStore_;
   std::vector<const char*> rowsScratch_;
   std::vector<exec::HybridRowId> idsScratch_;
+  // Parallel deferred gather: per-thread scratch (see gatherDeferred).
+  std::vector<std::vector<const char*>> rowsScratchT_;
+  std::vector<std::vector<exec::HybridRowId>> idsScratchT_;
   // Deferred + CPU exit: only the sorted __rowid column is kept on the device.
   bool idsOnly_ = false;
+  // CPU exit after a join (2026-09-10): deferred columns come from the
+  // probe's retained store, the rest (eager build side) from the sorted rows.
+  bool mixedExit_ = false;
   rmm::device_buffer sortedIds_;
   rmm::device_buffer fieldsBuffer_; // FieldDesc[] on device
 

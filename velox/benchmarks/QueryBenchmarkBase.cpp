@@ -69,6 +69,13 @@ DEFINE_int32(
     0,
     "GB of process memory for cache and query.. if "
     "non-0, uses mmap to allocator and in-process data cache.");
+DEFINE_bool(
+    flatten_result,
+    true,
+    "Flatten dictionary/constant-encoded result vectors in the task sink "
+    "(on the driver thread, inside the timed window). GPU arms already emit "
+    "flat columns or native rows; this charges the CPU probe for "
+    "materializing its dictionary-wrapped probe-side output.");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
 DEFINE_int32(
     warmup,
@@ -144,7 +151,7 @@ DEFINE_bool(
 
 DEFINE_int32(
     hybrid_join_min_payload_bytes,
-    24,
+    8, // 2026-09-16: lowered from 24 to match QueryConfig (8-byte rowRef break-even)
     "Minimum nominal byte width of build-side payload columns actually read "
     "by the probe for hybrid join to stay enabled (matches QueryConfig "
     "default 24; set =0 to disable the gate)");
@@ -331,6 +338,9 @@ QueryBenchmarkBase::run(
       // native-layout result (HostRowVector) into an empty RowVector. The
       // task outlives result printing, so the originals stay valid.
       params.copyResult = false;
+  // Materialize encoded (dictionary-wrapped) results on the driver thread so
+  // every arm delivers materialized output inside the timed window.
+  params.flattenResult = FLAGS_flatten_result;
       params.maxDrivers = FLAGS_num_drivers;
       params.planNode = tpchPlan.plan;
       params.queryConfigs = queryConfigs;

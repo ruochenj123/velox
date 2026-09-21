@@ -661,6 +661,116 @@ __global__ void rebase_string_offsets_kernel(
   }
 }
 
+// Batched variant (2026-09-08): ONE launch for a whole concatenation.
+// Rows [batch_row_start[b], batch_row_start[b+1]) came from batch b whose heap
+// was copied to byte offset batch_heap_base[b] of the combined heap; every
+// out-of-line slot of such a row gets batch_heap_base[b] added. The batch of
+// a row is found by binary search over batch_row_start (num_batches+1
+// entries, last = total rows). Replaces one rebase launch per appended batch
+// in RowOrderBy::concatenateRowInputs and the RowHashJoin build append.
+__global__ void rebase_string_offsets_batched_kernel(
+    uint8_t* __restrict__ rows,
+    int64_t num_rows,
+    int32_t row_width,
+    const int32_t* __restrict__ str_field_offsets,
+    int32_t num_str_fields,
+    const int64_t* __restrict__ batch_row_start,
+    const int64_t* __restrict__ batch_heap_base,
+    int32_t num_batches) {
+  int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  // upper_bound(batch_row_start, row) - 1
+  int32_t lo = 0, hi = num_batches;
+  while (lo + 1 < hi) {
+    int32_t mid = (lo + hi) >> 1;
+    if (batch_row_start[mid] <= row) lo = mid; else hi = mid;
+  }
+  const int64_t delta = batch_heap_base[lo];
+  if (delta == 0) return;
+  uint8_t* r = rows + row * row_width;
+  for (int f = 0; f < num_str_fields; f++) {
+    uint8_t* slot = r + str_field_offsets[f];
+    if (slot_len(slot) > kRowStrInlineMax) {
+      slot_set_off(slot, slot_off(slot) + (uint64_t)delta);
+    }
+  }
+}
+
+void rebaseStringOffsetsBatched(
+    uint8_t* d_rows,
+    int64_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    const int64_t* d_batch_row_start,
+    const int64_t* d_batch_heap_base,
+    int32_t num_batches,
+    cudaStream_t stream) {
+  if (num_rows == 0 || num_str_fields == 0 || num_batches == 0) return;
+  int block = 256;
+  int64_t grid = (num_rows + block - 1) / block;
+  rebase_string_offsets_batched_kernel<<<(unsigned)grid, block, 0, stream>>>(
+      d_rows, num_rows, row_width, d_str_field_offsets, num_str_fields,
+      d_batch_row_start, d_batch_heap_base, num_batches);
+}
+
+__global__ void rewrite_row_id_kernel(
+    uint8_t* __restrict__ rows,
+    int64_t start_row,
+    int64_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    uint64_t tag) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_rows) return;
+  uint64_t v = tag | (uint64_t)i;
+  *reinterpret_cast<uint64_t*>(
+      rows + (start_row + i) * (int64_t)row_width + field_offset) = v;
+}
+
+void rewriteRowIdField(
+    uint8_t* d_rows,
+    int64_t start_row,
+    int64_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    uint64_t tag,
+    cudaStream_t stream) {
+  if (num_rows == 0) return;
+  int block = 256;
+  int64_t grid = (num_rows + block - 1) / block;
+  rewrite_row_id_kernel<<<(unsigned)grid, block, 0, stream>>>(
+      d_rows, start_row, num_rows, row_width, field_offset, tag);
+}
+
+__global__ void gather_u64_field_kernel(
+    const uint8_t* __restrict__ rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int32_t* __restrict__ idx,
+    int32_t n,
+    uint64_t* __restrict__ out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = *reinterpret_cast<const uint64_t*>(
+      rows + (int64_t)idx[i] * row_width + field_offset);
+}
+
+void gatherU64Field(
+    const uint8_t* d_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int32_t* d_idx,
+    int32_t n,
+    uint64_t* d_out,
+    cudaStream_t stream) {
+  if (n == 0) return;
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  gather_u64_field_kernel<<<grid, block, 0, stream>>>(
+      d_rows, row_width, field_offset, d_idx, n, d_out);
+}
+
 void rebaseStringOffsets(
     uint8_t* d_rows,
     int32_t num_rows,

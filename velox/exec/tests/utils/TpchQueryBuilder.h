@@ -75,9 +75,9 @@ class TpchQueryBuilder {
 
   /// Get the query plan for a given TPC-H query number.
   /// @param queryId TPC-H query number
-  TpchPlan getQueryPlan(int queryId) const;
+  virtual TpchPlan getQueryPlan(int queryId) const;
 
-  ~TpchQueryBuilder();
+  virtual ~TpchQueryBuilder();
 
   /// Resident-table mode (2026-08-22): every TableScan of a query plan is
   /// served from process-resident, pre-decoded RowVector batches (see
@@ -103,7 +103,9 @@ class TpchQueryBuilder {
   /// Get the TPC-H table names present.
   static const std::vector<std::string>& getTableNames();
 
- private:
+ protected:
+  // Helpers below are shared with the GPU experiment builder
+  // (velox/experimental/cudf/benchmarks/GpuSynthQueryBuilder.h).
   // Initializes the schema information for 'tableName' from sample file at
   // 'filePath'.
   void readFileSchema(
@@ -150,6 +152,22 @@ class TpchQueryBuilder {
   TpchPlan getQ40Plan() const;  // Configurable sort benchmark on lineitem (4 sort keys, 16 cols)
   TpchPlan getQ41Plan() const;  // Wide-payload sort on the synthetic 'wide' table (up to 256 payload cols)
   TpchPlan getQ43Plan() const;  // lineitem |><| orders join, build on orders (intro Fig 1 workload)
+  // Q44: lineitem |><| orders (build = orders), NO filters, materialized
+  // output. The "common single join" skeleton of the GPU literature
+  // (MSR Fig. 1b's L |><| O) with configurable payload width per side:
+  //   --synth_payload_cols        build-side (orders)   payload columns
+  //   --synth_probe_payload_cols  probe-side (lineitem) payload columns
+  // Output = the join key + both payloads; no aggregation, so the join
+  // result is materialized (that is the cost under study).
+  TpchPlan getQ44Plan() const { return getQ44PlanImpl(false); }
+  // Q46: Q44 followed by ORDER BY (l_orderkey, l_linenumber) -- the
+  // join -> sort chain of the deferral figure, panel (c) (2026-09-10).
+  TpchPlan getQ46Plan() const { return getQ44PlanImpl(true); }
+  TpchPlan getQ44PlanImpl(bool sortAfter) const;
+  // Q45: lineitem |><| part (build = part), NO filters, SELECT * -- MSR S6.2's
+  // join skeleton. Same flags/semantics as Q44; l_partkey is random w.r.t.
+  // lineitem's physical order, so build-side gathers have no locality.
+  TpchPlan getQ45Plan() const;
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
@@ -220,6 +238,7 @@ class TpchQueryBuilder {
   static constexpr const char* kTableS = "S";
   // Wide-payload sort table: k1, k2 (sort keys) + c0..c255 (BIGINT payload).
   static constexpr const char* kTableWide = "wide";
+  static constexpr const char* kTableP = "P"; // GPU join probe: keys + 13 payloads
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   bool filtersAsNode_;

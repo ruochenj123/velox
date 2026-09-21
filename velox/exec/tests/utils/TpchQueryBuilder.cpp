@@ -30,6 +30,7 @@
 #include <folly/json.h>
 
 #include <algorithm>
+#include <map>
 #include <iostream>
 #include <atomic>
 #include <fstream>
@@ -46,6 +47,12 @@ DECLARE_bool(synth_sort_gather);
 DECLARE_bool(synth_join_flip);
 DECLARE_bool(synth_join_build_filter);
 DECLARE_int32(synth_join_keys);
+DECLARE_int32(synth_probe_payload_cols);
+DECLARE_int32(synth_build_sel);
+DECLARE_int32(synth_probe_sel);
+DECLARE_bool(synth_payload_strings_first);
+DECLARE_bool(synth_join_agg);
+DECLARE_bool(synth_join_agg_sum);
 DECLARE_int32(synth_wide_payload_cols);
 DECLARE_int32(synth_wide_sort_keys);
 
@@ -787,6 +794,12 @@ TpchPlan TpchQueryBuilder::buildQueryPlan(int queryId) const {
       return getQ41Plan();
     case 43:
       return getQ43Plan();
+    case 44:
+      return getQ44Plan();
+    case 45:
+      return getQ45Plan();
+    case 46:
+      return getQ46Plan();
     default:
       VELOX_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -3558,20 +3571,51 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
       "l_linenumber",     "l_shipdate", "l_commitdate",    "l_receiptdate",
       "l_comment"}; // 13th payload: wide VARCHAR (~27B avg)
   const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 13);
-  std::vector<std::string> rColumns = kJoinKeys;
-  rColumns.insert(
-      rColumns.end(),
-      kPayloadOrder.begin(),
-      kPayloadOrder.begin() + numPayloads);
+  const int numJoinKeysEarly = std::clamp(FLAGS_synth_join_keys, 1, 4);
+  // Probe-side payload (2026-08-31): --synth_probe_payload_cols projects the
+  // LAST N payload columns from S (S must carry them, e.g. the GPU P table),
+  // renamed p_*, so probe and build payloads never share a column. With
+  // probe payload requested, only the join keys actually used are projected
+  // (output = keys + probe payload + build payload); the legacy path keeps
+  // all four key candidates.
+  const int numProbePayloads =
+      std::clamp(FLAGS_synth_probe_payload_cols, 0, 13 - numPayloads);
+  const bool keysOnlyUsed = numProbePayloads > 0;
+  // Split-payload mode uses the GPU builder's payload order so both harnesses
+  // join identical columns: probe payload = first N, build payload = last M.
+  static const std::vector<std::string> kPayloadOrderSplit = {
+      "l_returnflag", "l_linestatus",  "l_extendedprice", "l_shipmode",
+      "l_shipinstruct", "l_quantity",  "l_discount",      "l_tax",
+      "l_linenumber",   "l_shipdate",  "l_commitdate",    "l_receiptdate",
+      "l_comment"};
+  std::vector<std::string> rColumns(
+      kJoinKeys.begin(),
+      kJoinKeys.begin() + (keysOnlyUsed ? numJoinKeysEarly : 4));
+  if (keysOnlyUsed) {
+    for (int i = 0; i < numPayloads; ++i) {
+      rColumns.push_back(
+          kPayloadOrderSplit[kPayloadOrderSplit.size() - 1 - i]);
+    }
+  } else {
+    rColumns.insert(
+        rColumns.end(),
+        kPayloadOrder.begin(),
+        kPayloadOrder.begin() + numPayloads);
+  }
 
-  // Probe-side columns (S) - only join keys (will be renamed to avoid
-  // conflicts)
-  std::vector<std::string> sColumns = {
-      "row_id", // join key
-      "l_suppkey", // join key
-      "l_returnflag", // join key
-      "l_linestatus" // join key
-  };
+  // Probe-side columns (S): the join keys (renamed to avoid conflicts) plus
+  // any requested probe payload.
+  std::vector<std::string> sColumns(
+      kJoinKeys.begin(),
+      kJoinKeys.begin() + (keysOnlyUsed ? numJoinKeysEarly : 4));
+  std::vector<std::string> probePayloadRenames;
+  std::vector<std::string> probePayloadOut;
+  for (int i = 0; i < numProbePayloads; ++i) {
+    const auto& c = kPayloadOrderSplit[i];
+    sColumns.push_back(c);
+    probePayloadRenames.push_back(fmt::format("{} AS p_{}", c, c));
+    probePayloadOut.push_back("p_" + c);
+  }
 
   auto rSelectedRowType = getRowType(kTableR, rColumns);
   const auto& rFileColumns = getFileColumnNames(kTableR);
@@ -3642,15 +3686,22 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
       sBuilder.filter(
           fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
     }
-    sBuilder
-        .project(
-            {kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys})
+    std::vector<std::string> probeProject(
+        kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys);
+    probeProject.insert(
+        probeProject.end(),
+        probePayloadRenames.begin(),
+        probePayloadRenames.end());
+    std::vector<std::string> outputColumns = rColumns;
+    outputColumns.insert(
+        outputColumns.end(), probePayloadOut.begin(), probePayloadOut.end());
+    sBuilder.project(probeProject)
         .hashJoin(
             {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
             {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
             r,
             "", // no filter
-            rColumns); // output: 4 key cols + selected payloads
+            outputColumns); // keys + build payloads (+ probe payloads)
   }
   if (FLAGS_synth_join_sort) {
     if (FLAGS_synth_sort_gather) {
@@ -3662,10 +3713,11 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
 
   TpchPlan context;
   context.planName = fmt::format(
-      "q31{}{}_p{}_sel{}_j{}{}",
+      "q31{}{}_p{}{}_sel{}_j{}{}",
       FLAGS_synth_join_flip ? "flip" : "",
       FLAGS_synth_join_build_filter ? "bf" : "",
       numPayloads,
+      numProbePayloads > 0 ? fmt::format("_pp{}", numProbePayloads) : "",
       FLAGS_s_selectivity_pct,
       numJoinKeys,
       FLAGS_synth_join_sort ? "_sort" : "");
@@ -3708,6 +3760,19 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
       kPayloadOrder.begin(),
       kPayloadOrder.begin() + numPayloads);
 
+  // Optional slice (shares the Q44 probe-side knob): l_shipdate < cut keeps
+  // 10/30/60% of lineitem so the whole input fits the device for the sort.
+  const int sliceSel = FLAGS_synth_probe_sel;
+  static const std::map<int, std::string> kShipdateCutQ40 = {
+      {10, "1992-10-27"}, {30, "1994-02-20"}, {60, "1996-02-13"}};
+  VELOX_CHECK(
+      sliceSel == 100 || kShipdateCutQ40.count(sliceSel) > 0,
+      "--synth_probe_sel must be one of 10, 30, 60, 100 (got {})", sliceSel);
+  if (sliceSel < 100 &&
+      std::find(selectedColumns.begin(), selectedColumns.end(), "l_shipdate") ==
+          selectedColumns.end()) {
+    selectedColumns.push_back("l_shipdate");
+  }
   const auto selectedRowType = getRowType(kLineitem, selectedColumns);
   const auto& fileColumnNames = getFileColumnNames(kLineitem);
 
@@ -3715,7 +3780,15 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
 
   PlanBuilder q40(pool_.get());
   q40.filtersAsNode(filtersAsNode_)
-      .tableScan(kLineitem, selectedRowType, fileColumnNames, {})
+      .tableScan(
+          kLineitem,
+          selectedRowType,
+          fileColumnNames,
+          sliceSel < 100
+              ? std::vector<std::string>{formatDateFilter(
+                    "l_shipdate", selectedRowType, "",
+                    fmt::format("'{}'", kShipdateCutQ40.at(sliceSel)))}
+              : std::vector<std::string>{})
       .captureScanNodeId(lineitemPlanNodeId);
   if (FLAGS_synth_sort_gather) {
     q40.localPartition(std::vector<std::string>{});
@@ -3723,7 +3796,7 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
   auto plan = q40.orderBy(sortKeys, false).planNode();
 
   TpchPlan context;
-  context.planName = fmt::format("q40_k{}_p{}", numKeys, numPayloads);
+  context.planName = fmt::format("q40_k{}_p{}_s{}", numKeys, numPayloads, sliceSel);
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFileFormat = format_;
@@ -3750,6 +3823,290 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
 // hybrid join gate threshold). A final sum/count aggregation keeps the
 // client from materializing ~SF*1.8M output rows while the join's
 // getOutput still performs the full extraction.
+TpchPlan TpchQueryBuilder::getQ45Plan() const {
+  static const std::vector<std::string> kLineitemPayload = {
+      "l_orderkey",      "l_suppkey",       "l_linenumber",
+      "l_quantity",      "l_extendedprice", "l_discount",
+      "l_tax",           "l_returnflag_str", "l_linestatus_str",
+      "l_shipdate",      "l_commitdate",    "l_receiptdate",
+      "l_shipinstruct",  "l_shipmode_str",  "l_comment"};
+  static const std::vector<std::string> kPartPayload = {
+      "p_name",       "p_mfgr_str",      "p_brand_str",   "p_type_str",
+      "p_size",       "p_container_str", "p_retailprice", "p_comment"};
+  const int numBuildPayload = FLAGS_synth_payload_cols < 0
+      ? static_cast<int>(kPartPayload.size())
+      : std::clamp(
+            FLAGS_synth_payload_cols, 0, static_cast<int>(kPartPayload.size()));
+  const int numProbePayload = FLAGS_synth_probe_payload_cols < 0
+      ? static_cast<int>(kLineitemPayload.size())
+      : std::clamp(
+            FLAGS_synth_probe_payload_cols,
+            0,
+            static_cast<int>(kLineitemPayload.size()));
+  std::vector<std::string> partCols = {"p_partkey"};
+  partCols.insert(
+      partCols.end(),
+      kPartPayload.begin(),
+      kPartPayload.begin() + numBuildPayload);
+  std::vector<std::string> lineitemCols = {"l_partkey"};
+  lineitemCols.insert(
+      lineitemCols.end(),
+      kLineitemPayload.begin(),
+      kLineitemPayload.begin() + numProbePayload);
+  auto lineitemType = getRowType(kLineitem, lineitemCols);
+  auto partType = getRowType(kPart, partCols);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  const auto& partFileColumns = getFileColumnNames(kPart);
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId;
+  core::PlanNodeId partScanId;
+  auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(kPart, partType, partFileColumns, {})
+                  .captureScanNodeId(partScanId)
+                  .planNode();
+  std::vector<std::string> outputCols = lineitemCols;
+  outputCols.insert(outputCols.end(), partCols.begin(), partCols.end());
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(
+                      kLineitem, lineitemType, lineitemFileColumns, {})
+                  .captureScanNodeId(lineitemScanId)
+                  .hashJoin(
+                      {"l_partkey"}, {"p_partkey"}, part, "", outputCols)
+                  .planNode();
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q45_lp_p{}_b{}", numProbePayload, numBuildPayload);
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemScanId] = getTableFilePaths(kLineitem);
+  context.dataFiles[partScanId] = getTableFilePaths(kPart);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+TpchPlan TpchQueryBuilder::getQ44PlanImpl(bool sortAfter) const {
+  // Payload order per side: fixed-width columns first, then strings in
+  // DECREASING length. A width sweep therefore reads "numeric payload grows,
+  // then the expensive strings arrive, then the cheap (inline) ones".
+  // Strings are the real CHAR/VARCHAR columns, not the dictionary-encoded
+  // integer variants. A NEGATIVE flag value (the default for this query)
+  // selects ALL payload columns of that side.
+  static const std::vector<std::string> kLineitemFixed = {
+      "l_partkey",       "l_suppkey",       "l_linenumber",
+      "l_quantity",      "l_extendedprice", "l_discount",
+      "l_tax",           "l_shipdate",      "l_commitdate",
+      "l_receiptdate"};
+  // 5 strings, longest first (comment ~27B, shipinstruct <=17B,
+  // shipmode <=7B, returnflag/linestatus 1B)
+  static const std::vector<std::string> kLineitemStrings = {
+      "l_comment",       "l_shipinstruct",  "l_shipmode_str",
+      "l_returnflag_str", "l_linestatus_str"};
+  static const std::vector<std::string> kOrdersFixed = {
+      "o_custkey",       "o_totalprice",    "o_orderdate",
+      "o_shippriority"};
+  // 4 strings, longest first (comment ~48B, clerk 15B,
+  // orderpriority <=15B, orderstatus 1B)
+  static const std::vector<std::string> kOrdersStrings = {
+      "o_comment",       "o_clerk",         "o_orderpriority_str",
+      "o_orderstatus"};
+  // --synth_payload_strings_first flips each side to "strings (longest
+  // first), then fixed-width" so a width sweep meets the expensive columns
+  // at the low end of the axis.
+  auto concat = [](const std::vector<std::string>& a,
+                   const std::vector<std::string>& b) {
+    std::vector<std::string> r = a;
+    r.insert(r.end(), b.begin(), b.end());
+    return r;
+  };
+  const bool stringsFirst = FLAGS_synth_payload_strings_first;
+  const std::vector<std::string> kLineitemPayload = stringsFirst
+      ? concat(kLineitemStrings, kLineitemFixed)
+      : concat(kLineitemFixed, kLineitemStrings);
+  const std::vector<std::string> kOrdersPayload = stringsFirst
+      ? concat(kOrdersStrings, kOrdersFixed)
+      : concat(kOrdersFixed, kOrdersStrings);
+  const int numBuildPayload = FLAGS_synth_payload_cols < 0
+      ? static_cast<int>(kOrdersPayload.size())
+      : std::clamp(
+            FLAGS_synth_payload_cols, 0, static_cast<int>(kOrdersPayload.size()));
+  const int numProbePayload = FLAGS_synth_probe_payload_cols < 0
+      ? static_cast<int>(kLineitemPayload.size())
+      : std::clamp(
+            FLAGS_synth_probe_payload_cols,
+            0,
+            static_cast<int>(kLineitemPayload.size()));
+  const int buildSel = std::clamp(FLAGS_synth_build_sel, 1, 100);
+  // Schema adaptivity: the "_enc" datasets keep the real strings under
+  // "<col>_str" (and dictionary-encoded ints under "<col>"); plain TPC-H
+  // parquet has the strings under "<col>". Use whichever exists.
+  auto resolveName = [&](const std::string& table, const std::string& n) {
+    const auto& cols = getFileColumnNames(table);
+    if (cols.count(n) > 0) return n;
+    const std::string base = n.size() > 4 && n.compare(n.size() - 4, 4, "_str") == 0 ? n.substr(0, n.size() - 4) : n;
+    VELOX_CHECK(cols.count(base) > 0, "Q44: column {} (or {}) not found in {}", n, base, table);
+    return base;
+  };
+  const int probeSel = FLAGS_synth_probe_sel;
+  // Probe-side selectivity (MSR Fig. 9a knob): l_shipdate quantiles measured
+  // on SF100 (shipdate = orderdate + 1..121 days, so not linear in time):
+  // 1% -> 0.98%, 3% -> 2.99%, 10% -> 9.93%, 30% -> 29.92%, 60% -> 59.97%
+  // of lineitem rows (1%/3% added 2026-09-17 for the MSR 1/3/10/30/100 grid).
+  static const std::map<int, std::string> kShipdateCut = {
+      {1, "1992-03-17"},
+      {3, "1992-05-13"},
+      {10, "1992-10-27"},
+      {30, "1994-02-20"},
+      {60, "1996-02-13"}};
+  VELOX_CHECK(
+      probeSel == 100 || kShipdateCut.count(probeSel) > 0,
+      "--synth_probe_sel must be one of 1, 3, 10, 30, 60, 100 (got {})",
+      probeSel);
+
+  // Projected (output) columns.
+  std::vector<std::string> ordersCols = {"o_orderkey"};
+  for (int i = 0; i < numBuildPayload; i++) {
+    ordersCols.push_back(resolveName(kOrders, kOrdersPayload[i]));
+  }
+  std::vector<std::string> lineitemCols = {"l_orderkey"};
+  for (int i = 0; i < numProbePayload; i++) {
+    lineitemCols.push_back(resolveName(kLineitem, kLineitemPayload[i]));
+  }
+  if (FLAGS_synth_join_agg_sum) {
+    // 2026-09-19 MSR-style cell: the join carries exactly the three numeric
+    // columns the SUM consumes; the width knobs are ignored.
+    ordersCols = {"o_orderkey", "o_totalprice"};
+    lineitemCols = {"l_orderkey", "l_extendedprice", "l_discount"};
+  }
+
+  // Scanned build columns: the projection plus the filter column when the
+  // hit-rate knob is on and o_orderdate is not already projected.
+  std::vector<std::string> ordersScanCols = ordersCols;
+  if (buildSel < 100 &&
+      std::find(ordersScanCols.begin(), ordersScanCols.end(), "o_orderdate") ==
+          ordersScanCols.end()) {
+    ordersScanCols.push_back("o_orderdate");
+  }
+
+  // Scanned probe columns: the projection plus l_shipdate when the probe
+  // filter is on and it is not already projected.
+  std::vector<std::string> lineitemScanCols = lineitemCols;
+  if (probeSel < 100 &&
+      std::find(
+          lineitemScanCols.begin(), lineitemScanCols.end(), "l_shipdate") ==
+          lineitemScanCols.end()) {
+    lineitemScanCols.push_back("l_shipdate");
+  }
+
+  auto lineitemType = getRowType(kLineitem, lineitemScanCols);
+  auto ordersType = getRowType(kOrders, ordersScanCols);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  // Hit-rate knob (MSR-style build-side selectivity): o_orderdate is uniform
+  // over [1992-01-01, 1998-08-02] (2405 days) and uncorrelated with
+  // o_orderkey, so "o_orderdate < 1992-01-01 + sel% * 2405 days" keeps sel%
+  // of orders (measured on SF100: 10 -> 9.97%, 30 -> 29.96%, 60 -> 59.97%)
+  // and, the join being PK-FK, the same fraction of lineitem rows find a
+  // match. Applied as a FilterNode (filtersAsNode) so it runs on the CPU
+  // inside the timed region, as in Q43 and in the MSR setup.
+  std::vector<std::string> ordersFilters;
+  if (buildSel < 100) {
+    const int32_t cutDays = static_cast<int32_t>(2405.0 * buildSel / 100.0);
+    const int32_t epochDays = 8035 /* 1992-01-01 */ + cutDays;
+    const auto cut = DATE()->toString(epochDays);
+    ordersFilters.push_back(formatDateFilter(
+        "o_orderdate", ordersType, "", fmt::format("'{}'", cut)));
+  }
+
+  std::vector<std::string> lineitemFilters;
+  if (probeSel < 100) {
+    lineitemFilters.push_back(formatDateFilter(
+        "l_shipdate",
+        lineitemType,
+        "",
+        fmt::format("'{}'", kShipdateCut.at(probeSel))));
+  }
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId;
+  core::PlanNodeId ordersScanId;
+
+  auto orders =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kOrders, ordersType, ordersFileColumns, ordersFilters)
+          .captureScanNodeId(ordersScanId)
+          .planNode();
+
+  // Output: every projected column of both sides (both join keys
+  // included, as "select *" would), no aggregation.
+  std::vector<std::string> outputCols = lineitemCols;
+  outputCols.insert(outputCols.end(), ordersCols.begin(), ordersCols.end());
+
+  auto q44 = PlanBuilder(planNodeIdGenerator, pool_.get())
+                 .filtersAsNode(filtersAsNode_)
+                 .tableScan(
+                     kLineitem,
+                     lineitemType,
+                     lineitemFileColumns,
+                     lineitemFilters)
+                 .captureScanNodeId(lineitemScanId)
+                 .hashJoin(
+                     {"l_orderkey"}, {"o_orderkey"}, orders, "", outputCols);
+  if (sortAfter) {
+    // Q46: sort the join result on (l_orderkey, l_linenumber) -- the sort
+    // consumes the probe's rows on the device and is the chain endpoint.
+    std::vector<std::string> sortKeys{"l_orderkey"};
+    if (std::find(outputCols.begin(), outputCols.end(), "l_linenumber") !=
+        outputCols.end()) {
+      sortKeys.push_back("l_linenumber");
+    }
+    if (FLAGS_synth_sort_gather) {
+      q44.localPartition(std::vector<std::string>{});
+    }
+    q44.orderBy(sortKeys, false);
+  }
+  if (FLAGS_synth_join_agg_sum) {
+    // MSR microbenchmark aggregate (Li et al. PVLDB'25, Sec. 6.2), on our
+    // lineitem |><| orders: one SUM over an arithmetic expression of the
+    // three projected numeric columns; one row leaves the GPU.
+    q44.project({"o_totalprice - l_extendedprice * (1.0 - l_discount) AS v"})
+        .partialAggregation({}, {"sum(v) AS s"})
+        .localPartition(std::vector<std::string>{})
+        .finalAggregation();
+  } else if (FLAGS_synth_join_agg) {
+    // 2026-09-19: consume the join output on the device. count(col) over
+    // EVERY output column keeps each column referenced (no planner can prune
+    // it; the join must still gather it) while only one row leaves the GPU.
+    // partial -> gather -> final so the 16 drivers merge into a single row.
+    std::vector<std::string> aggs{"count(0) AS cnt_all"};
+    for (const auto& c : outputCols) {
+      aggs.push_back(fmt::format("count({}) AS cnt_{}", c, c));
+    }
+    q44.partialAggregation({}, aggs)
+        .localPartition(std::vector<std::string>{})
+        .finalAggregation();
+  }
+  auto plan = q44.planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "{}_p{}_b{}_s{}_ps{}{}{}",
+      sortAfter ? "q46_lo_sort" : "q44_lo",
+      numProbePayload,
+      numBuildPayload,
+      buildSel,
+      probeSel,
+      stringsFirst ? "_sf" : "",
+      FLAGS_synth_join_agg_sum ? "_msr" : (FLAGS_synth_join_agg ? "_agg" : ""));
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemScanId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersScanId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getQ43Plan() const {
   std::vector<std::string> lineitemCols = {
       "l_orderkey",      "l_partkey",  "l_suppkey",  "l_linenumber",
@@ -3866,7 +4223,8 @@ const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kPartsupp,
     kTableR,
     kTableS,
-    kTableWide};
+    kTableWide,
+    kTableP};
 
 const std::unordered_map<std::string, std::vector<std::string>>
     TpchQueryBuilder::kTables_ = {
@@ -3938,6 +4296,17 @@ const std::unordered_map<std::string, std::vector<std::string>>
                 "l_suppkey",
                 "l_returnflag",
                 "l_linestatus",
-                "s_orderkey"})};
+                "s_orderkey"}),
+        // GPU single-join probe (exp gen_probe_payload.sh): S's keys in
+        // scrambled order + R's 13 payloads in Q31's kPayloadOrder.
+        std::make_pair(
+            "P",
+            std::vector<std::string>{
+                "row_id",          "l_suppkey",   "l_returnflag",
+                "l_linestatus",    "l_orderkey",  "l_partkey",
+                "l_extendedprice", "l_shipmode",  "l_shipinstruct",
+                "l_quantity",      "l_discount",  "l_tax",
+                "l_linenumber",    "l_shipdate",  "l_commitdate",
+                "l_receiptdate",   "l_comment"})};
 
 } // namespace facebook::velox::exec::test

@@ -25,6 +25,7 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <deque>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -102,8 +103,17 @@ class CudfFromVelox : public CudfOperatorBase {
     bool anyNulls{false};
     int32_t nullStride{0};
     int64_t heapOffset{0};
+    // Chunked staging: this group's first row id and heap byte within the
+    // whole batch, so packed rowids and string offsets stay batch-global.
+    int64_t rowIdBias{0};
+    int64_t heapBias{0};
   };
   void resolveRowPathOnce(bool rowWiseMode);
+  /// Bytes per row of the columns deferral would keep on the host (the
+  /// join output columns present here that are not in the crossing set).
+  int32_t deferredPayloadBytes(const RowTypePtr& inRowType) const;
+  static int32_t probeSideDeferredBytes(const core::HashJoinNode& join);
+  static int32_t buildSideDeferredBytes(const core::HashJoinNode& join);
   bool computeLayoutOnce(
       const RowTypePtr& inRowType,
       bool rowMode,
@@ -120,7 +130,9 @@ class CudfFromVelox : public CudfOperatorBase {
       bool rowMode,
       bool boundary,
       const PackBatch& pb,
-      uint8_t* const base);
+      uint8_t* const base,
+      size_t inputBegin = 0,
+      size_t inputEnd = std::numeric_limits<size_t>::max());
   RowVectorPtr tryPinnedPack(
       const std::vector<RowVectorPtr>& selectedInputs,
       vector_size_t totalRows);
@@ -205,6 +217,8 @@ class CudfFromVelox : public CudfOperatorBase {
   std::vector<std::string> joinOutputNames_;
   std::vector<std::string> subsetPackNames_;
   bool prunedPack_{false};
+  // One runtime stat per operator for the chunked-staging group count.
+  bool packBlockStatsLogged_{false};
   int32_t rowIdField_{-1};
   TypePtr boundaryStoreType_;
   static constexpr const char* kRowIdName = "__rowid";
@@ -240,6 +254,7 @@ class CudfFromVelox : public CudfOperatorBase {
   int64_t dataWidth_ = 0;  // raw sum of column widths, unpadded (col mode)
   bool rowLayoutReady_ = false;
   bool hasStringFields_ = false; // any kFieldString in rowFields_ (row mode)
+  bool payloadGateChecked_ = false; // selective hybrid execution (once)
   // Uploaded once; SHARED by every RowStoreVector this operator emits (the
   // shared_ptr keeps it alive as long as any batch lives downstream).
   std::shared_ptr<rmm::device_buffer> rowFieldsDevice_;
@@ -259,6 +274,10 @@ class CudfToVelox : public CudfOperatorBase {
  public:
   static constexpr const char* kPassthroughMode =
       "velox.cudf.to_velox.passthrough_mode";
+
+  /// Report + reset the thread-local D2H wall accumulated by toVeloxColumn,
+  /// so the exit's transfer phase is measured like the ingest's H2D wall.
+  void reportD2HWall();
 
   CudfToVelox(
       int32_t operatorId,

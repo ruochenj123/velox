@@ -22,6 +22,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -183,6 +184,12 @@ void RowOrderBy::concatenateRowInputs() {
   int64_t heapSoFar = 0;
   int64_t idSpaceSoFar = 0; // global rowid base of the NEXT new store
   uint8_t* rowsBase = static_cast<uint8_t*>(sorted_.data());
+  // Per-batch (row start, heap base) for ONE batched rebase launch after the
+  // copies (2026-09-08; was one rebase launch per input batch).
+  std::vector<int64_t> batchRowStart;
+  std::vector<int64_t> batchHeapBase;
+  batchRowStart.reserve(rowInputs_.size() + 1);
+  batchHeapBase.reserve(rowInputs_.size());
   for (auto& v : rowInputs_) {
     const int64_t n = v->size();
     waitOnStream(stream_, v->stream());
@@ -193,22 +200,18 @@ void RowOrderBy::concatenateRowInputs() {
         n * rowWidth_,
         cudaMemcpyDeviceToDevice,
         stream_.value());
-    if (hasStrings_ && v->charsBytes() > 0) {
-      cudaMemcpyAsync(
-          static_cast<uint8_t*>(heap_.data()) + heapSoFar,
-          v->charsData(),
-          v->charsBytes(),
-          cudaMemcpyDeviceToDevice,
-          stream_.value());
-      rebaseStringOffsets(
-          dst,
-          static_cast<int32_t>(n),
-          rowWidth_,
-          static_cast<const int32_t*>(strOffsDev.data()),
-          static_cast<int32_t>(strOffs.size()),
-          heapSoFar,
-          stream_.value());
-      heapSoFar += v->charsBytes();
+    if (hasStrings_) {
+      batchRowStart.push_back(rowsSoFar);
+      batchHeapBase.push_back(heapSoFar);
+      if (v->charsBytes() > 0) {
+        cudaMemcpyAsync(
+            static_cast<uint8_t*>(heap_.data()) + heapSoFar,
+            v->charsData(),
+            v->charsBytes(),
+            cudaMemcpyDeviceToDevice,
+            stream_.value());
+        heapSoFar += v->charsBytes();
+      }
     }
     if (nullPad_ > 0) {
       const auto store = v->getGpuRowStore();
@@ -232,8 +235,14 @@ void RowOrderBy::concatenateRowInputs() {
       auto store = v->provenanceStore();
       VELOX_CHECK_NOT_NULL(store);
       if (sortStore_ == nullptr) {
+        // Coalesced mode (default): coalesce() before the first gather.
+        // --sort_deferred_scattered: keep the batches as retained and gather
+        // through (batch, row) ids -- no coalesce pass.
         sortStore_ = std::make_unique<BoundaryHostStore>(
-            store->rowType(), pool(), /*scattered=*/false);
+            store->rowType(),
+            pool(),
+            /*scattered=*/CudfConfig::getInstance()
+                .benchmarkSortDeferredScattered);
       }
       const int64_t base = sortStore_->totalRows();
       for (const auto& b : store->batches()) {
@@ -249,6 +258,28 @@ void RowOrderBy::concatenateRowInputs() {
           stream_.value());
     }
     rowsSoFar += n;
+  }
+  if (hasStrings_ && !strOffs.empty() && !batchRowStart.empty()) {
+    batchRowStart.push_back(rowsSoFar);
+    rmm::device_buffer rowStartDev(
+        batchRowStart.data(),
+        batchRowStart.size() * sizeof(int64_t),
+        stream_);
+    rmm::device_buffer heapBaseDev(
+        batchHeapBase.data(),
+        batchHeapBase.size() * sizeof(int64_t),
+        stream_);
+    rebaseStringOffsetsBatched(
+        rowsBase,
+        rowsSoFar,
+        rowWidth_,
+        static_cast<const int32_t*>(strOffsDev.data()),
+        static_cast<int32_t>(strOffs.size()),
+        static_cast<const int64_t*>(rowStartDev.data()),
+        static_cast<const int64_t*>(heapBaseDev.data()),
+        static_cast<int32_t>(batchHeapBase.size()),
+        stream_.value());
+    stream_.synchronize(); // rowStartDev/heapBaseDev die at scope exit
   }
   stream_.synchronize();
   rowInputs_.clear(); // frees the per-batch GPU buffers
@@ -352,11 +383,12 @@ void RowOrderBy::sortRows() {
   // (HybridContainer::coalesceBatches, as the CPU hybrid sort does in
   // SortBuffer), overlapped with the device sort below; joined before the
   // first host gather.
-  idsOnly_ = emitHost_ == 1 && !deferredCols_.empty();
+  idsOnly_ = emitHost_ == 1 && !deferredCols_.empty() && !mixedExit_;
   std::thread coalesceThread;
   std::exception_ptr coalesceError;
   const auto tpCoalesce = std::chrono::steady_clock::now();
-  if (sortStore_ != nullptr && !deferredCols_.empty()) {
+  if (sortStore_ != nullptr && !deferredCols_.empty() &&
+      !CudfConfig::getInstance().benchmarkSortDeferredScattered) {
     coalesceThread = std::thread([&]() {
       try {
         sortStore_->coalesce();
@@ -480,6 +512,10 @@ void RowOrderBy::resolveOutputOnce() {
   emitHost_ = 0;
   chunkRows_ = std::max<int32_t>(
       1, outputBatchRows(static_cast<uint64_t>(rowWidth_ + nullPad_)));
+  if (sortGatherThreads() > 1) {
+    // Parallel gather: bigger chunks amortize the per-chunk fork/join.
+    chunkRows_ = std::max<int32_t>(chunkRows_, 1 << 17);
+  }
   if (auto* driver = operatorCtx_->driver()) {
     const auto ops = driver->operators();
     for (size_t i = 0; i + 1 < ops.size(); i++) {
@@ -509,10 +545,26 @@ void RowOrderBy::resolveOutputOnce() {
   // Deferred + CPU exit: ids-only crossing. Every output column -- keys
   // included -- is gathered on the host from the retained batches, so the
   // sorted rows never cross and no device transpose is needed.
+  // Sort-after-join (2026-09-10): the retained store is the PROBE's, so
+  // only the columns it holds can be gathered there; the others (the eager
+  // build side) live in the rows only -> mixed exit: rows cross, deferred
+  // columns are gathered by the __rowid carried in each row.
+  mixedExit_ = false;
   if (emitHost_ == 1 && !deferredCols_.empty()) {
+    const auto& storeType = sortStore_->rowType();
     deferredCols_.clear();
     for (size_t i = 0; i < outputType_->size(); i++) {
-      deferredCols_.push_back(static_cast<int32_t>(i));
+      if (storeType->getChildIdxIfExists(outputType_->nameOf(i)).has_value()) {
+        deferredCols_.push_back(static_cast<int32_t>(i));
+      } else {
+        VELOX_CHECK_GE(
+            outFieldIdx_[i],
+            0,
+            "RowOrderBy: column '{}' is neither in the rows nor in the "
+            "provenance store",
+            outputType_->nameOf(i));
+        mixedExit_ = true;
+      }
     }
   }
   addRuntimeStat(
@@ -540,6 +592,17 @@ void RowOrderBy::doNoMoreInput() {
 
 // Host gather of the deferred columns at the sorted GLOBAL row ids:
 // HybridContainer's coalesced-mode extraction over the single sort store.
+// Threads for the deferred exit's host gather: the flag, or (-1) auto =
+// min(48, hardware_concurrency) -- the cores are idle during the GPU sort.
+int32_t RowOrderBy::sortGatherThreads() {
+  const int32_t v = CudfConfig::getInstance().benchmarkSortGatherThreads;
+  if (v >= 0) {
+    return v;
+  }
+  const auto hw = static_cast<int32_t>(std::thread::hardware_concurrency());
+  return std::max<int32_t>(1, std::min<int32_t>(48, hw));
+}
+
 std::vector<VectorPtr> RowOrderBy::gatherDeferred(
     const std::vector<int64_t>& gids,
     int32_t n) {
@@ -547,14 +610,56 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
   const size_t D = deferredCols_.size();
   const auto& storeType = sortStore_->rowType();
   std::vector<VectorPtr> out(D);
-  for (size_t d = 0; d < D; d++) {
-    const auto& type = outputType_->childAt(deferredCols_[d]);
-    const auto childIdx = static_cast<int32_t>(
-        storeType->getChildIdx(outputType_->nameOf(deferredCols_[d])));
-    auto res = BaseVector::create(type, n, pool());
-    sortStore_->gatherCoalesced(
-        childIdx, gids.data(), n, res, rowsScratch_, idsScratch_);
-    out[d] = std::move(res);
+  const auto& cfg = CudfConfig::getInstance();
+  const bool scattered = cfg.benchmarkSortDeferredScattered;
+  // Scattered mode: (batch, row) ids for the chunk, computed once and read
+  // by every column's gather (no coalesce pass).
+  std::vector<exec::HybridRowId> scatteredIds;
+  if (scattered) {
+    std::vector<int32_t> g32(n);
+    for (int32_t i = 0; i < n; i++) {
+      g32[i] = static_cast<int32_t>(gids[i]);
+    }
+    sortStore_->idsForGlobalRows(g32.data(), n, scatteredIds);
+  }
+  auto work = [&](size_t d0,
+                  size_t d1,
+                  std::vector<const char*>& rowsScratch,
+                  std::vector<exec::HybridRowId>& idsScratch) {
+    for (size_t d = d0; d < d1; d++) {
+      const auto& type = outputType_->childAt(deferredCols_[d]);
+      const auto childIdx = static_cast<int32_t>(
+          storeType->getChildIdx(outputType_->nameOf(deferredCols_[d])));
+      auto res = BaseVector::create(type, n, pool());
+      if (scattered) {
+        sortStore_->gather(childIdx, scatteredIds, res, rowsScratch);
+      } else {
+        sortStore_->gatherCoalesced(
+            childIdx, gids.data(), n, res, rowsScratch, idsScratch);
+      }
+      out[d] = std::move(res);
+    }
+  };
+  // Columns are independent (each writes its own vector; the store is only
+  // read), so the chunk's gather fans out over T threads by column range.
+  const size_t T = static_cast<size_t>(std::max<int32_t>(
+      1, std::min<int32_t>(sortGatherThreads(), static_cast<int32_t>(D))));
+  if (T <= 1) {
+    work(0, D, rowsScratch_, idsScratch_);
+  } else {
+    rowsScratchT_.resize(T);
+    idsScratchT_.resize(T);
+    std::vector<std::thread> threads;
+    threads.reserve(T);
+    for (size_t t = 0; t < T; t++) {
+      const size_t d0 = D * t / T;
+      const size_t d1 = D * (t + 1) / T;
+      threads.emplace_back(
+          [&, t, d0, d1]() { work(d0, d1, rowsScratchT_[t], idsScratchT_[t]); });
+    }
+    for (auto& th : threads) {
+      th.join();
+    }
   }
   addRuntimeStat(
       "rowSortDeferredRows", RuntimeCounter(static_cast<int64_t>(n) * D));
@@ -562,7 +667,7 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
 }
 
 RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
-  if (!deferredCols_.empty()) {
+  if (!deferredCols_.empty() && !mixedExit_) {
     // DEFERRED exit (2026-08-25): uniformly COLUMNAR. Ids are extracted on
     // the device, the deferred payload is gathered on the host, and the
     // GPU-side (key) columns are transposed on the device and brought over
@@ -675,6 +780,36 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     if (fi >= 0) {
       f[i] = fields_[fi];
       nullBits[i] = fi; // the sidecar is indexed by FIELD
+    } else {
+      f[i] = {-1, 0, kFieldFixed}; // deferred: supplied below
+    }
+  }
+  // Mixed exit (sort after a join): the deferred columns are gathered from
+  // the probe's retained store by the __rowid field of each sorted row.
+  std::vector<VectorPtr> deferredChildren;
+  if (mixedExit_) {
+    VELOX_CHECK_GE(rowIdField_, 0);
+    const int32_t idOff = fields_[rowIdField_].offset;
+    std::vector<int64_t> gids(n);
+    for (int32_t r = 0; r < n; r++) {
+      memcpy(
+          &gids[r],
+          hostRowsCur_.data() + static_cast<int64_t>(r) * rowWidth_ + idOff,
+          sizeof(int64_t));
+    }
+    const auto tpHG = std::chrono::steady_clock::now();
+    deferredChildren = gatherDeferred(gids, n);
+    addRuntimeStat(
+        "rowSortHostGatherNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpHG)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    // Columns present in both the rows and the store are taken from the
+    // store like every other deferred column.
+    for (auto c : deferredCols_) {
+      f[c] = {-1, 0, kFieldFixed};
     }
   }
   std::vector<uint8_t> rowsOwned = std::move(hostRowsCur_);
@@ -696,7 +831,7 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
       std::move(nullsOwned),
       nullPad_,
       std::move(nullBits));
-  if (CudfConfig::getInstance().benchmarkRowOutputNative) {
+  if (CudfConfig::getInstance().benchmarkRowOutputNative && !mixedExit_) {
     addRuntimeStat(
         "hostExitNativeBytes",
         RuntimeCounter(
@@ -705,6 +840,11 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
   }
   const auto tpExtract = std::chrono::steady_clock::now();
   auto out = hostRows->materialize();
+  if (mixedExit_) {
+    for (size_t k = 0; k < deferredCols_.size(); k++) {
+      out->childAt(deferredCols_[k]) = std::move(deferredChildren[k]);
+    }
+  }
   addRuntimeStat(
       "rowSortHostExtractNanos",
       RuntimeCounter(

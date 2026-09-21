@@ -40,6 +40,9 @@ inline RowVectorPtr extractHostRows(
   std::vector<VectorPtr> children(numCols);
   for (int i = 0; i < numCols; i++) {
     const auto& fd = fields[i];
+    if (fd.offset < 0) {
+      continue; // not in the rows (deferred column): the caller supplies it
+    }
     auto vec = BaseVector::create(type->childAt(i), n, pool);
     if (fd.kind == kFieldString) {
       auto* fv = vec->template asFlatVector<StringView>();

@@ -722,6 +722,15 @@ class RowOrderByAdapter : public OperatorAdapter {
       if (std::dynamic_pointer_cast<const core::TableScanNode>(n)) {
         return true;
       }
+      // Sort-after-join (reinstated 2026-09-10): a row-native join
+      // (inner, no filter, --row_table) emits RowStoreVector rows to the
+      // sort, which becomes the chain endpoint (DeferralPlan).
+      if (auto join =
+              std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
+        const auto& cfg = CudfConfig::getInstance();
+        return cfg.benchmarkRowTable && cfg.benchmarkRowWiseGather &&
+            join->joinType() == core::JoinType::kInner && !join->filter();
+      }
       if (std::dynamic_pointer_cast<const core::FilterNode>(n) ||
           std::dynamic_pointer_cast<const core::ProjectNode>(n) ||
           std::dynamic_pointer_cast<const core::LocalPartitionNode>(n)) {

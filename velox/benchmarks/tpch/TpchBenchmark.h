@@ -46,6 +46,11 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
  protected:
   std::unordered_map<std::string, std::string> queryConfigs_;
 
+  /// Creates the TPC-H query builder; the cudf benchmark overrides this to
+  /// install the GPU experiment builder (extra query ids, same tables).
+  virtual std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder>
+  makeQueryBuilder() const;
+
  private:
   void initQueryBuilder();
 

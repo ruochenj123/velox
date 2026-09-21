@@ -110,6 +110,56 @@ DEFINE_bool(
     "Q31 join bench: append the 4-key sort after the join.");
 
 DEFINE_int32(
+    synth_build_payload_cols,
+    0,
+    "GPU synthetic join (q51): number of payload columns projected from the "
+    "BUILD side R (the last N of the payload order, renamed b_*).");
+DEFINE_int32(
+    synth_probe_payload_cols,
+    0,
+    "CPU synthetic join (q31): number of payload columns projected from the "
+    "PROBE side S (the last N of the payload order, renamed p_*; S must "
+    "carry them, e.g. point --data_path at a dir whose S is the GPU P table).");
+DEFINE_int32(
+    synth_build_sel,
+    100,
+    "Q44 build-side selectivity in percent (MSR-style hit-rate knob): <100 "
+    "adds a CPU-side FilterNode on orders (o_orderdate < cut) keeping this "
+    "fraction of build rows; the join being PK-FK, the same fraction of "
+    "lineitem rows find a match. 100 = no filter.");
+DEFINE_int32(
+    synth_probe_sel,
+    100,
+    "Q44 probe-side selectivity in percent (MSR Fig. 9a knob): <100 adds a "
+    "CPU-side FilterNode on lineitem (l_shipdate < cut) keeping this fraction "
+    "of probe rows; the build (orders) stays unfiltered, so |B| is fixed while "
+    "|S| shrinks. Supported values: 10, 30, 60, 100.");
+DEFINE_bool(
+    synth_payload_strings_first,
+    false,
+    "Q44 width sweep: reverse the per-side payload order so the string "
+    "columns come FIRST (longest first) and the fixed-width columns follow. "
+    "Default (false) keeps the original order: fixed-width first, then "
+    "strings longest-first.");
+// 2026-09-19: Q44 join + ungrouped aggregate that references EVERY projected
+// column (count(*) + count(col)): the join output is consumed on the device
+// and only one row returns, so the end-to-end time has no result-return
+// term. Mirrors the Sirius "<cell>agg" variant.
+DEFINE_bool(
+    synth_join_agg,
+    false,
+    "Q44: consume the join output with count(*)+count(col) over every "
+    "projected column (no result return).");
+// 2026-09-19: MSR-style join+aggregate (Li et al. PVLDB'25 microbenchmark):
+// SUM(o_totalprice - l_extendedprice * (1 - l_discount)); the join carries
+// only the three numeric columns the aggregate consumes (no strings, nothing
+// to defer) -- a narrow engine-speed cell, not a deferral test.
+DEFINE_bool(
+    synth_join_agg_sum,
+    false,
+    "Q44: MSR-style SUM(o_totalprice - l_extendedprice*(1-l_discount)) over "
+    "the join; projects only those three columns.");
+DEFINE_int32(
     synth_join_keys,
     4,
     "Q31 join bench: number of join keys (1..4; row_id first, so match "
@@ -141,6 +191,10 @@ DEFINE_bool(
     "81, 89, 93, 96) and use the TPC-DS query builder. --data_path "
     "must point to a TPC-DS dataset laid out one sub-directory per table.");
 
+std::shared_ptr<TpchQueryBuilder> TpchBenchmark::makeQueryBuilder() const {
+  return std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
+}
+
 void TpchBenchmark::initQueryBuilder() {
   if (FLAGS_use_tpcds) {
     tpcdsQueryBuilder_ =
@@ -148,8 +202,7 @@ void TpchBenchmark::initQueryBuilder() {
     tpcdsQueryBuilder_->initialize(FLAGS_data_path);
     return;
   }
-  queryBuilder_ =
-      std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
+  queryBuilder_ = makeQueryBuilder();
   queryBuilder_->setResidentTables(FLAGS_resident_tables, FLAGS_num_drivers);
   queryBuilder_->initialize(FLAGS_data_path);
 }

@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
+#include "velox/experimental/cudf/benchmarks/GpuSynthQueryBuilder.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
@@ -97,6 +98,44 @@ DEFINE_bool(deferral_adaptive, false,
     "With --boundary_hybrid: eager until a prior repeat observed match "
     "rate <= --deferral_threshold at the adjacent join (DeferralStats).");
 DEFINE_double(deferral_threshold, 0.5, "Adaptive deferral match-rate bound.");
+DEFINE_int32(
+    pack_block_mb,
+    16,
+    "Row pack: stage H2D through a pinned block of this many MiB (0 = one "
+    "pinned buffer per GPU batch). The device batch is unchanged.");
+DEFINE_int32(
+    defer_min_payload_bytes,
+    8,
+    "Selective hybrid execution: defer only when the host-retained "
+    "columns are at least this many bytes per row (0 = always defer). "
+    "Default 8 = the rowRef width, the same gate as the CPU join "
+    "(2026-09-17; was 48).");
+DEFINE_int32(
+    sort_gather_threads,
+    -1,
+    "Deferred row sort: threads for the per-chunk host gather of deferred "
+    "payload columns (0/1 = operator thread only).");
+DEFINE_bool(
+    boundary_build_defer,
+    true,
+    "Boundary-hybrid: defer the BUILD side payload too (keys + rowRef cross; "
+    "payload retained on the host, gathered for survivors).");
+DEFINE_bool(
+    join_deferred_scattered,
+    true,
+    "Boundary-hybrid join: keep the build-side host payload scattered "
+    "(true) or coalesce it after the build and gather survivors with the "
+    "optimized coalesced extraction (false).");
+DEFINE_bool(
+    sort_deferred_scattered,
+    true,
+    "Deferred row sort: gather from the retained batches (scattered ids) "
+    "instead of coalescing them first.");
+DEFINE_int32(
+    pack_tile_rows,
+    0,
+    "Row pack: rows per cache tile (0 = whole input batch). Keep tile x "
+    "rowWidth within L2 so column-at-a-time scatter stays cache-resident.");
 DEFINE_bool(row_table_pack_keys, true,
     "With --row_table: composite-key range packing when the ranges fit.");
 DEFINE_bool(keep_project_on_cpu, true,
@@ -119,6 +158,12 @@ DEFINE_string(pinned_pack_sync, "auto",
     "velox.cudf.pinned_pack_sync for the row-wise pack (auto|sync|async).");
 
 DEFINE_bool(cudf_debug_enabled, false, "Enable debug printing");
+
+std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder>
+CudfTpchBenchmark::makeQueryBuilder() const {
+  return std::make_shared<facebook::velox::cudf_velox::GpuSynthQueryBuilder>(
+      toFileFormat(FLAGS_data_format));
+}
 
 void CudfTpchBenchmark::initialize() {
   TpchBenchmark::initialize();
@@ -175,6 +220,14 @@ void CudfTpchBenchmark::initialize() {
   cfg.benchmarkDeferralAdaptive = FLAGS_deferral_adaptive;
   cfg.benchmarkRowOutputNative = FLAGS_row_output_native;
   cfg.benchmarkDeferralThreshold = FLAGS_deferral_threshold;
+  cfg.benchmarkPackTileRows = FLAGS_pack_tile_rows;
+  cfg.benchmarkDeferMinPayloadBytes = FLAGS_defer_min_payload_bytes;
+  cfg.benchmarkPackBlockBytes =
+      static_cast<int64_t>(FLAGS_pack_block_mb) * 1024 * 1024;
+  cfg.benchmarkSortGatherThreads = FLAGS_sort_gather_threads;
+  cfg.benchmarkSortDeferredScattered = FLAGS_sort_deferred_scattered;
+  cfg.benchmarkJoinDeferredScattered = FLAGS_join_deferred_scattered;
+  cfg.benchmarkBoundaryBuildDefer = FLAGS_boundary_build_defer;
   cfg.benchmarkLogGatherTime = FLAGS_log_gather_time;
   cfg.benchmarkConcatBeforeJoin = FLAGS_concat_join;
   cfg.concatOptimizationEnabled = FLAGS_concat_agg;

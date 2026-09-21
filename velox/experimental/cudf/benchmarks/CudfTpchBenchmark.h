@@ -36,4 +36,9 @@ class CudfTpchBenchmark : public TpchBenchmark {
       const facebook::velox::exec::test::TpchPlan& plan) override;
 
   void shutdown() override;
+
+  /// GPU experiment builder: TPC-H/SSB ids as before plus the GPU synthetic
+  /// single-join (51) and single-sort (52) plans.
+  std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder>
+  makeQueryBuilder() const override;
 };

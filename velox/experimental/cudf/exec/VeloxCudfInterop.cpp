@@ -121,6 +121,11 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type) {
 
 namespace with_arrow {
 
+int64_t& toVeloxD2HNanos() {
+  thread_local int64_t nanos = 0;
+  return nanos;
+}
+
 std::unique_ptr<cudf::table> toCudfTable(
     const facebook::velox::RowVectorPtr& veloxTable,
     facebook::velox::memory::MemoryPool* pool,
@@ -259,7 +264,14 @@ RowVectorPtr toVeloxColumn(
   //
   // seves 1/17/26
 
+  // Host wall of the result D2H: to_arrow_host performs every
+  // device-to-host copy for this table and synchronizes before returning,
+  // so bracketing it gives the transfer phase symmetric with the ingest's
+  // H2D wall. Accumulated per thread; CudfToVelox reports and resets it.
+  const auto tpD2H = std::chrono::steady_clock::now();
   auto arrowDeviceArray = cudf::to_arrow_host(table, stream, mr);
+  toVeloxD2HNanos() += std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - tpD2H).count();
   ArrowArray arrayCopy = arrowDeviceArray->array;
   arrowDeviceArray->array.release = nullptr;
 

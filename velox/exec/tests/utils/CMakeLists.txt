@@ -24,6 +24,7 @@ add_library(
   OperatorTestBase.cpp
   PlanBuilder.cpp
   QueryAssertions.cpp
+  ResidentTables.cpp
   SumNonPODAggregate.cpp
   TableWriterTestBase.cpp
   TableScanTestBase.cpp

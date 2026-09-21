@@ -162,6 +162,44 @@ struct StringGatherField {
   int32_t heap;
 };
 
+/// Build-time id encoding (CPU parity, 2026-09-03): overwrite the 8-byte
+/// field at field_offset of rows [start_row, start_row+num_rows) with
+/// tag | local_row, so the matcher's gathered id already carries the
+/// build driver (container) id, exactly like the CPU hybrid join's row ids.
+void rewriteRowIdField(
+    uint8_t* d_rows,
+    int64_t start_row,
+    int64_t num_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    uint64_t tag,
+    cudaStream_t stream);
+
+/// Gather one 8-byte field of the rows at d_idx into d_out.
+void gatherU64Field(
+    const uint8_t* d_rows,
+    int32_t row_width,
+    int32_t field_offset,
+    const int32_t* d_idx,
+    int32_t n,
+    uint64_t* d_out,
+    cudaStream_t stream);
+
+/// Batched rebase: one launch for all rows of a concatenation. Row r belongs
+/// to batch b with batch_row_start[b] <= r < batch_row_start[b+1]
+/// (num_batches+1 entries, device) and gets batch_heap_base[b] added to its
+/// out-of-line offsets.
+void rebaseStringOffsetsBatched(
+    uint8_t* d_rows,
+    int64_t num_rows,
+    int32_t row_width,
+    const int32_t* d_str_field_offsets,
+    int32_t num_str_fields,
+    const int64_t* d_batch_row_start,
+    const int64_t* d_batch_heap_base,
+    int32_t num_batches,
+    cudaStream_t stream);
+
 /// Add delta to every out-of-line offset of the listed string fields.
 void rebaseStringOffsets(
     uint8_t* d_rows,

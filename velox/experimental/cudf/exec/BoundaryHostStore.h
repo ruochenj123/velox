@@ -107,6 +107,33 @@ class BoundaryHostStore {
   void coalesce() {
     container_.coalesceBatches();
   }
+  /// Coalesced mode, after coalesce(): the single merged batch.
+  RowVectorPtr coalescedBatch() const {
+    return container_.getCoalescedBatch();
+  }
+  exec::HybridContainer& container() {
+    return container_;
+  }
+
+  /// int32 global ids (the GPU probe's survivor build ids).
+  void gatherCoalesced(
+      int32_t childIdx,
+      const int32_t* globalRows,
+      int32_t numRows,
+      const VectorPtr& result,
+      std::vector<const char*>& rowsScratch,
+      std::vector<exec::HybridRowId>& idsScratch) const {
+    idsScratch.resize(numRows);
+    for (int32_t i = 0; i < numRows; ++i) {
+      idsScratch[i] = exec::HybridRowId{0, static_cast<uint64_t>(globalRows[i])};
+    }
+    static const char kSentinel = 0;
+    if (static_cast<int32_t>(rowsScratch.size()) < numRows) {
+      rowsScratch.assign(numRows, &kSentinel);
+    }
+    const_cast<exec::HybridContainer&>(container_).extractColumn(
+        rowsScratch.data(), numRows, childIdx, result, idsScratch);
+  }
 
   /// Coalesced mode only: gather column `childIdx` at GLOBAL row ids.
   void gatherCoalesced(
@@ -190,7 +217,7 @@ class BoundaryHostStore {
   /// only reads container state).
   void gather(
       int32_t childIdx,
-      std::vector<exec::HybridRowId>& ids,
+      const std::vector<exec::HybridRowId>& ids,
       const VectorPtr& result,
       std::vector<const char*>& rowsScratch) const {
     const auto n = static_cast<int32_t>(ids.size());
@@ -198,10 +225,15 @@ class BoundaryHostStore {
     if (static_cast<int32_t>(rowsScratch.size()) < n) {
       rowsScratch.assign(n, &kSentinel);
     }
-    // extractColumn is logically const here (pure read in scattered mode);
-    // HybridContainer just does not mark it so.
+    // extractColumn is logically const here (pure read in scattered mode,
+    // ids included); HybridContainer just does not mark it so. Sharing one
+    // ids vector across concurrent column gathers is therefore safe.
     const_cast<exec::HybridContainer&>(container_).extractColumn(
-        rowsScratch.data(), n, /*columnIndex=*/childIdx, result, ids);
+        rowsScratch.data(),
+        n,
+        /*columnIndex=*/childIdx,
+        result,
+        const_cast<std::vector<exec::HybridRowId>&>(ids));
   }
 
  private:
@@ -215,6 +247,103 @@ class BoundaryHostStore {
   std::vector<int64_t> batchStarts_;
   std::vector<RowVectorPtr> batches_;
   int64_t totalRows_ = 0;
+};
+
+
+/// The CPU hybrid join's build-side layout, on the GPU boundary: one
+/// COALESCED per-driver store per build driver, registered as containers
+/// 0..N-1 of one HybridContainer group, so a survivor's build payload is
+/// extracted by container id exactly as the CPU probe does (per-container
+/// grouped, pre-decoded, prefetched extraction). The only GPU-specific step
+/// is mapping the matcher's global build row id to (driver chunk, local row)
+/// with a search over the (<=16) chunk starts.
+class MultiBoundaryHostStore {
+ public:
+  explicit MultiBoundaryHostStore(std::vector<std::shared_ptr<BoundaryHostStore>> chunks)
+      : chunks_(std::move(chunks)) {
+    VELOX_CHECK(!chunks_.empty());
+    VELOX_CHECK_LE(chunks_.size(), 255, "too many build drivers for uint8 container ids");
+    int64_t start = 0;
+    for (size_t k = 0; k < chunks_.size(); ++k) {
+      chunkStarts_.push_back(start);
+      start += chunks_[k]->totalRows();
+      chunks_[k]->container().setId(static_cast<uint8_t>(k));
+      all_[static_cast<uint8_t>(k)] = &chunks_[k]->container();
+    }
+    totalRows_ = start;
+    for (auto& c : chunks_) {
+      c->container().setAllContainers(all_);
+      // As the CPU hybrid join arm (--hybrid_join_reorder_enabled=false):
+      // extract in survivor order, no reorder-by-container pass.
+      c->container().setReorderEnabled(false);
+    }
+  }
+  int64_t totalRows() const {
+    return totalRows_;
+  }
+  const RowTypePtr& rowType() const {
+    return chunks_[0]->rowType();
+  }
+  static constexpr int kLocalBits = 48;
+  static constexpr uint64_t kLocalMask = (1ULL << kLocalBits) - 1;
+  /// Gather at BUILD-TIME-ENCODED ids (containerId << 48 | localRow), the
+  /// CPU mechanism: no mapping on the extraction path.
+  void gatherEncoded(
+      int32_t childIdx,
+      const uint64_t* encoded,
+      int32_t numRows,
+      const VectorPtr& result,
+      std::vector<const char*>& rowsScratch,
+      std::vector<exec::HybridRowId>& idsScratch) const {
+    idsScratch.resize(numRows);
+    for (int32_t i = 0; i < numRows; ++i) {
+      const uint64_t v = encoded[i];
+      idsScratch[i] = exec::HybridRowId{
+          static_cast<uint8_t>(v >> kLocalBits), v & kLocalMask};
+    }
+    static const char kSentinel = 0;
+    if (static_cast<int32_t>(rowsScratch.size()) < numRows) {
+      rowsScratch.assign(numRows, &kSentinel);
+    }
+    const_cast<exec::HybridContainer&>(chunks_[0]->container())
+        .extractColumn(rowsScratch.data(), numRows, childIdx, result, idsScratch);
+  }
+
+  /// Gather column `childIdx` at GLOBAL build row ids (the matcher's ids).
+  void gather(
+      int32_t childIdx,
+      const int32_t* globalRows,
+      int32_t numRows,
+      const VectorPtr& result,
+      std::vector<const char*>& rowsScratch,
+      std::vector<exec::HybridRowId>& idsScratch) const {
+    idsScratch.resize(numRows);
+    const auto nChunks = chunkStarts_.size();
+    for (int32_t i = 0; i < numRows; ++i) {
+      const int64_t g = globalRows[i];
+      size_t k = nChunks - 1;
+      if (nChunks > 1) {
+        // last chunk whose start <= g
+        k = static_cast<size_t>(
+            std::upper_bound(chunkStarts_.begin(), chunkStarts_.end(), g) -
+            chunkStarts_.begin() - 1);
+      }
+      idsScratch[i] = exec::HybridRowId{
+          static_cast<uint8_t>(k), static_cast<uint64_t>(g - chunkStarts_[k])};
+    }
+    static const char kSentinel = 0;
+    if (static_cast<int32_t>(rowsScratch.size()) < numRows) {
+      rowsScratch.assign(numRows, &kSentinel);
+    }
+    const_cast<exec::HybridContainer&>(chunks_[0]->container())
+        .extractColumn(rowsScratch.data(), numRows, childIdx, result, idsScratch);
+  }
+
+ private:
+  std::vector<std::shared_ptr<BoundaryHostStore>> chunks_;
+  std::vector<int64_t> chunkStarts_;
+  std::unordered_map<uint8_t, exec::HybridContainer*> all_;
+  int64_t totalRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

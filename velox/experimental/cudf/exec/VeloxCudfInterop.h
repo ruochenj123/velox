@@ -32,6 +32,10 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type);
 
 namespace with_arrow {
 
+/// Host wall time (ns) spent inside to_arrow_host (the result D2H copies),
+/// accumulated per thread; the reporting operator reads and resets it.
+int64_t& toVeloxD2HNanos();
+
 // Optional per-call phase timing for toCudfTable, filled when a non-null
 // pointer is passed. Phases: exportToArrow (array + schema, pure CPU),
 // the cudf::from_arrow call (device alloc + copy enqueue), and the stream

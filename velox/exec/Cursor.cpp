@@ -303,7 +303,10 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
         std::move(queryCtx_),
         Task::ExecutionMode::kParallel,
         // consumer
-        [queueHolder, copyResult = params.copyResult, taskId = taskId_](
+        [queueHolder,
+         copyResult = params.copyResult,
+         flattenResult = params.flattenResult,
+         taskId = taskId_](
             const RowVectorPtr& vector,
             bool drained,
             velox::ContinueFuture* future) {
@@ -313,6 +316,16 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
             return exec::BlockingReason::kNotBlocked;
           }
 
+          if (vector && flattenResult) {
+            VectorPtr flat = vector;
+            BaseVector::flattenVector(flat);
+            if (flat.get() != vector.get()) {
+              return queue->enqueue(
+                  std::static_pointer_cast<RowVector>(std::move(flat)),
+                  drained,
+                  future);
+            }
+          }
           if (!vector || !copyResult) {
             return queue->enqueue(vector, drained, future);
           }

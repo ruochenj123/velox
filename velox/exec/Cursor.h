@@ -110,6 +110,14 @@ struct CursorParameters {
   /// callback (if non-null) is invoked with the current vector before the
   /// cursor pauses.
   TBreakpointMap breakpoints = {};
+
+  /// If true, results are flattened (dictionary/constant/lazy encodings
+  /// materialized) in the sink callback, i.e. on the driver thread inside the
+  /// task's execution window. Makes a probe that emits dictionary-wrapped
+  /// probe-side columns pay for materializing them, like a consumer would.
+  /// Already-flat vectors are untouched.
+  bool flattenResult = false;
+
 };
 
 /// Abstract interface for iterating over query results. TaskCursor manages

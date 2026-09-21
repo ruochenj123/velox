@@ -34,6 +34,7 @@ add_library(
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   RowHashJoin.cpp
+  RowOrderBy.cpp
   SparkAggregateFunctions.cpp
   ToCudf.cpp
   Utilities.cpp
