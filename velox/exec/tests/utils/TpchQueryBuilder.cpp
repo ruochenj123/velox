@@ -49,6 +49,7 @@ DECLARE_bool(synth_join_build_filter);
 DECLARE_int32(synth_join_keys);
 DECLARE_int32(synth_probe_payload_cols);
 DECLARE_int32(synth_build_sel);
+DECLARE_string(synth_semijoin_bitmap);
 DECLARE_int32(synth_probe_sel);
 DECLARE_bool(synth_payload_strings_first);
 DECLARE_bool(synth_join_agg);
@@ -800,6 +801,8 @@ TpchPlan TpchQueryBuilder::buildQueryPlan(int queryId) const {
       return getQ45Plan();
     case 46:
       return getQ46Plan();
+    case 47:
+      return getQ47Plan();
     default:
       VELOX_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -3885,6 +3888,79 @@ TpchPlan TpchQueryBuilder::getQ45Plan() const {
   return context;
 }
 
+TpchPlan TpchQueryBuilder::getQ47Plan() const {
+  // Same payload flags as Q45: --synth_probe_payload_cols bounds lineitem's
+  // payload, --synth_payload_cols bounds EACH build's payload (negative = all).
+  static const std::vector<std::string> kLineitemPayload = {
+      "l_orderkey",      "l_linenumber",     "l_quantity",
+      "l_extendedprice", "l_discount",       "l_tax",
+      "l_returnflag_str", "l_linestatus_str", "l_shipdate",
+      "l_commitdate",    "l_receiptdate",    "l_shipinstruct",
+      "l_shipmode_str",  "l_comment"};
+  static const std::vector<std::string> kPartPayload = {
+      "p_name",       "p_mfgr_str",      "p_brand_str",   "p_type_str",
+      "p_size",       "p_container_str", "p_retailprice", "p_comment"};
+  static const std::vector<std::string> kSupplierPayload = {
+      "s_nationkey", "s_acctbal", "s_name_str", "s_address_str",
+      "s_phone_str", "s_comment_str"};
+  auto take = [](const std::vector<std::string>& all, int n) {
+    const int k = n < 0 ? static_cast<int>(all.size())
+                        : std::clamp(n, 0, static_cast<int>(all.size()));
+    return std::vector<std::string>(all.begin(), all.begin() + k);
+  };
+  std::vector<std::string> lineitemCols = {"l_partkey", "l_suppkey"};
+  for (const auto& c : take(kLineitemPayload, FLAGS_synth_probe_payload_cols)) {
+    lineitemCols.push_back(c);
+  }
+  std::vector<std::string> partCols = {"p_partkey"};
+  for (const auto& c : take(kPartPayload, FLAGS_synth_payload_cols)) {
+    partCols.push_back(c);
+  }
+  std::vector<std::string> supplierCols = {"s_suppkey"};
+  for (const auto& c : take(kSupplierPayload, FLAGS_synth_payload_cols)) {
+    supplierCols.push_back(c);
+  }
+  auto lineitemType = getRowType(kLineitem, lineitemCols);
+  auto partType = getRowType(kPart, partCols);
+  auto supplierType = getRowType(kSupplier, supplierCols);
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId;
+  core::PlanNodeId partScanId;
+  core::PlanNodeId supplierScanId;
+  auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(kPart, partType, getFileColumnNames(kPart), {})
+                  .captureScanNodeId(partScanId)
+                  .planNode();
+  auto supplier =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kSupplier, supplierType, getFileColumnNames(kSupplier), {})
+          .captureScanNodeId(supplierScanId)
+          .planNode();
+  std::vector<std::string> join1Cols = lineitemCols;
+  join1Cols.insert(join1Cols.end(), partCols.begin(), partCols.end());
+  std::vector<std::string> outputCols = join1Cols;
+  outputCols.insert(outputCols.end(), supplierCols.begin(), supplierCols.end());
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, lineitemType, getFileColumnNames(kLineitem), {})
+          .captureScanNodeId(lineitemScanId)
+          .hashJoin({"l_partkey"}, {"p_partkey"}, part, "", join1Cols)
+          .hashJoin({"l_suppkey"}, {"s_suppkey"}, supplier, "", outputCols)
+          .planNode();
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q47_lps_p{}_b{}", lineitemCols.size() - 2, partCols.size() - 1);
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemScanId] = getTableFilePaths(kLineitem);
+  context.dataFiles[partScanId] = getTableFilePaths(kPart);
+  context.dataFiles[supplierScanId] = getTableFilePaths(kSupplier);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getQ44PlanImpl(bool sortAfter) const {
   // Payload order per side: fixed-width columns first, then strings in
   // DECREASING length. A width sweep therefore reads "numeric payload grows,
@@ -4051,9 +4127,15 @@ TpchPlan TpchQueryBuilder::getQ44PlanImpl(bool sortAfter) const {
                      lineitemType,
                      lineitemFileColumns,
                      lineitemFilters)
-                 .captureScanNodeId(lineitemScanId)
-                 .hashJoin(
-                     {"l_orderkey"}, {"o_orderkey"}, orders, "", outputCols);
+                 .captureScanNodeId(lineitemScanId);
+  // Semi-join reduction (2026-09-22): drop lineitem rows whose order does not
+  // survive the build-side filter, on the CPU, before the boundary. A
+  // FilterNode (not a scan subfield filter: those must be simple predicates);
+  // the function is not cuDF-convertible, so the FilterProject stays on the CPU.
+  if (!FLAGS_synth_semijoin_bitmap.empty()) {
+    q44.filter("bitmap_contains(l_orderkey)");
+  }
+  q44.hashJoin({"l_orderkey"}, {"o_orderkey"}, orders, "", outputCols);
   if (sortAfter) {
     // Q46: sort the join result on (l_orderkey, l_linenumber) -- the sort
     // consumes the probe's rows on the device and is the chain endpoint.

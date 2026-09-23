@@ -100,6 +100,15 @@ class CudfFromVelox : public CudfOperatorBase {
     std::vector<VectorPtr> keepAlive;
     std::vector<const uint8_t*> srcs;
     std::vector<const uint64_t*> rawNullsPtrs;
+    // 2026-09-22: DICTIONARY children (e.g. a FilterProject's lazily
+    // selected output) are packed THROUGH their indices instead of being
+    // flattened per input vector: idx[b*numCols+c] is the dictionary's
+    // index array (nullptr = flat child, read positionally) and srcs[]
+    // then points at the flat BASE vector's values.
+    std::vector<const vector_size_t*> idx;
+    // Base vectors of dictionary children (the wrapper in keepAlive holds the
+    // indices; the base is what srcs[] points into).
+    std::vector<VectorPtr> keepAliveBase;
     bool anyNulls{false};
     int32_t nullStride{0};
     int64_t heapOffset{0};

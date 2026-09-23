@@ -1929,7 +1929,7 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   // A probe feeding a BUILD emits rows for eager batches only.
   if (emitColumnar_ == 1 || (nextIsBuild_ && !deferredOutputCols_.empty())) {
     if (hostExit_ &&
-        (probeProvStore_ != nullptr ||
+        (probeProvStore_ != nullptr || !deferredBuildOutputCols_.empty() ||
          CudfConfig::getInstance().benchmarkRowOutputNative)) {
       return makeHostOutput(
           numMatches,

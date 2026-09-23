@@ -168,6 +168,10 @@ class TpchQueryBuilder {
   // join skeleton. Same flags/semantics as Q44; l_partkey is random w.r.t.
   // lineitem's physical order, so build-side gathers have no locality.
   TpchPlan getQ45Plan() const;
+  // Q47: left-deep chain with a CPU exit, (lineitem |><| part) |><| supplier,
+  // both keys from lineitem, SELECT * -- deferral figure panel (b): T =
+  // lineitem, S = part (inner build), R = supplier (last build) (2026-09-21).
+  TpchPlan getQ47Plan() const;
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {

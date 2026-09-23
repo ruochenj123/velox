@@ -22,6 +22,9 @@
 #include <iostream>
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/functions/Macros.h"
+#include "velox/functions/Registerer.h"
+#include <fstream>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -207,8 +210,56 @@ void TpchBenchmark::initQueryBuilder() {
   queryBuilder_->initialize(FLAGS_data_path);
 }
 
+
+// 2026-09-22 semi-join reduction (MSR-style sideways information passing, done
+// statically): a bitmap over o_orderkey of the orders that survive the
+// build-side filter; the q44 plan adds the CPU filter bitmap_contains(l_orderkey)
+// on lineitem so rows that cannot join never reach the boundary. Built by
+// exp/.../semijoin/make_bitmaps.py (uint64 words, bit k = key k survives).
+DEFINE_string(
+    synth_semijoin_bitmap,
+    "",
+    "Path of the surviving-build-key bitmap; empty = no semi-join reduction");
+
+namespace {
+std::vector<uint64_t> gSemijoinBitmap;
+int64_t gSemijoinBits = 0;
+
+template <typename T>
+struct BitmapContainsFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+  FOLLY_ALWAYS_INLINE void call(bool& out, const int64_t& key) {
+    out = key >= 0 && key < gSemijoinBits &&
+        ((gSemijoinBitmap[key >> 6] >> (key & 63)) & 1ULL) != 0;
+  }
+};
+
+void loadSemijoinBitmap(const std::string& path) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  VELOX_CHECK(in.good(), "cannot open semi-join bitmap {}", path);
+  const auto bytes = static_cast<size_t>(in.tellg());
+  gSemijoinBitmap.assign(bytes / sizeof(uint64_t), 0);
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(gSemijoinBitmap.data()), bytes);
+  gSemijoinBits = static_cast<int64_t>(gSemijoinBitmap.size()) * 64;
+  size_t ones = 0;
+  for (auto w : gSemijoinBitmap) {
+    ones += __builtin_popcountll(w);
+  }
+  std::cerr << "[semijoin] bitmap " << path << ": " << bytes / 1e6 << " MB, "
+            << ones << " surviving keys" << std::endl;
+  ::facebook::velox::registerFunction<
+      BitmapContainsFunction,
+      bool,
+      int64_t>({"bitmap_contains"});
+}
+} // namespace
+
 void TpchBenchmark::initialize() {
   QueryBenchmarkBase::initialize();
+  if (!FLAGS_synth_semijoin_bitmap.empty()) {
+    loadSemijoinBitmap(FLAGS_synth_semijoin_bitmap);
+  }
   initQueryBuilder();
 }
 

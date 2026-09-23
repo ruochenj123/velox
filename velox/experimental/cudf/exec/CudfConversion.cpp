@@ -611,15 +611,23 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
             };
             walk(root);
           }
-          if (numJoins == 1 && numSorts == 0 && !buildGpuConsumer &&
+          // General endpoint rule (2026-09-21): the build defers whenever
+          // ITS join exits straight to the CPU, in a plan with any number
+          // of joins (paper Fig. deferral (b): the LAST join's build R).
+          // The builds of the inner joins of a chain have a parent (the
+          // next join) and stay eager above; a sort is always a parent.
+          // Before, the rule also required numJoins == 1 && numSorts == 0.
+          (void)numJoins;
+          (void)numSorts;
+          if (!buildGpuConsumer &&
               (minBytes <= 0 || buildBytes >= minBytes)) {
             deferralEligible_ = true;
             boundaryMode_ = 1;
             payloadGateChecked_ = true; // plan rule + probe-width gate
             addRuntimeStat("fromVeloxBuildDefer", RuntimeCounter(1));
-          } else if (numJoins == 1 && numSorts == 0 && buildGpuConsumer) {
+          } else if (buildGpuConsumer) {
             addRuntimeStat("fromVeloxBuildGpuConsumerEager", RuntimeCounter(1));
-          } else if (numJoins == 1 && numSorts == 0) {
+          } else {
             addRuntimeStat("fromVeloxBuildGateEager", RuntimeCounter(1));
           }
         }
@@ -973,6 +981,8 @@ bool CudfFromVelox::loadChildren(
   auto& keepAlive = pb.keepAlive;
   auto& srcs = pb.srcs;
   auto& rawNullsPtrs = pb.rawNullsPtrs;
+  auto& idx = pb.idx;
+  auto& keepAliveBase = pb.keepAliveBase;
   bool& anyNulls = pb.anyNulls;
   // ---- Load children; require flat, null-free, materialized ----
   // Loading a lazy child materializes the scan column -- work the merge path
@@ -1028,11 +1038,46 @@ bool CudfFromVelox::loadChildren(
       // flatten here (a copy of the StringViews, not of the bytes).
       // Subset-pack channels (boundary crossing / pruned) must also be
       // flat: filter pushdown yields DICTIONARY columns.
+      // 2026-09-22: a DICTIONARY child over a FLAT, null-free base (what a
+      // FilterProject emits for the surviving rows of each input vector) is
+      // packed through its indices -- no per-vector flatten (which cost
+      // ~18x per cell on the semi-join cells: one allocation + copy per
+      // column per 1K-row vector). Dictionary-level nulls are positional
+      // and ride in rawNullsPtrs like flat nulls; a nullable base or a
+      // nested wrapper still takes the flatten path below.
+      if (child != nullptr && rowMode &&
+          child->encoding() == VectorEncoding::Simple::DICTIONARY) {
+        auto baseVec = BaseVector::loadedVectorShared(child->valueVector());
+        const bool dictNulls = child->rawNulls() != nullptr;
+        // A nulls buffer on the base does not mean it has nulls (readers
+        // attach all-valid buffers); count once per (batch, channel).
+        const bool baseHasNulls = baseVec != nullptr &&
+            baseVec->rawNulls() != nullptr &&
+            BaseVector::countNulls(baseVec->nulls(), baseVec->size()) > 0;
+        if (baseVec != nullptr &&
+            baseVec->encoding() == VectorEncoding::Simple::FLAT &&
+            !baseHasNulls && baseVec->valuesAsVoid() != nullptr &&
+            (!dictNulls || (allowNulls && !isKeyChannel(c)))) {
+          addRuntimeStat("fromVeloxDictPacked", RuntimeCounter(1));
+          idx[b * numCols + c] = child->wrapInfo()->as<vector_size_t>();
+          srcs[b * numCols + c] =
+              static_cast<const uint8_t*>(baseVec->valuesAsVoid());
+          if (dictNulls) {
+            rawNullsPtrs[b * numCols + c] = child->rawNulls();
+            anyNulls = true;
+          }
+          // Keep both the wrapper (indices, nulls) and the base alive.
+          keepAlive[b * numCols + c] = std::move(child);
+          keepAliveBase[b * numCols + c] = std::move(baseVec);
+          continue;
+        }
+      }
       if (child != nullptr && rowMode &&
           child->encoding() != VectorEncoding::Simple::FLAT &&
           (boundary || prunedPack_ ||
            inRowType->childAt(c)->kind() == TypeKind::VARCHAR ||
            inRowType->childAt(c)->kind() == TypeKind::VARBINARY)) {
+        addRuntimeStat("fromVeloxDictFlattened", RuntimeCounter(1));
         BaseVector::flattenVector(child);
         child = BaseVector::loadedVectorShared(child);
       }
@@ -1112,6 +1157,7 @@ void CudfFromVelox::packIntoSlot(
   const int numCols = pb.numCols;
   const auto& srcs = pb.srcs;
   const auto& rawNullsPtrs = pb.rawNullsPtrs;
+  const auto& idxs = pb.idx;
   const bool anyNulls = pb.anyNulls;
   const int32_t nullStride = pb.nullStride;
   const int64_t heapOffset = pb.heapOffset;
@@ -1164,7 +1210,9 @@ void CudfFromVelox::packIntoSlot(
           // Inline StringViews (<= 12B) are byte-identical to the slot.
           // Longer ones: len + prefix stay, the pointer becomes a heap
           // offset and the bytes are appended to the heap region.
-          const auto* sv = reinterpret_cast<const StringView*>(src) + t0;
+          const vector_size_t* ix = idxs[b * numCols + c];
+          const auto* sv = reinterpret_cast<const StringView*>(src) +
+              (ix == nullptr ? t0 : 0);
           const uint64_t* nulls = rawNullsPtrs[b * numCols + c];
           uint8_t* d = tile + off;
           for (int64_t r = 0; r < n; r++, d += rowWidth) {
@@ -1172,7 +1220,7 @@ void CudfFromVelox::packIntoSlot(
               std::memset(d, 0, kRowStrSlotBytes);
               continue;
             }
-            const auto& v = sv[r];
+            const auto& v = ix == nullptr ? sv[r] : sv[ix[t0 + r]];
             if (v.size() <= kRowStrInlineMax) {
               std::memcpy(d, &v, kRowStrSlotBytes);
             } else {
@@ -1184,6 +1232,28 @@ void CudfFromVelox::packIntoSlot(
               std::memcpy(d + 8, &hoff, 8);
               std::memcpy(heapBase + heapCursor, v.data(), len);
               heapCursor += len;
+            }
+          }
+          continue;
+        }
+        const vector_size_t* ix = idxs[b * numCols + c];
+        if (ix != nullptr) {
+          // Dictionary child: gather from the flat base through the indices.
+          const vector_size_t* ixt = ix + t0;
+          uint8_t* d = tile + off;
+          if (w == 8) {
+            const uint64_t* s = reinterpret_cast<const uint64_t*>(src);
+            for (int64_t r = 0; r < n; r++, d += rowWidth) {
+              *reinterpret_cast<uint64_t*>(d) = s[ixt[r]];
+            }
+          } else if (w == 4) {
+            const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+            for (int64_t r = 0; r < n; r++, d += rowWidth) {
+              *reinterpret_cast<uint32_t*>(d) = s[ixt[r]];
+            }
+          } else {
+            for (int64_t r = 0; r < n; r++, d += rowWidth) {
+              std::memcpy(d, src + static_cast<int64_t>(ixt[r]) * w, w);
             }
           }
           continue;
@@ -1252,10 +1322,16 @@ void CudfFromVelox::packIntoSlot(
       const int64_t n = selectedInputs[b]->size();
       for (int c = 0; c < numCols; c++) {
         const int32_t w = rowFields_[c].byte_width;
-        std::memcpy(
-            base + colOff[c] + rowsSoFar * w,
-            srcs[b * numCols + c],
-            static_cast<size_t>(n) * w);
+        const vector_size_t* ix = idxs[b * numCols + c];
+        uint8_t* dst = base + colOff[c] + rowsSoFar * w;
+        if (ix == nullptr) {
+          std::memcpy(dst, srcs[b * numCols + c], static_cast<size_t>(n) * w);
+        } else {
+          const uint8_t* s = srcs[b * numCols + c];
+          for (int64_t r = 0; r < n; r++) {
+            std::memcpy(dst + r * w, s + static_cast<int64_t>(ix[r]) * w, w);
+          }
+        }
       }
       rowsSoFar += n;
     }
@@ -1393,6 +1469,8 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
   pb.keepAlive.resize(selectedInputs.size() * numCols);
   pb.srcs.resize(selectedInputs.size() * numCols);
   pb.rawNullsPtrs.assign(selectedInputs.size() * numCols, nullptr);
+  pb.idx.assign(selectedInputs.size() * numCols, nullptr);
+  pb.keepAliveBase.resize(selectedInputs.size() * numCols);
   if (!loadChildren(selectedInputs, inRowType, rowMode, boundary, pb)) {
     return nullptr;
   }
@@ -1433,12 +1511,14 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
         const auto* sv =
             reinterpret_cast<const StringView*>(pb.srcs[b * numCols + c]);
         const uint64_t* nulls = pb.rawNullsPtrs[b * numCols + c];
+        const vector_size_t* ix = pb.idx[b * numCols + c];
         for (int64_t r = 0; r < n; r++) {
           if (nulls != nullptr && velox::bits::isBitNull(nulls, r)) {
             continue;
           }
-          if (sv[r].size() > kRowStrInlineMax) {
-            heapBytes += sv[r].size();
+          const auto& v = ix == nullptr ? sv[r] : sv[ix[r]];
+          if (v.size() > kRowStrInlineMax) {
+            heapBytes += v.size();
           }
         }
       }
