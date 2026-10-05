@@ -976,6 +976,70 @@ __global__ void compact_strings_kernel(
   }
 }
 
+// Warp-per-row compaction (2026-10-05). The thread-per-row kernel above copies
+// each string byte by byte from one thread: adjacent threads write ~100 B
+// apart, so every store touches 32 cache lines for one byte each (measured
+// 1.58 s of 3.45 s kernel time at the full q44 join, ~38 GB/s). Here one warp
+// owns one output row: lane f reads string field f's slot, a warp scan of the
+// out-of-line lengths gives each field's offset in the row's heap region, and
+// the warp then copies the row's string bytes 32 at a time, byte b of the
+// region by lane b % 32 -- consecutive lanes write consecutive bytes
+// (coalesced) and read consecutive bytes of the same source string. Same
+// output as compact_strings_kernel; requires num_fields <= 32.
+constexpr int kCompactWarpsPerBlock = 8;
+
+__global__ void compact_strings_warp_kernel(
+    uint8_t* __restrict__ rows,
+    int32_t num_rows,
+    int32_t row_width,
+    const StringGatherField* __restrict__ fields,
+    int32_t num_fields,
+    const uint8_t* __restrict__ heap0,
+    const uint8_t* __restrict__ heap1,
+    const int64_t* __restrict__ row_base,
+    uint8_t* __restrict__ out_chars) {
+  __shared__ uint32_t sEnd[kCompactWarpsPerBlock][32];
+  __shared__ uint32_t sBegin[kCompactWarpsPerBlock][32];
+  __shared__ const uint8_t* sSrc[kCompactWarpsPerBlock][32];
+  constexpr unsigned kFull = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  const int w = threadIdx.x >> 5;
+  const int64_t row = (int64_t)blockIdx.x * kCompactWarpsPerBlock + w;
+  if (row >= num_rows) return;   // whole warp exits together
+  uint8_t* r = rows + row * row_width;
+  uint32_t len = 0;
+  const uint8_t* src = nullptr;
+  if (lane < num_fields) {
+    const uint32_t l = slot_len(r + fields[lane].dst_offset);
+    if (l > kRowStrInlineMax) {
+      len = l;
+      src = (fields[lane].heap == 0 ? heap0 : heap1) +
+          slot_off(r + fields[lane].dst_offset);
+    }
+  }
+  uint32_t end = len;   // inclusive scan -> end of this field's bytes
+  for (int d = 1; d < 32; d <<= 1) {
+    const uint32_t v = __shfl_up_sync(kFull, end, d);
+    if (lane >= d) end += v;
+  }
+  const uint32_t total = __shfl_sync(kFull, end, 31);
+  if (total == 0) return;
+  const int64_t base = row_base[row];
+  sEnd[w][lane] = end;
+  sBegin[w][lane] = end - len;
+  sSrc[w][lane] = src;
+  __syncwarp();
+  if (len > 0) {
+    slot_set_off(r + fields[lane].dst_offset, (uint64_t)(base + end - len));
+  }
+  uint8_t* dst = out_chars + base;
+  int k = 0;   // field holding byte b; b only grows, so the search moves forward
+  for (uint32_t b = lane; b < total; b += 32) {
+    while (sEnd[w][k] <= b) k++;
+    dst[b] = sSrc[w][k][b - sBegin[w][k]];
+  }
+}
+
 void compactStrings(
     uint8_t* d_rows,
     int32_t num_rows,
@@ -988,6 +1052,14 @@ void compactStrings(
     uint8_t* d_out_chars,
     cudaStream_t stream) {
   if (num_rows == 0 || num_fields == 0) return;
+  if (num_fields <= 32) {
+    const int grid =
+        (num_rows + kCompactWarpsPerBlock - 1) / kCompactWarpsPerBlock;
+    compact_strings_warp_kernel<<<grid, kCompactWarpsPerBlock * 32, 0, stream>>>(
+        d_rows, num_rows, row_width, d_fields, num_fields, d_heap0, d_heap1,
+        d_row_base, d_out_chars);
+    return;
+  }
   int block = 256;
   int grid = (num_rows + block - 1) / block;
   compact_strings_kernel<<<grid, block, 0, stream>>>(

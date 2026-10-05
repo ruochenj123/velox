@@ -25,6 +25,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h" // CudfHashJoinBridge
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/GpuFixedRowStore.h"
+#include "velox/experimental/cudf/exec/HostRowVector.h"
 #include "velox/experimental/cudf/exec/GpuRowHashTable.cuh"
 #include "velox/experimental/cudf/exec/GpuRowOps.cuh"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -43,6 +44,7 @@
 
 #include <cuda_runtime.h>
 
+#include <functional>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -98,12 +100,16 @@ class RowHashJoinBridge : public exec::JoinBridge {
     bool hostStoreScattered{true};
     // Per-driver coalesced chunks under one container group (the CPU
     // build-side layout); when set, the probe gathers build payload here.
-    std::shared_ptr<MultiBoundaryHostStore> hostMultiStore;
+    // 2026-09-27: lazy (coalesce waited for at the first probe gather).
+    std::shared_ptr<LazyMultiBoundaryHostStore> hostMultiStore;
     // Build rows' __rowid field was rewritten to (driver << 48 | local) at
     // build time; the probe gathers that field for survivors and hands the
     // container-encoded ids straight to the extraction (CPU parity).
     bool buildIdsEncoded{false};
     int32_t rowIdFieldOffset{-1};
+    // Field index of that __rowid in the build row (for the output gather's
+    // null-sidecar mapping; the field itself is never null).
+    int32_t rowIdFieldIndex{-1};
 
     // ---- Row-native N:M matcher (CudfConfig::benchmarkRowTable) ----
     // Chained multimap built directly over the key rows of gpuRowStore
@@ -172,15 +178,18 @@ class RowHashJoinBuild : public CudfOperatorBase {
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<RowVectorPtr> inputs_;  // RowStoreVector or CudfVector
   // Per-driver overlapped coalesce of the build's deferred payload
-  // (--boundary_build_defer with --join_deferred_scattered=false): each
+  // (--boundary_build_defer; coalesced build stores): each
   // driver merges ITS retained batches on a background thread while the
   // other drivers are still ingesting; the finalizer links the per-driver
   // merged batches (own first, then peers in collection order == the GPU
   // concat order). Same overlap as the CPU HashBuild's hybrid coalesce.
   std::shared_ptr<BoundaryHostStore> driverProvStore_;
-  std::thread coalesceThread_;
-  std::exception_ptr coalesceError_;
-  void joinCoalesceThread();
+  // 2026-09-27: per-driver coalesce as an async task holding only the store
+  // (not `this`); its future goes to the probe's LazyMultiBoundaryHostStore.
+  std::shared_future<int64_t> coalesceDone_;
+  // Rows retained by this driver (the store itself is filled by the
+  // background merge, so its row count is not readable until then).
+  int64_t driverProvRows_ = 0;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
@@ -221,6 +230,14 @@ class RowHashJoinProbe : public CudfOperatorBase {
     int64_t capacity = 0; // elements
     void ensure(int64_t n);
     ~PinnedIdBuffer();
+  };
+  // Reused pinned (page-locked) host bytes for the CPU exit's row chunks:
+  // fixed size after the first ensure() (one crossing block, --pack_block_mb).
+  struct PinnedBytes {
+    uint8_t* data = nullptr;
+    size_t capacity = 0; // bytes
+    void ensure(size_t bytes);
+    ~PinnedBytes();
   };
 
   // The entire boundary-hybrid probe path: extract keys from the keys-only
@@ -297,6 +314,11 @@ class RowHashJoinProbe : public CudfOperatorBase {
   std::shared_ptr<BoundaryHostStore> probeProvStore_;
   int32_t probeRowIdField_ = -1;
   int32_t outputRowIdField_ = -1;
+  // Build-side deferral at a CPU exit (2026-09-30): the build rowRef
+  // (driver << 48 | local) rides in the output row as one more trailing field
+  // and returns with the rows; -1 when the build side is not deferred.
+  int32_t outputBuildRowIdField_ = -1;
+  std::vector<uint64_t> buildRowRefsHost_; // per output row, read per chunk
   std::vector<int32_t> deferredOutputCols_; // outType indices materialized late
   std::vector<int32_t> deferredBuildOutputCols_; // build cols from bd.hostStore
   std::vector<int32_t> materializeIds_;
@@ -304,12 +326,20 @@ class RowHashJoinProbe : public CudfOperatorBase {
   std::vector<const char*> materializeSentinelScratch_;
   bool hostExit_ = false; // consumer is CudfToVelox: emit host RowVector
   std::vector<uint8_t> hostRowsScratch_;
+  PinnedBytes hostRowsPinned_; // CPU-exit row chunk (host extraction)
+  PinnedBytes hostRowsPinned2_; // second chunk buffer (double buffering)
   std::vector<uint8_t> hostCharsScratch_;
   std::vector<uint8_t> hostNullsScratch_;
   RowVectorPtr makeHostOutput(
       int32_t numMatches,
       rmm::cuda_stream_view stream,
       const int32_t* buildIdsDev = nullptr);
+  void d2hHeapAndNulls(int32_t numMatches, rmm::cuda_stream_view stream);
+  void d2hExtractRows(
+      int32_t numMatches,
+      rmm::cuda_stream_view stream,
+      HostRowExtractor& ex,
+      const std::function<void(int64_t, int64_t, const uint8_t*)>& onChunk);
   std::vector<std::unique_ptr<cudf::column>> transposeGpuOutputColumns(
       int32_t numMatches,
       rmm::cuda_stream_view stream,

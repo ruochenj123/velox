@@ -23,6 +23,10 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+#include <atomic>
+#include <exception>
+#include <thread>
+
 namespace facebook::velox::exec {
 namespace test {
 class RowContainerTestHelper;
@@ -2198,6 +2202,19 @@ class HybridContainer {
   // Controls whether scattered (non-coalesced) mode is used for payloads.
   // In scattered mode, batches are kept separate and row IDs encode (batchId,
   // rowInBatch).
+  /// 2026-09-27: opt in to extractPayloadScatteredFast for single-container
+  /// scattered extraction (the GPU boundary stores). Off by default, so the
+  /// CPU hybrid paths keep their existing kernels.
+  /// 2026-09-27: column-parallel coalesceBatches with n workers (1 = the
+  /// sequential default).
+  void setCoalesceThreads(int32_t n) {
+    coalesceThreads_ = n;
+  }
+
+  void setFastScatteredExtraction(bool enabled) {
+    fastScatteredExtraction_ = enabled;
+  }
+
   void setScatteredModeEnabled(bool enabled) {
     scatteredModeEnabled_ = enabled;
   }
@@ -2351,7 +2368,13 @@ class HybridContainer {
     // copy work moved off the operator thread but end-to-end wall time did
     // not improve, while concurrent in-flight columns pushed the transient
     // peak back toward 2x unless byte-capped — complexity without benefit.)
-    for (int32_t col = 0; col < numPayloadCols; ++col) {
+    // 2026-09-27: optional column-parallel merge (setCoalesceThreads, default
+    // 1 = the sequential loop, unchanged for the CPU hybrid paths). Columns are
+    // independent: each worker builds newChildren[col] and resets only
+    // childAt(col) of each batch. Used by the GPU deferred sort/build stores,
+    // whose coalesce is not hidden behind a long CPU-side phase.
+    newChildren.resize(numPayloadCols);
+    auto mergeColumn = [&](int32_t col) {
       // VARCHAR/VARBINARY: compact out-of-line string bodies into a single
       // buffer instead of merging via BaseVector::copy. copy()'s string path
       // shares the source string buffers, which would leave the merged child
@@ -2419,18 +2442,49 @@ class HybridContainer {
           batch->childAt(col).reset();
           offset += batchSize;
         }
-        newChildren.push_back(std::move(merged));
-        continue;
+        newChildren[col] = std::move(merged);
+        return;
       }
-      newChildren.push_back(
-          BaseVector::create(payloadTypes_[col], totalRows, pool));
-      auto& merged = newChildren.back();
+      newChildren[col] = BaseVector::create(payloadTypes_[col], totalRows, pool);
+      auto& merged = newChildren[col];
       vector_size_t offset = 0;
       for (auto& batch : owningInputs_) {
         const auto batchSize = batch->size();
         merged->copy(batch->childAt(col).get(), offset, 0, batchSize);
         batch->childAt(col).reset();
         offset += batchSize;
+      }
+        };
+    const int32_t nThreads =
+        std::min<int32_t>(std::max<int32_t>(coalesceThreads_, 1), numPayloadCols);
+    if (nThreads <= 1) {
+      for (int32_t col = 0; col < numPayloadCols; ++col) {
+        mergeColumn(col);
+      }
+    } else {
+      std::atomic<int32_t> nextCol{0};
+      std::vector<std::exception_ptr> errors(nThreads);
+      std::vector<std::thread> workers;
+      workers.reserve(nThreads);
+      for (int32_t t = 0; t < nThreads; ++t) {
+        workers.emplace_back([&, t]() {
+          try {
+            for (int32_t col = nextCol++; col < numPayloadCols;
+                 col = nextCol++) {
+              mergeColumn(col);
+            }
+          } catch (...) {
+            errors[t] = std::current_exception();
+          }
+        });
+      }
+      for (auto& w : workers) {
+        w.join();
+      }
+      for (auto& e : errors) {
+        if (e) {
+          std::rethrow_exception(e);
+        }
       }
     }
     for (auto& batch : owningInputs_) {
@@ -2551,6 +2605,12 @@ class HybridContainer {
     // Scattered mode: payloads kept in separate batches
     if (scatteredModeEnabled_) {
       if (isSingleContainer()) {
+        if (fastScatteredExtraction_) {
+          extractPayloadScatteredFast<T, useRowNumbers>(
+              rows, rowNumbers, numRows, columnIndex, resultOffset,
+              flatResult, outputRowIds);
+          return;
+        }
         if (isNullable_[columnIndex]) {
           extractPayloadScatteredWithNulls<T, useRowNumbers>(
               rows, rowNumbers, numRows, columnIndex, resultOffset,
@@ -2894,6 +2954,109 @@ class HybridContainer {
 
     if constexpr (std::is_same_v<T, StringView>) {
       addSharedStringBufferViews(result, flatChild, stringRefBytes);
+    }
+  }
+
+  // ========== Fast scattered extraction (opt-in, 2026-09-27) ==========
+  // For the GPU boundary stores: the survivor ids of a probe store arrive in
+  // retained-batch order (the row-native join emits matches in probe-row
+  // order), so the batch's column is resolved once per batch switch instead of
+  // per value, flat columns (the common case: addPayload flattens a filter's
+  // dictionaries) are read directly instead of through
+  // DecodedVector::valueAt, a null test is only done for batches that may
+  // have nulls, and rows ahead are prefetched: the value at 2*kPrefetchDist
+  // and, for strings, the body at kPrefetchDist (the body sits in the
+  // upstream scan buffer, i.e. usually a cache miss). Results are identical
+  // to extractPayloadScattered{NoNulls,WithNulls}; string bodies are still
+  // copied into the result.
+  template <typename T, bool useRowNumbers>
+  void extractPayloadScatteredFast(
+      const char* const* rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    VELOX_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+    const auto* rowIdPtr = outputRowIds.data();
+
+    // BOOLEAN values are bit-packed: no raw indexing, no prefetch.
+    constexpr bool kDirect = !std::is_same_v<T, bool>;
+    constexpr int32_t kPrefetchDist = 16;
+    auto rawOf = [&](uint32_t b) -> const T* {
+      const auto* d = decodedPayloads_[b][columnIndex].get();
+      return (kDirect && d->isIdentityMapping() && !d->isConstantMapping())
+          ? d->template data<T>()
+          : nullptr;
+    };
+
+    uint32_t curBatch = std::numeric_limits<uint32_t>::max();
+    const DecodedVector* decoded = nullptr;
+    const T* raw = nullptr;
+    bool batchMayHaveNulls = false;
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      if constexpr (kDirect) {
+        if (i + 2 * kPrefetchDist < numRows) {
+          const auto& f = rowIdPtr[i + 2 * kPrefetchDist];
+          const T* p = f.batchId() == curBatch ? raw : rawOf(f.batchId());
+          if (p != nullptr) {
+            __builtin_prefetch(p + f.rowInBatch(), 0, 1);
+          }
+        }
+        if constexpr (std::is_same_v<T, StringView>) {
+          if (i + kPrefetchDist < numRows) {
+            const auto& f = rowIdPtr[i + kPrefetchDist];
+            const T* p = f.batchId() == curBatch ? raw : rawOf(f.batchId());
+            if (p != nullptr) {
+              const auto& v = p[f.rowInBatch()];
+              if (!v.isInline()) {
+                __builtin_prefetch(v.data(), 0, 1);
+              }
+            }
+          }
+        }
+      }
+
+      const char* row;
+      if constexpr (useRowNumbers) {
+        auto rowNumber = rowNumbers[i];
+        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+      } else {
+        row = rows[i];
+      }
+      const auto resultIndex = resultOffset + i;
+      if (row == nullptr) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      const auto& rid = rowIdPtr[i];
+      const auto batchIdx = rid.batchId();
+      const auto rowInBatch = rid.rowInBatch();
+      if (batchIdx != curBatch) {
+        curBatch = batchIdx;
+        decoded = decodedPayloads_[batchIdx][columnIndex].get();
+        raw = rawOf(batchIdx);
+        batchMayHaveNulls = decoded->mayHaveNulls();
+      }
+      if (batchMayHaveNulls && decoded->isNullAt(rowInBatch)) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+      result->setNull(resultIndex, false);
+      const T value =
+          raw != nullptr ? raw[rowInBatch] : decoded->valueAt<T>(rowInBatch);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(resultIndex, value);
+      } else {
+        values[resultIndex] = value;
+      }
     }
   }
 
@@ -3625,6 +3788,10 @@ class HybridContainer {
   // In scattered mode, payload batches are kept separate and row IDs
   // encode (batchId, rowInBatch) instead of global row index.
   bool scatteredModeEnabled_{false};
+  // 2026-09-27: opt-in fast scattered extraction (extractPayloadScatteredFast).
+  bool fastScatteredExtraction_{false};
+  // 2026-09-27: worker threads for coalesceBatches (1 = sequential).
+  int32_t coalesceThreads_{1};
 
   // Decoded payload vectors for scattered mode extraction.
   // Outer vector: per batch (same index as owningInputs_)

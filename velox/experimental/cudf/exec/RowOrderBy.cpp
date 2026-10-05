@@ -235,19 +235,17 @@ void RowOrderBy::concatenateRowInputs() {
       auto store = v->provenanceStore();
       VELOX_CHECK_NOT_NULL(store);
       if (sortStore_ == nullptr) {
-        // Coalesced mode (default): coalesce() before the first gather.
-        // --sort_deferred_scattered: keep the batches as retained and gather
-        // through (batch, row) ids -- no coalesce pass.
+        // ONE coalesced store for the sort: the retained batches are merged
+        // in one parallel pass by coalesceFrom() (sortRows' coalesce thread)
+        // and gathered by global row id.
         sortStore_ = std::make_unique<BoundaryHostStore>(
-            store->rowType(),
-            pool(),
-            /*scattered=*/CudfConfig::getInstance()
-                .benchmarkSortDeferredScattered);
+            store->rowType(), pool(), /*scattered=*/false);
       }
-      const int64_t base = sortStore_->totalRows();
+      const int64_t base = sortStoreRows_;
       for (const auto& b : store->batches()) {
-        sortStore_->addBatch(b);
+        pendingSortBatches_.push_back(b);
       }
+      sortStoreRows_ += store->totalRows();
       idSpaceSoFar += store->totalRows();
       addInt64Field(
           dst,
@@ -387,13 +385,56 @@ void RowOrderBy::sortRows() {
   std::thread coalesceThread;
   std::exception_ptr coalesceError;
   const auto tpCoalesce = std::chrono::steady_clock::now();
-  if (sortStore_ != nullptr && !deferredCols_.empty() &&
-      !CudfConfig::getInstance().benchmarkSortDeferredScattered) {
+  if (sortStore_ != nullptr && !deferredCols_.empty()) {
     coalesceThread = std::thread([&]() {
       try {
-        sortStore_->coalesce();
+        if (!pendingSortBatches_.empty()) {
+          sortStore_->coalesceFrom(pendingSortBatches_);
+          pendingSortBatches_ = {};
+        } else {
+          sortStore_->coalesce();
+        }
       } catch (...) {
         coalesceError = std::current_exception();
+      }
+    });
+  }
+  // Mixed host exit: D2H the string heap now, overlapped with the merge and
+  // the device sort (the heap is final after concatenateRowInputs), in
+  // parallel slices on their own streams.
+  std::thread heapThread;
+  std::exception_ptr heapError;
+  if (hostExtractPath() && hasStrings_ && !hostCharsReady_) {
+    heapThread = std::thread([&]() {
+      try {
+        const size_t bytes = heap_.size();
+        hostChars_.resize(bytes);
+        constexpr int kSlices = 4;
+        std::vector<std::thread> slices;
+        for (int k = 0; k < kSlices; k++) {
+          slices.emplace_back([&, k]() {
+            const size_t b0 = bytes * k / kSlices;
+            const size_t b1 = bytes * (k + 1) / kSlices;
+            if (b1 <= b0) {
+              return;
+            }
+            cudaStream_t st;
+            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            cudaMemcpyAsync(
+                hostChars_.data() + b0,
+                static_cast<const uint8_t*>(heap_.data()) + b0,
+                b1 - b0,
+                cudaMemcpyDeviceToHost,
+                st);
+            cudaStreamSynchronize(st);
+            cudaStreamDestroy(st);
+          });
+        }
+        for (auto& t : slices) {
+          t.join();
+        }
+      } catch (...) {
+        heapError = std::current_exception();
       }
     });
   }
@@ -453,6 +494,13 @@ void RowOrderBy::sortRows() {
   }
   cudaEventRecord(evGatherEnd, stream_.value());
   stream_.synchronize();
+  if (heapThread.joinable()) {
+    heapThread.join();
+    if (heapError) {
+      std::rethrow_exception(heapError);
+    }
+    hostCharsReady_ = true;
+  }
   if (coalesceThread.joinable()) {
     coalesceThread.join();
     if (coalesceError) {
@@ -521,7 +569,10 @@ void RowOrderBy::resolveOutputOnce() {
     for (size_t i = 0; i + 1 < ops.size(); i++) {
       if (ops[i] == this) {
         if (dynamic_cast<CudfToVelox*>(ops[i + 1]) != nullptr) {
-          emitHost_ = 1; // CPU exit: emit host RowVectors directly
+          // CPU exit: emit host RowVectors directly -- native rows
+          // (--row_output_native), or D2H'd rows extracted on the host
+          // (eager and mixed exits), or the deferred ids-only exit.
+          emitHost_ = 1;
         }
         break;
       }
@@ -610,18 +661,6 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
   const size_t D = deferredCols_.size();
   const auto& storeType = sortStore_->rowType();
   std::vector<VectorPtr> out(D);
-  const auto& cfg = CudfConfig::getInstance();
-  const bool scattered = cfg.benchmarkSortDeferredScattered;
-  // Scattered mode: (batch, row) ids for the chunk, computed once and read
-  // by every column's gather (no coalesce pass).
-  std::vector<exec::HybridRowId> scatteredIds;
-  if (scattered) {
-    std::vector<int32_t> g32(n);
-    for (int32_t i = 0; i < n; i++) {
-      g32[i] = static_cast<int32_t>(gids[i]);
-    }
-    sortStore_->idsForGlobalRows(g32.data(), n, scatteredIds);
-  }
   auto work = [&](size_t d0,
                   size_t d1,
                   std::vector<const char*>& rowsScratch,
@@ -631,12 +670,8 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
       const auto childIdx = static_cast<int32_t>(
           storeType->getChildIdx(outputType_->nameOf(deferredCols_[d])));
       auto res = BaseVector::create(type, n, pool());
-      if (scattered) {
-        sortStore_->gather(childIdx, scatteredIds, res, rowsScratch);
-      } else {
-        sortStore_->gatherCoalesced(
-            childIdx, gids.data(), n, res, rowsScratch, idsScratch);
-      }
+      sortStore_->gatherCoalesced(
+          childIdx, gids.data(), n, res, rowsScratch, idsScratch);
       out[d] = std::move(res);
     }
   };
@@ -664,6 +699,21 @@ std::vector<VectorPtr> RowOrderBy::gatherDeferred(
   addRuntimeStat(
       "rowSortDeferredRows", RuntimeCounter(static_cast<int64_t>(n) * D));
   return out;
+}
+
+// CPU exits taken through D2H'd rows (pinned) + parallel host extraction:
+// the mixed deferred exit (sort after a join) and the eager exit without
+// native output. (The mixed exit's device transpose + arrow alternative was
+// removed 2026-09-29: Q46 ps10 11.2 s vs 6.7 s.)
+bool RowOrderBy::hostExtractPath() const {
+  if (emitHost_ != 1) {
+    return false;
+  }
+  if (mixedExit_) {
+    return !deferredCols_.empty();
+  }
+  return deferredCols_.empty() &&
+      !CudfConfig::getInstance().benchmarkRowOutputNative;
 }
 
 RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
@@ -703,7 +753,30 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
   }
   // ---- D2H: this chunk was prefetched by the previous call (or now) ----
   const auto rowsBytes = static_cast<size_t>(n) * rowWidth_;
-  if (prefetchBegin_ != begin) {
+  const auto tpChunkD2H = std::chrono::steady_clock::now();
+  if (hostExtractPath()) {
+    // Pinned double buffer (see pinnedRows_).
+    if (pinnedRows_[0] == nullptr) {
+      const size_t cap = static_cast<size_t>(chunkRows_) * rowWidth_;
+      for (auto& buf : pinnedRows_) {
+        const auto err = cudaHostAlloc(
+            reinterpret_cast<void**>(&buf), cap, cudaHostAllocDefault);
+        VELOX_CHECK(
+            err == cudaSuccess,
+            "RowOrderBy: cudaHostAlloc({} B) failed: {}",
+            cap,
+            cudaGetErrorString(err));
+      }
+    }
+    if (prefetchBegin_ != begin) {
+      cudaMemcpyAsync(
+          pinnedRows_[pinnedCur_],
+          static_cast<const uint8_t*>(sorted_.data()) + begin * rowWidth_,
+          rowsBytes,
+          cudaMemcpyDeviceToHost,
+          stream_.value());
+    }
+  } else if (prefetchBegin_ != begin) {
     hostRows_.resize(rowsBytes);
     cudaMemcpyAsync(
         hostRows_.data(),
@@ -745,10 +818,36 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
   addRuntimeStat(
       "rowSortD2HBytes",
       RuntimeCounter(static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
+  const uint8_t* curRows = nullptr;
+  const int64_t nextBegin = begin + n;
+  if (hostExtractPath()) {
+    curRows = pinnedRows_[pinnedCur_];
+    if (nextBegin < totalRows_) {
+      const auto nextN = static_cast<size_t>(
+          std::min<int64_t>(chunkRows_, totalRows_ - nextBegin));
+      cudaMemcpyAsync(
+          pinnedRows_[1 - pinnedCur_],
+          static_cast<const uint8_t*>(sorted_.data()) + nextBegin * rowWidth_,
+          nextN * rowWidth_,
+          cudaMemcpyDeviceToHost,
+          stream_.value());
+      prefetchBegin_ = nextBegin;
+      pinnedCur_ = 1 - pinnedCur_;
+    } else {
+      prefetchBegin_ = -1;
+    }
+    addRuntimeStat(
+        "rowSortChunkD2HNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpChunkD2H)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+  } else {
   std::swap(hostRows_, hostRowsCur_); // hostRowsCur_ = this chunk
+  curRows = hostRowsCur_.data();
   // Prefetch the NEXT chunk into the (now free) other buffer; the next
   // call's synchronize() waits for it.
-  const int64_t nextBegin = begin + n;
   if (nextBegin < totalRows_) {
     const auto nextN = static_cast<size_t>(
         std::min<int64_t>(chunkRows_, totalRows_ - nextBegin));
@@ -763,12 +862,13 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
   } else {
     prefetchBegin_ = -1;
   }
+  }
 
   const int32_t numCols = outputType_->size();
-  // Eager exit: this chunk's D2H'd rows as a HostRowVector (row bytes + the
-  // shared string heap + this chunk's null sidecar). Under
-  // --row_output_native it is handed over as-is; otherwise it is extracted
-  // into Velox columns here (the shared extractHostRows, via materialize()).
+  // Eager / mixed exit: this chunk's D2H'd rows (+ the shared string heap +
+  // this chunk's null sidecar) are extracted into Velox columns on the host
+  // (hostExtractPath); under --row_output_native an eager chunk is handed
+  // over as a HostRowVector instead.
   if (hasStrings_ && hostCharsShared_ == nullptr) {
     hostCharsShared_ =
         std::make_shared<const std::vector<uint8_t>>(std::move(hostChars_));
@@ -794,7 +894,7 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     for (int32_t r = 0; r < n; r++) {
       memcpy(
           &gids[r],
-          hostRowsCur_.data() + static_cast<int64_t>(r) * rowWidth_ + idOff,
+          curRows + static_cast<int64_t>(r) * rowWidth_ + idOff,
           sizeof(int64_t));
     }
     const auto tpHG = std::chrono::steady_clock::now();
@@ -811,6 +911,37 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
     for (auto c : deferredCols_) {
       f[c] = {-1, 0, kFieldFixed};
     }
+  }
+  if (hostExtractPath()) {
+    // 2026-09-28: the eager columns are extracted over the gather threads,
+    // (column, row range) tasks, string views pointing into the D2H'd heap
+    // (no body copies). Was: HostRowVector::materialize on this thread.
+    const auto tpExtract = std::chrono::steady_clock::now();
+    auto children = extractHostRowsParallel(
+        pool(),
+        outputType_,
+        n,
+        curRows,
+        rowWidth_,
+        f,
+        hostCharsShared_,
+        nullPad_ > 0 ? hostNulls_.data() : nullptr,
+        nullPad_,
+        &nullBits,
+        sortGatherThreads());
+    for (size_t k = 0; k < deferredCols_.size(); k++) {
+      children[deferredCols_[k]] = std::move(deferredChildren[k]);
+    }
+    addRuntimeStat(
+        "rowSortHostExtractNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpExtract)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    addRuntimeStat("hostExitRows", RuntimeCounter(static_cast<int64_t>(n)));
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, n, std::move(children));
   }
   std::vector<uint8_t> rowsOwned = std::move(hostRowsCur_);
   std::vector<uint8_t> nullsOwned;
@@ -831,28 +962,13 @@ RowVectorPtr RowOrderBy::emitHostChunk(int64_t begin, int32_t n) {
       std::move(nullsOwned),
       nullPad_,
       std::move(nullBits));
-  if (CudfConfig::getInstance().benchmarkRowOutputNative && !mixedExit_) {
-    addRuntimeStat(
-        "hostExitNativeBytes",
-        RuntimeCounter(
-            static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
-    return hostRows;
-  }
-  const auto tpExtract = std::chrono::steady_clock::now();
-  auto out = hostRows->materialize();
-  if (mixedExit_) {
-    for (size_t k = 0; k < deferredCols_.size(); k++) {
-      out->childAt(deferredCols_[k]) = std::move(deferredChildren[k]);
-    }
-  }
+  // Native rows (--row_output_native): handed over as-is, no extraction.
+  VELOX_CHECK(CudfConfig::getInstance().benchmarkRowOutputNative && !mixedExit_);
   addRuntimeStat(
-      "rowSortHostExtractNanos",
+      "hostExitNativeBytes",
       RuntimeCounter(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - tpExtract)
-              .count(),
-          RuntimeCounter::Unit::kNanos));
-  return out;
+          static_cast<int64_t>(rowsBytes), RuntimeCounter::Unit::kBytes));
+  return hostRows;
 }
 
 // Device transpose of one chunk of sorted rows into cudf columns, in
@@ -1037,6 +1153,13 @@ RowVectorPtr RowOrderBy::doGetOutput() {
 void RowOrderBy::doClose() {
   Operator::close();
   rowInputs_.clear();
+  pendingSortBatches_.clear();
+  for (auto& buf : pinnedRows_) {
+    if (buf != nullptr) {
+      cudaFreeHost(buf);
+      buf = nullptr;
+    }
+  }
   sortStore_.reset();
   sortedIds_ = rmm::device_buffer{};
   sorted_ = rmm::device_buffer{};

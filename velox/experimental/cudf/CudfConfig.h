@@ -162,11 +162,12 @@ struct CudfConfig {
   /// 0/1 = the operator thread only).
   /// -1 = auto: min(48, hardware_concurrency); 0/1 = operator thread only.
   /// Selective hybrid execution: defer the payload only when the columns
-  /// kept on the host are at least this many bytes per row. With a
-  /// key-only projection the deferred "payload" is a couple of narrow
-  /// columns and the host gather costs more than the crossing it saves.
-  /// 0 disables the gate.
-  int32_t benchmarkDeferMinPayloadBytes{8}; // 2026-09-17: was 48; now equal to the CPU join gate (rowRef width)
+  /// kept on the host are WIDER than this many bytes per row (default = the
+  /// 8 B rowRef that replaces them; an equal-width swap ships the same bytes
+  /// and still pays the survivors' host gather). With a key-only projection
+  /// the deferred "payload" is a couple of narrow columns and the host
+  /// gather costs more than the crossing it saves. 0 disables the gate.
+  int32_t benchmarkDeferMinPayloadBytes{8}; // 2026-10-02: strict (>); 2026-09-17: was 48
 
   /// Row pack: stage the host-to-device transfer through a pinned block of
   /// this many bytes instead of one buffer sized to the whole GPU batch.
@@ -178,17 +179,29 @@ struct CudfConfig {
   /// single-copy ship is preserved; larger batches are chunked.
   int64_t benchmarkPackBlockBytes{16 << 20};
 
-  int32_t benchmarkSortGatherThreads{-1};
-  /// Deferred row sort exit: gather straight from the retained batches
-  /// (scattered ids) instead of coalescing them into one contiguous store
-  /// first (skips the serial HybridContainer::coalesceBatches pass).
-  bool benchmarkSortDeferredScattered{true};
-
-  /// Boundary-hybrid JOIN: keep the build side's retained host payload in
-  /// scattered (per-batch) layout (true, historical) or coalesce it into one
-  /// contiguous batch after the build so survivors are gathered with the
-  /// CPU hybrid join's optimized coalesced extraction (false = "layer 3").
-  bool benchmarkJoinDeferredScattered{true};
+  /// 2026-09-29 simplification: the deferral stores' layouts and the CPU-exit
+  /// paths are no longer configurable -- the measured-best choices are fixed
+  /// in code: light per-GPU-batch probe stores with the fast (cursor +
+  /// prefetch) gather; coalesced per-driver build stores; one coalesced sort
+  /// store; every CPU exit of a row operator (eager, deferred, mixed sort)
+  /// D2Hs rows into pinned memory and extracts Velox columns on the host
+  /// (unless --row_output_native). Removed flags: boundary_light_store,
+  /// boundary_fast_gather, join_deferred_scattered, sort_deferred_scattered,
+  /// sort_mixed_host_rows, row_output_host_extract, probe_store_coalesce,
+  /// probe_store_share_strings. Only the thread counts remain.
+  ///
+  /// Deferred sort: host gather threads for the deferred columns and
+  /// extraction threads of the sort's CPU exit (-1 = min(48, cores)).
+  int32_t benchmarkSortGatherThreads{16};
+  /// Extraction threads per join driver at a CPU exit (the drivers already
+  /// run in parallel).
+  int32_t benchmarkRowHostExtractThreads{1};
+  /// Worker threads for the deferral stores' coalesce (sort store; build
+  /// stores unless benchmarkBuildCoalesceThreads >= 0).
+  int32_t benchmarkCoalesceThreads{16};
+  /// Threads per BUILD driver for its background coalesce (per-driver build
+  /// stores run concurrently). -1 = benchmarkCoalesceThreads.
+  int32_t benchmarkBuildCoalesceThreads{1};
 
   /// Boundary-hybrid: also defer the BUILD side's payload (ingress packs the
   /// build's join keys + rowRef only; the build's payload is retained on the

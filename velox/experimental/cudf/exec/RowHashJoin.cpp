@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -455,23 +456,16 @@ RowVectorPtr RowHashJoinBuild::doGetOutput() {
   return nullptr;
 }
 
-void RowHashJoinBuild::joinCoalesceThread() {
-  if (coalesceThread_.joinable()) {
-    coalesceThread_.join();
-  }
-  if (coalesceError_) {
-    auto e = coalesceError_;
-    coalesceError_ = nullptr;
-    std::rethrow_exception(e);
-  }
-}
-
 void RowHashJoinBuild::doNoMoreInput() {
   Operator::noMoreInput();
   {
     const auto& jcfg = CudfConfig::getInstance();
-    if (jcfg.benchmarkBoundaryBuildDefer &&
-        !jcfg.benchmarkJoinDeferredScattered && driverProvStore_ == nullptr) {
+    if (jcfg.benchmarkBoundaryBuildDefer && driverProvStore_ == nullptr) {
+      // 2026-09-30: the retained batches are only COLLECTED here (kept as
+      // they came, a filter's views included) and merged by the background
+      // task in one copy (coalesceFrom, as the sort store) -- was addBatch per
+      // batch (a flatten through addPayload) + HybridContainer::coalesceBatches.
+      std::vector<RowVectorPtr> retained;
       for (auto& inp : inputs_) {
         auto rsv = std::dynamic_pointer_cast<RowStoreVector>(inp);
         if (rsv == nullptr || !rsv->hasProvenance()) {
@@ -482,17 +476,27 @@ void RowHashJoinBuild::doNoMoreInput() {
               rsv->provenanceStore()->rowType(), pool(), /*scattered=*/false);
         }
         for (const auto& hb : rsv->provenanceStore()->batches()) {
-          driverProvStore_->addBatch(hb);
+          retained.push_back(hb);
+          driverProvRows_ += hb->size();
         }
       }
       if (driverProvStore_ != nullptr) {
-        coalesceThread_ = std::thread([this]() {
-          try {
-            driverProvStore_->coalesce();
-          } catch (...) {
-            coalesceError_ = std::current_exception();
-          }
-        });
+        auto store = driverProvStore_;
+        const auto& bcfg = CudfConfig::getInstance();
+        const int32_t buildThreads = bcfg.benchmarkBuildCoalesceThreads >= 0
+            ? bcfg.benchmarkBuildCoalesceThreads
+            : bcfg.benchmarkCoalesceThreads;
+        coalesceDone_ = std::async(std::launch::async, [store, buildThreads, retained = std::move(retained)]() mutable -> int64_t {
+                          const auto t0 = std::chrono::steady_clock::now();
+                          store->coalesceFrom(retained, buildThreads);
+                          // Drop the sources now: the closure lives as long
+                          // as the future does.
+                          retained = {};
+                          return std::chrono::duration_cast<
+                                     std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - t0)
+                              .count();
+                        }).share();
       }
     }
   }
@@ -701,15 +705,21 @@ void RowHashJoinBuild::doNoMoreInput() {
   std::shared_ptr<BoundaryHostStore> boundaryStore;
   bool buildDeferredV2 = false;
   bool perDriverCoalesced = false;
-  std::shared_ptr<MultiBoundaryHostStore> multiStore;
+  std::shared_ptr<LazyMultiBoundaryHostStore> multiStore;
   std::vector<int64_t> chunkRows;
   int32_t rowIdFieldOffset = -1;
+  int32_t rowIdFieldIndex = -1;
   if (driverProvStore_ != nullptr) {
     // Own chunk first, then peers in collection order: the same order the
     // inputs were concatenated above, so global build row ids line up.
-    joinCoalesceThread();
+    // 2026-09-27: the coalesces are NOT joined here any more; their futures go
+    // into the lazy store and the probe's first gather waits for them.
     std::vector<std::shared_ptr<BoundaryHostStore>> chunks;
+    std::vector<std::shared_future<int64_t>> pending;
+    std::vector<int64_t> hostRows; // retained rows per chunk
     chunks.push_back(driverProvStore_);
+    pending.push_back(coalesceDone_);
+    hostRows.push_back(driverProvRows_);
     // Row count of each chunk, in chunk order, from the input segments.
     auto segRows = [&](size_t begin, size_t count) {
       int64_t r = 0;
@@ -726,15 +736,18 @@ void RowHashJoinBuild::doNoMoreInput() {
       VELOX_CHECK_NOT_NULL(pb);
       const size_t cnt = peerInputCounts[pi++];
       if (pb->driverProvStore_ != nullptr) {
-        pb->joinCoalesceThread();
         chunks.push_back(pb->driverProvStore_);
+        pending.push_back(pb->coalesceDone_);
+        hostRows.push_back(pb->driverProvRows_);
         chunkRows.push_back(segRows(segBegin, cnt));
       } else {
         VELOX_CHECK_EQ(segRows(segBegin, cnt), 0);
       }
       segBegin += cnt;
     }
-    multiStore = std::make_shared<MultiBoundaryHostStore>(std::move(chunks));
+    multiStore = std::make_shared<LazyMultiBoundaryHostStore>(
+        std::move(chunks), std::move(pending), hostRows);
+    addRuntimeStat("boundaryBuildPerDriverCoalesce", RuntimeCounter(1));
     perDriverCoalesced = true;
     buildDeferredV2 = true;
   }
@@ -880,8 +893,7 @@ void RowHashJoinBuild::doNoMoreInput() {
           boundaryStore = std::make_shared<BoundaryHostStore>(
               hostType,
               pool(),
-              /*scattered=*/CudfConfig::getInstance()
-                  .benchmarkJoinDeferredScattered);
+              /*scattered=*/false);
         }
         for (const auto& hb : hostBatches) {
           boundaryStore->addBatch(hb);
@@ -895,8 +907,7 @@ void RowHashJoinBuild::doNoMoreInput() {
           boundaryStore = std::make_shared<BoundaryHostStore>(
               rsv->provenanceStore()->rowType(),
               pool(),
-              /*scattered=*/CudfConfig::getInstance()
-                  .benchmarkJoinDeferredScattered);
+              /*scattered=*/false);
           buildDeferredV2 = true;
         }
         for (const auto& hb : rsv->provenanceStore()->batches()) {
@@ -941,8 +952,7 @@ void RowHashJoinBuild::doNoMoreInput() {
       // contiguous batch (global row ids == GPU build row ids), so the probe
       // gathers survivors with the CPU hybrid join's optimized extraction
       // instead of the scattered per-batch path. Paid once, at build time.
-      if (!perDriverCoalesced &&
-          !CudfConfig::getInstance().benchmarkJoinDeferredScattered) {
+      if (!perDriverCoalesced) {
         const auto tpCoalesce = std::chrono::steady_clock::now();
         boundaryStore->coalesce();
         addRuntimeStat(
@@ -969,6 +979,7 @@ void RowHashJoinBuild::doNoMoreInput() {
     // addresses its per-driver container directly.
     if (perDriverCoalesced && firstRowStore->rowIdField() >= 0) {
       rowIdFieldOffset = fields[firstRowStore->rowIdField()].offset;
+      rowIdFieldIndex = firstRowStore->rowIdField();
       int64_t start = 0;
       for (size_t k = 0; k < chunkRows.size(); k++) {
         rewriteRowIdField(
@@ -1202,8 +1213,8 @@ void RowHashJoinBuild::doNoMoreInput() {
   bd.hostMultiStore = std::move(multiStore);
   bd.buildIdsEncoded = perDriverCoalesced && rowIdFieldOffset >= 0;
   bd.rowIdFieldOffset = rowIdFieldOffset;
-  bd.hostStoreScattered = perDriverCoalesced ||
-      CudfConfig::getInstance().benchmarkJoinDeferredScattered;
+  bd.rowIdFieldIndex = rowIdFieldIndex;
+  bd.hostStoreScattered = perDriverCoalesced;
   // Row-native matcher: hand the probe the chained multimap (device pointers
   // stay valid — rmm::device_buffer moves preserve the allocation).
   bd.hasRowTable = hasRowTable;
@@ -1314,7 +1325,8 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
     return nullptr;
   }
 
-  // Host-side phase timers (only emitted under benchmarkLogGatherTime):
+  // Host-side phase timers (2026-10-05: always emitted -- CPU timestamps only, no extra syncs; before, only under
+  // benchmarkLogGatherTime, which also adds a stream sync after the gather):
   // prep (input/layout) -> matcher (incl. count readback) -> gather (incl.
   // string compaction + sync) -> output construction (row store or
   // row->col + strings column). Sum == this call's wall.
@@ -1396,9 +1408,11 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       outputFields_.clear();
       outputStringFields_.clear();
       deferredOutputCols_.clear();
+      deferredBuildOutputCols_.clear();
       probeGatherMappings_.clear();
       buildGatherMappings_.clear();
       outputRowIdField_ = -1;
+      outputBuildRowIdField_ = -1;
       addRuntimeStat("probeLayoutSwitch", RuntimeCounter(1));
     }
     if (!initialized_) {
@@ -1624,6 +1638,23 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       outputFields_.push_back({dstOffset, 8, kFieldFixed});
       dstOffset += 8;
     }
+    // Build-side deferral (2026-09-30): the build rowRef (driver << 48 |
+    // local, written into the build rows at build time) is gathered into the
+    // output row like any 8 B build field, so it returns with the rows
+    // through the chunked pinned exit. Was: a separate GPU gather of the
+    // field for the survivors + a whole-batch D2H into a pinned id buffer.
+    outputBuildRowIdField_ = -1;
+    if (!deferredBuildOutputCols_.empty() && buildData_->buildIdsEncoded &&
+        buildData_->hostMultiStore != nullptr) {
+      dstOffset = alignUp(dstOffset, 8);
+      outputBuildRowIdField_ = static_cast<int32_t>(outputFields_.size());
+      buildGatherMappings_.push_back(
+          {buildData_->rowIdFieldOffset, dstOffset, 8});
+      bSrcField.push_back(buildData_->rowIdFieldIndex);
+      bDstField.push_back(0); // rowid is never null
+      outputFields_.push_back({dstOffset, 8, kFieldFixed});
+      dstOffset += 8;
+    }
     outputRowWidth_ = (dstOffset + 7) & ~7;
     if (!outputStringFields_.empty()) {
       outputStringFieldsBuffer_ = rmm::device_buffer(
@@ -1820,6 +1851,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       if (baseBytes > outputRowBaseBuffer_.size()) {
         outputRowBaseBuffer_ = rmm::device_buffer(baseBytes, stream);
       }
+      // 2026-10-05 diagnostic: host wall of the heap sizing, which reads the
+      // total back with a stream sync (waits for this batch's queued GPU work).
+      const auto tpLayout = std::chrono::steady_clock::now();
       const int64_t heapBytes = stringHeapLayout(
           static_cast<const uint8_t*>(probeGatherBuffer_.data()),
           numMatches,
@@ -1828,6 +1862,11 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
           static_cast<int32_t>(outputStringFields_.size()),
           static_cast<int64_t*>(outputRowBaseBuffer_.data()),
           stream.value());
+      addRuntimeStat(
+          "probeStringLayoutNanos",
+          RuntimeCounter(
+              hostNanos(tpLayout, std::chrono::steady_clock::now()),
+              RuntimeCounter::Unit::kNanos));
       if (heapBytes > 0) {
         outputCharsBuffer_ = rmm::device_buffer(heapBytes, stream);
         compactStrings(
@@ -1902,7 +1941,7 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
       op->addRuntimeStat("probeOutputHostNanos",
           RuntimeCounter(f(o, now), RuntimeCounter::Unit::kNanos));
     }
-  } phaseReport{this, timeGather, tpEnter, tpMatcher, tpGather, tpOutput,
+  } phaseReport{this, true, tpEnter, tpMatcher, tpGather, tpOutput,
                 hostNanos};
 
   if (logTimeline && driverId == 0) {
@@ -1928,9 +1967,9 @@ RowVectorPtr RowHashJoinProbe::doGetOutput() {
   // ---- Terminal join: transpose row buffer -> cudf columns (CudfVector) ----
   // A probe feeding a BUILD emits rows for eager batches only.
   if (emitColumnar_ == 1 || (nextIsBuild_ && !deferredOutputCols_.empty())) {
-    if (hostExit_ &&
-        (probeProvStore_ != nullptr || !deferredBuildOutputCols_.empty() ||
-         CudfConfig::getInstance().benchmarkRowOutputNative)) {
+    if (hostExit_) {
+      // CPU exit: always the host path (native rows, or pinned rows +
+      // host extraction; deferred columns gathered on the host).
       return makeHostOutput(
           numMatches,
           stream,
@@ -2023,61 +2062,90 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
   const int32_t numCols = outputType_->size();
   std::vector<VectorPtr> children(numCols);
   if (!deferredOutputCols_.empty() || !deferredBuildOutputCols_.empty()) {
-    // DEFERRED exit: uniformly COLUMNAR, and the rows never cross. The
-    // whole output row buffer is transposed on the device (with __rowid as
-    // one more column when the PROBE payload is deferred), the GPU-side
-    // columns come over through the arrow path, the probe ids are read
-    // from the transposed column on the host and the build ids from the
-    // matcher's index list, and the deferred payloads are gathered from the
-    // retained batches (probe: this batch's store; build: the merged store).
+    // DEFERRED exit: the GPU-side columns (+ the probe __rowid) leave as
+    // rows (pinned D2H) and are extracted on the host; the probe ids are read
+    // from the rows and the build ids from the matcher's index list, and the
+    // deferred payloads are gathered from the retained batches (probe: this
+    // batch's store; build: the merged store). (Until 2026-09-29: device
+    // transpose + arrow for the GPU-side columns.)
     const bool probeDeferred = !deferredOutputCols_.empty();
     if (probeDeferred) {
       VELOX_CHECK_NOT_NULL(probeProvStore_);
     }
-    auto gpuCols =
-        transposeGpuOutputColumns(numMatches, stream, probeDeferred);
-    std::unique_ptr<cudf::column> rowIdCol;
-    if (probeDeferred) {
-      rowIdCol = std::move(gpuCols.back());
-      gpuCols.pop_back();
+    const auto tpCols = std::chrono::steady_clock::now();
+    // Heap + null sidecar first, then the rows (GPU-side columns + probe
+    // __rowid) in pinned chunks, extracted on the host (d2hExtractRows); the
+    // probe ids are read from each chunk's rows.
+    const bool hasChars = outputCharsBuffer_.size() > 0;
+    d2hHeapAndNulls(numMatches, stream);
+    std::shared_ptr<const std::vector<uint8_t>> chars;
+    if (hasChars) {
+      chars = std::make_shared<const std::vector<uint8_t>>(
+          std::move(hostCharsScratch_));
     }
-    std::vector<std::unique_ptr<cudf::column>> subset;
-    std::vector<std::string> names;
-    std::vector<TypePtr> types;
-    std::vector<int32_t> subsetIdx;
-    for (int i = 0; i < numCols; i++) {
-      if (gpuCols[i] != nullptr) {
-        subset.push_back(std::move(gpuCols[i]));
-        names.push_back(outputType_->nameOf(i));
-        types.push_back(outputType_->childAt(i));
-        subsetIdx.push_back(i);
-      }
-    }
-    if (probeDeferred) {
-      subset.push_back(std::move(rowIdCol));
-      names.push_back("__rowid");
-      types.push_back(BIGINT());
-    }
-    auto tbl = std::make_unique<cudf::table>(std::move(subset));
-    auto host = with_arrow::toVeloxColumn(
-        tbl->view(),
+    HostRowExtractor ex(
         pool(),
-        std::static_pointer_cast<const Type>(ROW(std::move(names), std::move(types))),
-        stream,
-        get_output_mr());
-    for (size_t k = 0; k < subsetIdx.size(); k++) {
-      children[subsetIdx[k]] = host->childAt(k);
-    }
+        outputType_,
+        numMatches,
+        outputRowWidth_,
+        std::vector<FieldDesc>(
+            outputFields_.begin(), outputFields_.begin() + numCols),
+        std::move(chars),
+        outputNullStride_,
+        nullptr);
+    // Row references carried in the rows: the probe __rowid and/or the
+    // build rowRef, read from each chunk while it is in cache.
+    const int32_t probeIdOff =
+        probeDeferred ? outputFields_[outputRowIdField_].offset : -1;
+    const int32_t buildIdOff = outputBuildRowIdField_ >= 0
+        ? outputFields_[outputBuildRowIdField_].offset
+        : -1;
     if (probeDeferred) {
-      const auto* ids64 = host->childAt(subsetIdx.size())
-                              ->asFlatVector<int64_t>()
-                              ->rawValues();
+      VELOX_CHECK_GE(outputRowIdField_, 0);
       materializeIds_.resize(numMatches);
-      for (int32_t r = 0; r < numMatches; r++) {
-        materializeIds_[r] = static_cast<int32_t>(ids64[r]);
+    }
+    if (buildIdOff >= 0) {
+      buildRowRefsHost_.resize(numMatches);
+    }
+    std::function<void(int64_t, int64_t, const uint8_t*)> readIds;
+    if (probeIdOff >= 0 || buildIdOff >= 0) {
+      readIds = [this, probeIdOff, buildIdOff](
+                    int64_t begin, int64_t n, const uint8_t* rows) {
+        for (int64_t r = 0; r < n; r++) {
+          const uint8_t* row = rows + r * outputRowWidth_;
+          if (probeIdOff >= 0) {
+            int64_t id;
+            std::memcpy(&id, row + probeIdOff, 8);
+            materializeIds_[begin + r] = static_cast<int32_t>(id);
+          }
+          if (buildIdOff >= 0) {
+            std::memcpy(&buildRowRefsHost_[begin + r], row + buildIdOff, 8);
+          }
+        }
+      };
+    }
+    d2hExtractRows(numMatches, stream, ex, readIds);
+    auto gpuSide = ex.finish();
+    for (int i = 0; i < numCols; i++) {
+      if (gpuSide[i] != nullptr) {
+        children[i] = std::move(gpuSide[i]);
       }
-      probeProvStore_->idsForGlobalRows(
+    }
+    addRuntimeStat(
+        "deferredExitColumnsNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tpCols)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+    const auto tpProbe = std::chrono::steady_clock::now();
+    if (probeDeferred) {
+      const auto cursorFallbacks = probeProvStore_->idsForGlobalRows(
           materializeIds_.data(), numMatches, materializeRowIds_);
+      if (cursorFallbacks > 0) {
+        addRuntimeStat(
+            "probeCursorFallbacks", RuntimeCounter(cursorFallbacks));
+      }
       const auto& storeType = probeProvStore_->rowType();
       for (auto outIdx : deferredOutputCols_) {
         auto col = BaseVector::create(
@@ -2090,40 +2158,49 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
             materializeSentinelScratch_);
         children[outIdx] = std::move(col);
       }
+      addRuntimeStat(
+          "probeDeferredGatherNanos",
+          RuntimeCounter(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - tpProbe)
+                  .count(),
+              RuntimeCounter::Unit::kNanos));
     }
     if (!deferredBuildOutputCols_.empty()) {
-      // Build-side deferred columns: survivor build ids come straight from
-      // the matcher's index list (global over the concatenated build).
+      // Build-side deferred columns, gathered from the build's host store(s)
+      // at the survivors' build row references.
       auto& bd = *buildData_;
       VELOX_CHECK(
           bd.hostStore != nullptr || bd.hostMultiStore != nullptr,
           "build-deferred exit: no build host store");
-      VELOX_CHECK_NOT_NULL(buildIdsDev, "build-deferred exit needs build ids");
+      if (bd.hostMultiStore != nullptr) {
+        // 2026-09-27: first gather waits for the per-driver coalesces (kept
+        // out of buildDeferredGatherNanos).
+        const auto waited = bd.hostMultiStore->ensureReady();
+        if (waited > 0) {
+          addRuntimeStat(
+              "buildCoalesceWaitNanos",
+              RuntimeCounter(waited, RuntimeCounter::Unit::kNanos));
+        }
+        if (bd.hostMultiStore->claimCoalesceReport()) {
+          addRuntimeStat(
+              "buildCoalesceNanos",
+              RuntimeCounter(
+                  bd.hostMultiStore->coalesceNanos(),
+                  RuntimeCounter::Unit::kNanos));
+        }
+      }
       const auto tpBuild = std::chrono::steady_clock::now();
       const uint64_t* encodedHost = nullptr;
-      if (bd.hostMultiStore != nullptr && bd.buildIdsEncoded) {
-        // CPU parity: the build rows carry (container << 48 | local); gather
-        // that field for the survivors and hand it to the extraction as-is.
-        rmm::device_buffer enc(
-            static_cast<size_t>(numMatches) * sizeof(uint64_t), stream);
-        gatherU64Field(
-            static_cast<const uint8_t*>(bd.gpuRowStore.row_buffer),
-            bd.rowWidth,
-            bd.rowIdFieldOffset,
-            buildIdsDev,
-            numMatches,
-            static_cast<uint64_t*>(enc.data()),
-            stream.value());
-        boundaryBuildIds_.ensure(static_cast<int64_t>(numMatches) * 2);
-        cudaMemcpyAsync(
-            boundaryBuildIds_.data,
-            enc.data(),
-            static_cast<size_t>(numMatches) * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost,
-            stream.value());
-        stream.synchronize();
-        encodedHost = reinterpret_cast<const uint64_t*>(boundaryBuildIds_.data);
+      if (outputBuildRowIdField_ >= 0) {
+        // Per-driver coalesced stores: the rowRefs (driver << 48 | local)
+        // came back inside the rows (read per chunk above).
+        encodedHost = buildRowRefsHost_.data();
       } else {
+        // Single build store (a finalizing driver without its own retained
+        // input): the matcher's global build row ids, read back separately.
+        VELOX_CHECK_NOT_NULL(
+            buildIdsDev, "build-deferred exit needs build ids");
         boundaryBuildIds_.ensure(numMatches);
         cudaMemcpyAsync(
             boundaryBuildIds_.data,
@@ -2133,6 +2210,15 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
             stream.value());
         stream.synchronize();
       }
+      // Separate id read-back (single-store fallback only; 0 when the
+      // rowRefs came back inside the rows).
+      addRuntimeStat(
+          "buildIdsFetchNanos",
+          RuntimeCounter(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - tpBuild)
+                  .count(),
+              RuntimeCounter::Unit::kNanos));
       const bool buildScattered = bd.hostStoreScattered;
       if (bd.hostMultiStore == nullptr && buildScattered) {
         bd.hostStore->idsForGlobalRows(
@@ -2194,57 +2280,48 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
         pool(), outputType_, nullptr, numMatches, std::move(children));
   }
 
-  // EAGER exit: rows. D2H the row buffer (+ string heap, null sidecar).
-  // Bracketed so the exit's transfer wall is reported like the ingest's H2D.
+  // EAGER exit: rows. D2H the string heap and null sidecar, then either the
+  // whole row buffer (native: handed over as-is) or the rows in fixed chunks
+  // extracted on the host (d2hExtractRows). Bracketed so the exit's transfer
+  // wall is reported like the ingest's H2D.
   const auto tpExitD2H = std::chrono::steady_clock::now();
   const int64_t rowsBytes =
       static_cast<int64_t>(numMatches) * outputRowWidth_;
-  hostRowsScratch_.resize(rowsBytes);
-  cudaMemcpyAsync(
-      hostRowsScratch_.data(),
-      probeGatherBuffer_.data(),
-      rowsBytes,
-      cudaMemcpyDeviceToHost,
-      stream.value());
-  // Strings' compacted heap, if any GPU-gathered string column exists.
-  if (outputCharsBuffer_.size() > 0) {
-    hostCharsScratch_.resize(outputCharsBuffer_.size());
+  const bool native = CudfConfig::getInstance().benchmarkRowOutputNative;
+  if (native) {
+    hostRowsScratch_.resize(rowsBytes);
     cudaMemcpyAsync(
-        hostCharsScratch_.data(),
-        outputCharsBuffer_.data(),
-        outputCharsBuffer_.size(),
+        hostRowsScratch_.data(),
+        probeGatherBuffer_.data(),
+        rowsBytes,
         cudaMemcpyDeviceToHost,
         stream.value());
   }
-  // Null sidecar of the output rows, if present.
-  if (outputNullStride_ > 0) {
-    hostNullsScratch_.resize(
-        static_cast<int64_t>(numMatches) * outputNullStride_);
-    cudaMemcpyAsync(
-        hostNullsScratch_.data(),
-        outputNullBuffer_.data(),
-        hostNullsScratch_.size(),
-        cudaMemcpyDeviceToHost,
-        stream.value());
-  }
-  stream.synchronize();
+  const bool hasChars = outputCharsBuffer_.size() > 0;
+  d2hHeapAndNulls(numMatches, stream);
   addRuntimeStat(
       "probeExitD2HNanos",
       RuntimeCounter(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - tpExitD2H).count(),
           RuntimeCounter::Unit::kNanos));
-
-  const uint8_t* rows = hostRowsScratch_.data();
+  const auto tpFree = std::chrono::steady_clock::now();
   std::vector<FieldDesc> fields(
       outputFields_.begin(), outputFields_.begin() + numCols);
-  const bool hasChars = outputCharsBuffer_.size() > 0;
   outputCharsBuffer_ = rmm::device_buffer{};
   addRuntimeStat(
+      "hostExitFreeNanos",
+      RuntimeCounter(
+          static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - tpFree)
+                  .count()),
+          RuntimeCounter::Unit::kNanos));
+  addRuntimeStat(
       "hostExitRows", RuntimeCounter(static_cast<int64_t>(numMatches)));
-  if (CudfConfig::getInstance().benchmarkRowOutputNative) {
-    // Native row output: hand the D2H'd rows (+ heap, null sidecar) and the
-    // host-gathered deferred columns to the consumer as-is. No transpose.
+  if (native) {
+    // Native row output: hand the D2H'd rows (+ heap, null sidecar) to the
+    // consumer as-is. No transpose.
     addRuntimeStat(
         "hostExitNativeBytes",
         RuntimeCounter(rowsBytes, RuntimeCounter::Unit::kBytes));
@@ -2261,18 +2338,171 @@ RowVectorPtr RowHashJoinProbe::makeHostOutput(
                               : std::vector<uint8_t>{},
         outputNullStride_);
   }
-  // GPU-gathered columns: strided host extraction (shared with
-  // HostRowVector::materialize).
-  return extractHostRows(
+  // Host extraction; string views point into this batch's heap, which the
+  // string columns co-own.
+  // 2026-10-05 diagnostic timers (host wall, no syncs): extractor setup
+  // (output vector allocation), the whole chunked D2H + extraction loop, and
+  // finish + RowVector construction.
+  auto nanosSince = [](std::chrono::steady_clock::time_point t) {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t)
+            .count());
+  };
+  const auto tpSetup = std::chrono::steady_clock::now();
+  std::shared_ptr<const std::vector<uint8_t>> chars;
+  if (hasChars) {
+    chars = std::make_shared<const std::vector<uint8_t>>(
+        std::move(hostCharsScratch_));
+  }
+  HostRowExtractor ex(
       pool(),
       outputType_,
       numMatches,
-      rows,
       outputRowWidth_,
-      fields,
-      hostCharsScratch_.data(),
-      outputNullStride_ > 0 ? hostNullsScratch_.data() : nullptr,
-      outputNullStride_);
+      std::move(fields),
+      std::move(chars),
+      outputNullStride_,
+      nullptr);
+  addRuntimeStat(
+      "hostExitSetupNanos",
+      RuntimeCounter(nanosSince(tpSetup), RuntimeCounter::Unit::kNanos));
+  const auto tpLoop = std::chrono::steady_clock::now();
+  d2hExtractRows(numMatches, stream, ex, nullptr);
+  addRuntimeStat(
+      "hostExitLoopNanos",
+      RuntimeCounter(nanosSince(tpLoop), RuntimeCounter::Unit::kNanos));
+  const auto tpFinish = std::chrono::steady_clock::now();
+  auto result = std::make_shared<RowVector>(
+      pool(), outputType_, nullptr, numMatches, ex.finish());
+  addRuntimeStat(
+      "hostExitFinishNanos",
+      RuntimeCounter(nanosSince(tpFinish), RuntimeCounter::Unit::kNanos));
+  return result;
+}
+
+// D2H the batch's string heap and null sidecar (pageable; one copy each) and
+// wait. The rows themselves go through d2hExtractRows.
+void RowHashJoinProbe::d2hHeapAndNulls(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream) {
+  const auto tp = std::chrono::steady_clock::now();
+  const bool any = outputCharsBuffer_.size() > 0 || outputNullStride_ > 0;
+  if (outputCharsBuffer_.size() > 0) {
+    hostCharsScratch_.resize(outputCharsBuffer_.size());
+    cudaMemcpyAsync(
+        hostCharsScratch_.data(),
+        outputCharsBuffer_.data(),
+        outputCharsBuffer_.size(),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  }
+  if (outputNullStride_ > 0) {
+    hostNullsScratch_.resize(
+        static_cast<int64_t>(numMatches) * outputNullStride_);
+    cudaMemcpyAsync(
+        hostNullsScratch_.data(),
+        outputNullBuffer_.data(),
+        hostNullsScratch_.size(),
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  }
+  stream.synchronize();
+  if (any) {
+    // Pageable copies (plus any GPU work still queued on the stream); the
+    // rows' pinned copies are reported as probeExitD2HNanos.
+    addRuntimeStat(
+        "probeExitHeapD2HNanos",
+        RuntimeCounter(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tp)
+                .count(),
+            RuntimeCounter::Unit::kNanos));
+  }
+}
+
+// 2026-09-29: the CPU exit's rows leave in chunks of one crossing block
+// through two reused pinned buffers -- the next chunk's D2H overlaps this
+// chunk's host extraction, and the pinned footprint no longer grows with the
+// GPU batch (whole-batch pinned buffers cost ~8 s per driver at 5M-row
+// batches). `onChunk` (optional) sees each chunk's host rows, e.g. to read
+// the probe __rowid. The heap and null sidecar must already be on the host.
+void RowHashJoinProbe::d2hExtractRows(
+    int32_t numMatches,
+    rmm::cuda_stream_view stream,
+    HostRowExtractor& ex,
+    const std::function<void(int64_t, int64_t, const uint8_t*)>& onChunk) {
+  // Chunk = the crossing block (--pack_block_mb, 16 MB), the unit the ingress
+  // ships rows in: the same pinned footprint and copy granularity in both
+  // directions, whatever the row width and the GPU batch size (a row-count
+  // chunk was 2 MB for V-RD's 32 B rows and 43 MB for V-R's 332 B rows).
+  // Rounded down to a multiple of 64 rows (null-word aligned chunks).
+  const int64_t chunk = std::max<int64_t>(
+      64,
+      (CudfConfig::getInstance().benchmarkPackBlockBytes /
+       std::max<int64_t>(1, outputRowWidth_)) /
+          64 * 64);
+  const size_t capBytes =
+      static_cast<size_t>(chunk) * static_cast<size_t>(outputRowWidth_);
+  hostRowsPinned_.ensure(capBytes);
+  hostRowsPinned2_.ensure(capBytes);
+  uint8_t* bufs[2] = {hostRowsPinned_.data, hostRowsPinned2_.data};
+  const auto* src = static_cast<const uint8_t*>(probeGatherBuffer_.data());
+  auto issue = [&](int64_t begin, int slot) {
+    const int64_t n = std::min<int64_t>(chunk, numMatches - begin);
+    cudaMemcpyAsync(
+        bufs[slot],
+        src + begin * outputRowWidth_,
+        n * outputRowWidth_,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+  };
+  const uint8_t* nulls =
+      outputNullStride_ > 0 ? hostNullsScratch_.data() : nullptr;
+  const int32_t threads =
+      CudfConfig::getInstance().benchmarkRowHostExtractThreads;
+  int64_t waitNanos = 0;
+  int64_t extractNanos = 0;
+  auto timedSync = [&]() {
+    const auto t = std::chrono::steady_clock::now();
+    stream.synchronize();
+    waitNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - t)
+                     .count();
+  };
+  if (numMatches > 0) {
+    issue(0, 0);
+    timedSync();
+  }
+  int slot = 0;
+  for (int64_t begin = 0; begin < numMatches; begin += chunk, slot ^= 1) {
+    const int64_t n = std::min<int64_t>(chunk, numMatches - begin);
+    if (begin + chunk < numMatches) {
+      issue(begin + chunk, slot ^ 1);
+    }
+    const auto t = std::chrono::steady_clock::now();
+    ex.extract(
+        begin,
+        n,
+        bufs[slot],
+        nulls != nullptr ? nulls + begin * outputNullStride_ : nullptr,
+        threads);
+    if (onChunk) {
+      onChunk(begin, n, bufs[slot]);
+    }
+    extractNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t)
+                        .count();
+    if (begin + chunk < numMatches) {
+      timedSync(); // the next chunk has landed
+    }
+  }
+  addRuntimeStat(
+      "probeExitD2HNanos",
+      RuntimeCounter(waitNanos, RuntimeCounter::Unit::kNanos));
+  addRuntimeStat(
+      "hostExitExtractNanos",
+      RuntimeCounter(extractNanos, RuntimeCounter::Unit::kNanos));
 }
 
 // Device transpose of the GPU-gathered output rows into cudf columns, in
@@ -2446,8 +2676,12 @@ RowVectorPtr RowHashJoinProbe::makeColumnarOutput(
     for (int32_t i = 0; i < numMatches; i++) {
       materializeIds_[i] = static_cast<int32_t>(ids64[i]);
     }
-    probeProvStore_->idsForGlobalRows(
+    const auto cursorFallbacks = probeProvStore_->idsForGlobalRows(
         materializeIds_.data(), numMatches, materializeRowIds_);
+    if (cursorFallbacks > 0) {
+      addRuntimeStat(
+          "probeCursorFallbacks", RuntimeCounter(cursorFallbacks));
+    }
     const auto& storeType = probeProvStore_->rowType();
     std::vector<VectorPtr> hostCols;
     std::vector<std::string> hostNames;
@@ -2582,6 +2816,30 @@ void RowHashJoinProbe::PinnedIdBuffer::ensure(int64_t n) {
       "boundary-hybrid: cudaHostAlloc({} B) failed: {}",
       capacity * sizeof(int32_t),
       cudaGetErrorString(err));
+}
+
+void RowHashJoinProbe::PinnedBytes::ensure(size_t bytes) {
+  if (bytes <= capacity) {
+    return;
+  }
+  if (data != nullptr) {
+    cudaFreeHost(data);
+    data = nullptr;
+  }
+  capacity = bytes;
+  const cudaError_t err = cudaHostAlloc(
+      reinterpret_cast<void**>(&data), capacity, cudaHostAllocDefault);
+  VELOX_CHECK(
+      err == cudaSuccess,
+      "row join exit: cudaHostAlloc({} B) failed: {}",
+      capacity,
+      cudaGetErrorString(err));
+}
+
+RowHashJoinProbe::PinnedBytes::~PinnedBytes() {
+  if (data != nullptr) {
+    cudaFreeHost(data);
+  }
 }
 
 RowHashJoinProbe::PinnedIdBuffer::~PinnedIdBuffer() {

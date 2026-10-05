@@ -120,6 +120,13 @@ class RowOrderBy : public CudfOperatorBase {
   // == __rowid base + local; coalesced while the device sorts, then gathered
   // with HybridContainer's coalesced-mode extraction.
   std::unique_ptr<BoundaryHostStore> sortStore_;
+  // Coalesced mode (2026-09-28): the retained batches are collected here in
+  // GPU concatenation order and merged column-parallel into the empty
+  // sortStore_ by BoundaryHostStore::coalesceFrom on the coalesce thread
+  // (no per-batch addPayload on the operator thread). sortStoreRows_ = the
+  // global rowid base of the next retained store.
+  std::vector<RowVectorPtr> pendingSortBatches_;
+  int64_t sortStoreRows_ = 0;
   std::vector<const char*> rowsScratch_;
   std::vector<exec::HybridRowId> idsScratch_;
   // Parallel deferred gather: per-thread scratch (see gatherDeferred).
@@ -149,6 +156,13 @@ class RowOrderBy : public CudfOperatorBase {
   int64_t prefetchBegin_ = -1;
   std::vector<uint8_t> hostNulls_;
   std::vector<uint8_t> hostChars_;
+  // Mixed host exit (2026-09-28): pinned double buffer for the chunk rows, so
+  // the next chunk's D2H really overlaps this chunk's extraction (a D2H into
+  // pageable memory blocks the host), and the heap D2H runs in the
+  // background during the sort-store merge.
+  uint8_t* pinnedRows_[2] = {nullptr, nullptr};
+  int32_t pinnedCur_ = 0;
+  bool hostExtractPath() const;
   std::shared_ptr<const std::vector<uint8_t>> hostCharsShared_; // native output
   bool hostCharsReady_ = false;
   rmm::device_buffer idsDev_;

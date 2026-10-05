@@ -29,6 +29,10 @@
 
 #include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
 
+#include <gflags/gflags.h>
+
+#include <iostream>
+
 DECLARE_int64(max_coalesced_bytes);
 DECLARE_string(max_coalesced_distance_bytes);
 DECLARE_int32(parquet_prefetch_rowgroups);
@@ -71,6 +75,12 @@ DEFINE_bool(velox_cudf_table_scan, false, "Enable cuDF table scan");
 // ---- Hybrid-layout / whole-query-deferral arms (see DESIGN-whole-query-
 // deferral.md). Mirrors VeloxCudfJoinBench's flag -> CudfConfig mapping so
 // query-level runs and the single-join bench share one vocabulary. ----
+DEFINE_string(
+    design,
+    "",
+    "2026-09-29: evaluated configuration preset -- v (Velox-cuDF), vr (row-native "
+    "crossing + HashJoin/Sort; CPU exits extract Velox columns on the host), vrd "
+    "(vr + payload deferral). Sets only flags left at their defaults.");
 DEFINE_bool(gpu, true,
     "Register the cuDF operator replacements. false = pure CPU Velox in the "
     "SAME binary (same scan path), the apples-to-apples baseline.");
@@ -107,12 +117,12 @@ DEFINE_int32(
     defer_min_payload_bytes,
     8,
     "Selective hybrid execution: defer only when the host-retained "
-    "columns are at least this many bytes per row (0 = always defer). "
-    "Default 8 = the rowRef width, the same gate as the CPU join "
-    "(2026-09-17; was 48).");
+    "columns are WIDER than this many bytes per row (0 = always defer). "
+    "Default 8 = the rowRef width: a payload must be wider than the rowRef "
+    "that replaces it (2026-10-02; was 'at least', 2026-09-17: was 48).");
 DEFINE_int32(
     sort_gather_threads,
-    -1,
+    16,
     "Deferred row sort: threads for the per-chunk host gather of deferred "
     "payload columns (0/1 = operator thread only).");
 DEFINE_bool(
@@ -120,17 +130,20 @@ DEFINE_bool(
     true,
     "Boundary-hybrid: defer the BUILD side payload too (keys + rowRef cross; "
     "payload retained on the host, gathered for survivors).");
-DEFINE_bool(
-    join_deferred_scattered,
-    true,
-    "Boundary-hybrid join: keep the build-side host payload scattered "
-    "(true) or coalesce it after the build and gather survivors with the "
-    "optimized coalesced extraction (false).");
-DEFINE_bool(
-    sort_deferred_scattered,
-    true,
-    "Deferred row sort: gather from the retained batches (scattered ids) "
-    "instead of coalescing them first.");
+DEFINE_int32(
+    build_coalesce_threads,
+    1,
+    "Coalesce threads per build driver (per-driver build stores); -1 = "
+    "--coalesce_threads.");
+DEFINE_int32(
+    coalesce_threads,
+    16,
+    "Deferral stores (sort, per-driver build): worker threads for the "
+    "column-parallel coalesce (1 = sequential).");
+DEFINE_int32(
+    row_host_extract_threads,
+    1,
+    "Host extraction at a join's CPU exit: threads per join driver.");
 DEFINE_int32(
     pack_tile_rows,
     0,
@@ -204,6 +217,33 @@ void CudfTpchBenchmark::initialize() {
 
   cudf_velox::CudfConfig::getInstance().debugEnabled = FLAGS_cudf_debug_enabled;
 
+  // ---- Designs (2026-09-29): one flag per evaluated configuration ----
+  if (!FLAGS_design.empty()) {
+    auto preset = [](const char* name, const char* value) {
+      gflags::CommandLineFlagInfo info;
+      VELOX_CHECK(
+          gflags::GetCommandLineFlagInfo(name, &info), "unknown flag {}", name);
+      if (info.is_default) { // an explicit flag still overrides the preset
+        gflags::SetCommandLineOption(name, value);
+      }
+    };
+    VELOX_CHECK(
+        FLAGS_design == "v" || FLAGS_design == "vr" || FLAGS_design == "vrd",
+        "--design must be v, vr or vrd, got '{}'",
+        FLAGS_design);
+    preset("gpu", "true");
+    if (FLAGS_design != "v") {
+      preset("row_wise", "true");
+      preset("cpu_col_to_row", "true");
+      preset("row_table", "true");
+      preset("row_sort", "true");
+    }
+    if (FLAGS_design == "vrd") {
+      preset("boundary_hybrid", "true");
+      preset("deferral_adaptive", "true");
+    }
+  }
+
   // ---- Hybrid-layout arms ----
   auto& cfg = cudf_velox::CudfConfig::getInstance();
   if (FLAGS_boundary_hybrid) {
@@ -225,9 +265,27 @@ void CudfTpchBenchmark::initialize() {
   cfg.benchmarkPackBlockBytes =
       static_cast<int64_t>(FLAGS_pack_block_mb) * 1024 * 1024;
   cfg.benchmarkSortGatherThreads = FLAGS_sort_gather_threads;
-  cfg.benchmarkSortDeferredScattered = FLAGS_sort_deferred_scattered;
-  cfg.benchmarkJoinDeferredScattered = FLAGS_join_deferred_scattered;
+  cfg.benchmarkRowHostExtractThreads = FLAGS_row_host_extract_threads;
+  cfg.benchmarkCoalesceThreads = FLAGS_coalesce_threads;
+  cfg.benchmarkBuildCoalesceThreads = FLAGS_build_coalesce_threads;
   cfg.benchmarkBoundaryBuildDefer = FLAGS_boundary_build_defer;
+  // Every run records its effective settings (the gate checks this line).
+  std::cout << "EFFECTIVE_CONFIG design=" << (FLAGS_design.empty() ? "-" : FLAGS_design)
+            << " gpu=" << FLAGS_gpu << " row_wise=" << cfg.benchmarkRowWiseGather
+            << " cpu_col_to_row=" << cfg.benchmarkCpuColToRow
+            << " row_table=" << cfg.benchmarkRowTable
+            << " row_sort=" << cfg.benchmarkRowSort
+            << " boundary_hybrid=" << cfg.benchmarkBoundaryHybrid
+            << " deferral_adaptive=" << cfg.benchmarkDeferralAdaptive
+            << " boundary_build_defer=" << cfg.benchmarkBoundaryBuildDefer
+            << " row_output_native=" << cfg.benchmarkRowOutputNative
+            << " coalesce_threads=" << cfg.benchmarkCoalesceThreads
+            << " build_coalesce_threads=" << cfg.benchmarkBuildCoalesceThreads
+            << " sort_gather_threads=" << cfg.benchmarkSortGatherThreads
+            << " row_host_extract_threads=" << cfg.benchmarkRowHostExtractThreads
+            << " deferral_threshold=" << cfg.benchmarkDeferralThreshold
+            << " defer_min_payload_bytes=" << cfg.benchmarkDeferMinPayloadBytes
+            << " gpu_batch_rows=" << FLAGS_cudf_gpu_batch_size_rows << std::endl;
   cfg.benchmarkLogGatherTime = FLAGS_log_gather_time;
   cfg.benchmarkConcatBeforeJoin = FLAGS_concat_join;
   cfg.concatOptimizationEnabled = FLAGS_concat_agg;

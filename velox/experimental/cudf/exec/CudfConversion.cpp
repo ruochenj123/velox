@@ -42,6 +42,8 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/FlatVector.h"
 
 #include <cudf/column/column.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -619,8 +621,9 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
           // Before, the rule also required numJoins == 1 && numSorts == 0.
           (void)numJoins;
           (void)numSorts;
+          // Same strict width rule as the probe side (2026-10-02; was >=).
           if (!buildGpuConsumer &&
-              (minBytes <= 0 || buildBytes >= minBytes)) {
+              (minBytes <= 0 || buildBytes > minBytes)) {
             deferralEligible_ = true;
             boundaryMode_ = 1;
             payloadGateChecked_ = true; // plan rule + probe-width gate
@@ -707,6 +710,66 @@ void CudfFromVelox::resolveRowPathOnce(bool rowWiseMode) {
                 endpointExitsToHost =
                     dynamic_cast<CudfToVelox*>(ops[i + 1]) != nullptr;
                 break;
+              }
+            }
+          }
+          // 2026-09-28: a terminal join whose output feeds a ROW SORT (possibly
+          // through a gather exchange) that itself exits to the CPU is a CPU
+          // exit as well: the sort carries the probe rowRef to the host, so
+          // the GPU transfer ratio is 0 in advance (same as the single-sort
+          // rule above). Only the parent of the sort decides: another
+          // join/aggregation/sort consumes it on the GPU; anything else
+          // (exchange, project, root) exits to the host.
+          if (!endpointExitsToHost && !endpointJoinId_.empty() &&
+              CudfConfig::getInstance().benchmarkRowSort) {
+            const auto& root = operatorCtx_->task()->planFragment().planNode;
+            std::function<core::PlanNodePtr(
+                const core::PlanNodePtr&, const core::PlanNodeId&)>
+                parentOf = [&](const core::PlanNodePtr& node,
+                               const core::PlanNodeId& id) -> core::PlanNodePtr {
+              for (const auto& src : node->sources()) {
+                if (src->id() == id) {
+                  return node;
+                }
+                if (auto p = parentOf(src, id)) {
+                  return p;
+                }
+              }
+              return nullptr;
+            };
+            // The chain walk (collectChainKeyNames) runs THROUGH a gather into
+            // the sort, so the endpoint is usually the sort itself; otherwise
+            // look for a sort above the terminal join.
+            std::function<core::PlanNodePtr(const core::PlanNodePtr&)> findNode =
+                [&](const core::PlanNodePtr& node) -> core::PlanNodePtr {
+              if (node->id() == endpointJoinId_) {
+                return node;
+              }
+              for (const auto& src : node->sources()) {
+                if (auto n = findNode(src)) {
+                  return n;
+                }
+              }
+              return nullptr;
+            };
+            const auto endpointNode = findNode(root);
+            auto p = std::dynamic_pointer_cast<const core::OrderByNode>(endpointNode)
+                ? endpointNode
+                : parentOf(root, endpointJoinId_);
+            while (p != nullptr &&
+                   std::dynamic_pointer_cast<const core::LocalPartitionNode>(p)) {
+              p = parentOf(root, p->id());
+            }
+            if (p != nullptr &&
+                std::dynamic_pointer_cast<const core::OrderByNode>(p)) {
+              const auto pp = parentOf(root, p->id());
+              const bool gpuConsumer = pp != nullptr &&
+                  (std::dynamic_pointer_cast<const core::HashJoinNode>(pp) ||
+                   std::dynamic_pointer_cast<const core::AggregationNode>(pp) ||
+                   std::dynamic_pointer_cast<const core::OrderByNode>(pp));
+              if (!gpuConsumer) {
+                endpointExitsToHost = true;
+                addRuntimeStat("fromVeloxSortExitDefer", RuntimeCounter(1));
               }
             }
           }
@@ -1339,6 +1402,7 @@ void CudfFromVelox::packIntoSlot(
 
 }
 
+
 RowVectorPtr CudfFromVelox::tryPinnedPack(
     const std::vector<RowVectorPtr>& selectedInputs,
     vector_size_t totalRows) {
@@ -1429,7 +1493,11 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
           std::dynamic_pointer_cast<const RowType>(selectedInputs[0]->type());
       const int32_t bytes = t != nullptr ? deferredPayloadBytes(t) : 0;
       addRuntimeStat("fromVeloxDeferredPayloadBytes", RuntimeCounter(bytes));
-      if (bytes < minBytes) {
+      // Strictly wider (2026-10-02): an 8 B payload swapped for the 8 B
+      // rowRef ships the same bytes and still pays the survivors' gather +
+      // upload -- 10 paired rounds on TPC-H/SSB: never faster than eager,
+      // slower with many survivors (Q2, Q7, SSB Q3.1). Was `bytes < minBytes`.
+      if (bytes <= minBytes) {
         boundaryMode_ = 0;
         deferralEligible_ = false;
         addRuntimeStat("fromVeloxPayloadGateEager", RuntimeCounter(1));
@@ -1722,9 +1790,16 @@ RowVectorPtr CudfFromVelox::tryPinnedPack(
       if (boundaryStoreType_ == nullptr) {
         boundaryStoreType_ = inRowType;
       }
+      // Per-GPU-batch store: light retention (the inputs kept as they came,
+      // a filter's zero-copy views included; raw column pointers per batch).
+      // A probe gathers from it directly (cursor + prefetch); a build or a
+      // sort only takes its batches and merges them into its own coalesced
+      // store (coalesceFrom), so nothing is flattened here (2026-09-30).
       auto store = std::make_shared<BoundaryHostStore>(
           std::dynamic_pointer_cast<const RowType>(boundaryStoreType_),
-          selectedInputs[0]->pool());
+          selectedInputs[0]->pool(),
+          /*scattered=*/true,
+          /*light=*/true);
       for (size_t b = 0; b < selectedInputs.size(); b++) {
         std::vector<VectorPtr> children(numCols);
         for (int c = 0; c < numCols; c++) {
